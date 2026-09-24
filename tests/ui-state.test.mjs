@@ -25,6 +25,8 @@ import {
   extractVideoUrl,
   isCurrentSubmission,
   performGenerationSubmission,
+  commitProjectWorkspace,
+  refreshAccountSnapshot,
 } from '../public/app.js';
 
 const capabilities = {
@@ -221,6 +223,52 @@ test('stale project generation success and failure do not mutate the replacement
     assert.equal(await pending, false);
     assert.deepEqual(mutations, []);
   }
+});
+
+test('failed project switch keeps the prior pending submission current', async () => {
+  let generationToken = 4;
+  let activeProjectId = 'project-a';
+  const mutations = [];
+  await performProjectSwitch({
+    load: async () => { throw new Error('switch failed'); },
+    setBusy: () => {},
+    commit: (workspace) => commitProjectWorkspace(() => { generationToken += 1; }, () => { activeProjectId = 'project-b'; }, workspace),
+    fail: () => {},
+  });
+  const applied = await performGenerationSubmission({
+    submit: async () => ({ id: 'task-a' }),
+    isCurrent: () => isCurrentSubmission(activeProjectId, 'project-a', 4, generationToken),
+    success: () => mutations.push('success'),
+    fail: () => mutations.push('failure'),
+  });
+  assert.equal(applied, true);
+  assert.deepEqual(mutations, ['success']);
+  assert.equal(generationToken, 4);
+});
+
+test('successful project commit invalidates pending submissions immediately before selection changes', () => {
+  const events = [];
+  commitProjectWorkspace(() => events.push('invalidate'), () => events.push('commit'), { project: { id: 'project-b' } });
+  assert.deepEqual(events, ['invalidate', 'commit']);
+});
+
+test('task success refreshes account status once and suppresses stale refresh UI', async () => {
+  let calls = 0;
+  const applied = [];
+  let current = true;
+  const refreshed = await refreshAccountSnapshot({
+    load: async () => { calls += 1; current = false; return { membership: 'pro', credits: 9 }; },
+    isCurrent: () => current,
+    apply: (status) => applied.push(status),
+  });
+  assert.equal(calls, 1);
+  assert.equal(refreshed, false);
+  assert.deepEqual(applied, []);
+
+  current = true;
+  assert.equal(await refreshAccountSnapshot({ load: async () => { calls += 1; return { credits: 8 }; }, isCurrent: () => current, apply: (status) => applied.push(status) }), true);
+  assert.equal(calls, 2);
+  assert.deepEqual(applied, [{ credits: 8 }]);
 });
 
 test('new task is prepended only to the active project task list', () => {

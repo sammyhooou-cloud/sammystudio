@@ -148,6 +148,16 @@ export async function performGenerationSubmission({ submit, isCurrent, success, 
   }
 }
 
+export function commitProjectWorkspace(invalidate, commit, workspaceState) {
+  invalidate(); commit(workspaceState);
+}
+
+export async function refreshAccountSnapshot({ load, isCurrent, apply }) {
+  const status = await load();
+  if (!isCurrent()) return false;
+  apply(status); return true;
+}
+
 export function prependProjectTask(activeProjectId, submittedProjectId, tasks, task) {
   if (!task?.id || activeProjectId !== submittedProjectId) return tasks;
   return [task, ...tasks.filter(({ id }) => id !== task.id)].slice(0, 100);
@@ -365,7 +375,6 @@ function setup() {
       });
       return;
     }
-    generationSequence += 1;
     const sequence = ++workspaceLoadSequence;
     projectError.textContent = '正在加载项目…';
     if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
@@ -377,12 +386,18 @@ function setup() {
       load: () => request(`/api/projects/${encodeURIComponent(project.id)}/workspace`),
       commit: (workspaceState) => {
         if (sequence !== workspaceLoadSequence) return;
-        setCurrentProjectId(project.id);
-        storeCurrentProjectId(projectStorage(), project.id);
-        applyWorkspace(workspaceState);
-        renderProjects();
-        projectError.textContent = '';
-        setProjectSwitchBusy(false);
+        commitProjectWorkspace(
+          () => { generationSequence += 1; },
+          () => {
+            setCurrentProjectId(project.id);
+            storeCurrentProjectId(projectStorage(), project.id);
+            applyWorkspace(workspaceState);
+            renderProjects();
+            projectError.textContent = '';
+            setProjectSwitchBusy(false);
+          },
+          workspaceState,
+        );
       },
       fail: (error) => {
         if (sequence !== workspaceLoadSequence) return;
@@ -414,6 +429,13 @@ function setup() {
     const online = status.connection === 'online'; statusLight.classList.toggle('online', online); statusText.textContent = online ? 'MCP 在线' : 'MCP 未连接';
     document.querySelector('#membership').textContent = status.membership ?? '—'; document.querySelector('#credits').textContent = status.credits ?? '暂不可用'; document.querySelector('#last-check').textContent = `最后检查 ${new Date(status.checkedAt).toLocaleTimeString()}`;
     fillModels(); if (!online) statusText.parentElement.onclick = () => { location.href = '/api/kling/oauth/start'; };
+  }
+  function applyAccountStatus(status) {
+    const online = status.connection === 'online';
+    statusLight.classList.toggle('online', online); statusText.textContent = online ? 'MCP 在线' : 'MCP 未连接';
+    document.querySelector('#membership').textContent = status.membership ?? '—';
+    document.querySelector('#credits').textContent = status.credits ?? '暂不可用';
+    document.querySelector('#last-check').textContent = `最后检查 ${new Date(status.checkedAt).toLocaleTimeString()}`;
   }
   const loadWorkspaceEntry = createRetryableLoader(async () => {
     await refreshStatus();
@@ -472,7 +494,7 @@ function setup() {
       projects = renameProjectInList(projects, project); renameForm.hidden = true; renderProjects();
     } catch (error) { projectError.textContent = error.message; }
   };
-  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const submittedProjectId = currentProjectId; const submissionToken = ++generationSequence; const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; await performGenerationSubmission({ submit: () => request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }), isCurrent: () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence), success: (task) => { projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() }); renderTasks(); }, fail: (error) => { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } }); };
+  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const submittedProjectId = currentProjectId; const submissionToken = ++generationSequence; const submissionIsCurrent = () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence); const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; await performGenerationSubmission({ submit: () => request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }), isCurrent: submissionIsCurrent, success: (task) => { projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() }); renderTasks(); void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {}); }, fail: (error) => { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } }); };
   document.querySelector('#refresh-status').onclick = refreshStatus;
   document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
 }
