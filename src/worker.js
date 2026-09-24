@@ -3,6 +3,7 @@ import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
 import { submitTask } from './tasks.js';
 import { siteAssets } from './site-assets.js';
+import { ensureSchema } from './db.js';
 
 const securityHeaders = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'permissions-policy': 'camera=(), microphone=(), geolocation=()', 'content-security-policy': "default-src 'self'; img-src 'self' blob: data:; media-src 'self' https:; style-src 'self'; script-src 'self'; connect-src 'self' https://klingai.com" };
 
@@ -56,6 +57,7 @@ async function api(request, env) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith('/api/')) await ensureSchema(env.DB);
     const response = url.pathname.startsWith('/api/') ? await api(request, env, ctx) : siteAsset(url.pathname) || (env.ASSETS ? await env.ASSETS.fetch(request) : new Response('Not found', { status: 404 }));
     return withSecurity(response);
   },

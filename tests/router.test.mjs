@@ -5,6 +5,7 @@ import worker from '../src/worker.js';
 function env() {
   return {
     ASSETS: { fetch: async () => new Response('asset') },
+    DB: { prepare: () => ({ run: async () => ({ success: true }) }) },
   };
 }
 
