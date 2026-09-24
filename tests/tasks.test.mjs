@@ -26,6 +26,37 @@ const input = {
   imageCount: 1,
 };
 
+class RecoveryMedia {
+  constructor() {
+    this.objects = new Map();
+    this.putAttempts = 0;
+    this.failPutsRemaining = 0;
+    this.deleted = [];
+  }
+
+  async put(key, value) {
+    this.putAttempts += 1;
+    if (this.failPutsRemaining > 0) {
+      this.failPutsRemaining -= 1;
+      throw new Error('r2 unavailable');
+    }
+    this.objects.set(key, String(value));
+  }
+
+  async get(key) {
+    if (!this.objects.has(key)) return null;
+    const value = this.objects.get(key);
+    return { text: async () => value };
+  }
+
+  async delete(key) {
+    this.deleted.push(key);
+    this.objects.delete(key);
+  }
+}
+
+const taskEnv = (db, media = new RecoveryMedia()) => ({ DB: db, MEDIA: media });
+
 class TaskDb {
   constructor() {
     this.projects = [{ id: 'project-1' }];
@@ -56,6 +87,7 @@ class TaskDb {
           return db.tasks.find(({ id, idempotency_key }) => idempotency_key === idempotencyKey && taskIds.includes(id)) ?? null;
         }
         if (sql.includes('FROM video_tasks')) return db.tasks.find(({ idempotency_key }) => idempotency_key === this.values[0]) ?? null;
+        if (sql.includes('FROM project_settings')) return db.settings.find(({ project_id }) => project_id === this.values[0]) ?? null;
         if (sql.includes('FROM projects')) return db.projects.find(({ id }) => id === this.values[0]) ?? null;
         if (sql.includes('FROM stored_objects')) return db.upload;
         throw new Error(`Unexpected first query: ${sql}`);
@@ -142,7 +174,7 @@ test('the same external idempotency key is independent across projects', async (
   db.projectTasks.push({ project_id: 'project-1', task_id: 'task-project-1', created_at: 1 });
   let calls = 0;
 
-  const result = await submitTask({ ...input, projectId: 'project-2' }, { DB: db }, 'shared-key', capabilities, fetch, async () => {
+  const result = await submitTask({ ...input, projectId: 'project-2' }, taskEnv(db), 'shared-key', capabilities, fetch, async () => {
     calls += 1;
     return { taskId: 'remote-project-2' };
   });
@@ -165,8 +197,9 @@ test('concurrent same-project submissions reserve once and make one paid Kling c
     return { taskId: 'remote-race' };
   };
 
-  const first = submitTask(input, { DB: db }, 'race-key', capabilities, fetch, tool);
-  const second = submitTask(input, { DB: db }, 'race-key', capabilities, fetch, tool);
+  const media = new RecoveryMedia();
+  const first = submitTask(input, taskEnv(db, media), 'race-key', capabilities, fetch, tool);
+  const second = submitTask(input, taskEnv(db, media), 'race-key', capabilities, fetch, tool);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(calls, 1);
   assert.equal(db.tasks.length, 1);
@@ -210,16 +243,21 @@ test('reservation mapping failure rolls back the task and prevents a paid call',
 test('settings failure after core finalization replays the tracked remote task', async () => {
   const db = new TaskDb();
   db.failSettings = true;
+  const media = new RecoveryMedia();
   let calls = 0;
 
   await assert.rejects(
-    () => submitTask(input, { DB: db }, 'settings-key', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-1' }; }),
+    () => submitTask(input, taskEnv(db, media), 'settings-key', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-1' }; }),
     (error) => error.status === 500 && error.message === '项目设置保存失败',
   );
-  const replay = await submitTask(input, { DB: db }, 'settings-key', capabilities, fetch, async () => { calls += 1; });
+  db.failSettings = false;
+  const replay = await submitTask(input, taskEnv(db, media), 'settings-key', capabilities, fetch, async () => { calls += 1; });
 
   assert.equal(calls, 1);
   assert.deepEqual(replay, { id: replay.id, remote_id: 'remote-1', status: 'queued' });
+  assert.equal(db.settings.length, 1);
+  assert.equal(media.objects.size, 0);
+  assert.equal(media.deleted.length, 1);
 });
 
 test('core finalization retries transient database failures without another provider call', async () => {
@@ -227,11 +265,61 @@ test('core finalization retries transient database failures without another prov
   db.finalizationFailuresRemaining = 2;
   let calls = 0;
 
-  const result = await submitTask(input, { DB: db }, 'retry-finalize', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-retry' }; });
+  const result = await submitTask(input, taskEnv(db), 'retry-finalize', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-retry' }; });
 
   assert.equal(calls, 1);
   assert.equal(db.finalizationAttempts, 3);
   assert.deepEqual(result, { id: result.id, remote_id: 'remote-retry', status: 'queued' });
+});
+
+test('persistent core finalization failure recovers from R2 on replay without another provider call', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  db.finalizationFailuresRemaining = 3;
+  let calls = 0;
+
+  await assert.rejects(
+    () => submitTask(input, taskEnv(db, media), 'recover-core', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-recover' }; }),
+    (error) => error.status === 500 && error.message === '任务保存失败',
+  );
+  assert.equal(media.objects.size, 1);
+  db.finalizationFailuresRemaining = 0;
+  const replay = await submitTask(input, taskEnv(db, media), 'recover-core', capabilities, fetch, async () => { calls += 1; });
+
+  assert.equal(calls, 1);
+  assert.deepEqual(replay, { id: replay.id, remote_id: 'remote-recover', status: 'queued' });
+  assert.equal(media.objects.size, 0);
+  assert.equal(media.deleted.length, 1);
+});
+
+test('recovery record is minimal and excludes extra secrets or raw input data', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  db.finalizationFailuresRemaining = 3;
+
+  await assert.rejects(() => submitTask({ ...input, apiToken: 'secret-token', rawFile: [1, 2, 3] }, taskEnv(db, media), 'safe-recovery', capabilities, fetch, async () => ({ taskId: 'remote-safe', access_token: 'provider-secret' })));
+  const record = JSON.parse([...media.objects.values()][0]);
+
+  assert.deepEqual(Object.keys(record).sort(), ['id', 'projectId', 'remoteId', 'result', 'settings']);
+  assert.equal(record.remoteId, 'remote-safe');
+  assert.deepEqual(record.result, { taskId: 'remote-safe' });
+  assert.equal(JSON.stringify(record).includes('secret'), false);
+  assert.equal(JSON.stringify(record).includes('rawFile'), false);
+});
+
+test('recovery write failure is bounded and returns the remote id without provider internals', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  media.failPutsRemaining = 3;
+  let calls = 0;
+
+  await assert.rejects(
+    () => submitTask(input, taskEnv(db, media), 'recovery-put-fail', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-visible', secret: 'provider-secret' }; }),
+    (error) => error.status === 503 && error.message === '任务恢复记录保存失败' && error.task?.remote_id === 'remote-visible' && !JSON.stringify(error).includes('provider-secret'),
+  );
+  assert.equal(calls, 1);
+  assert.equal(media.putAttempts, 3);
+  assert.equal(db.tasks[0].status, 'submitting');
 });
 
 test('database without batch support fails before a paid call or reservation write', async () => {
@@ -312,7 +400,7 @@ test('task rejects a missing or invalid project before calling Kling', async () 
 test('task links the generated task and saves a serializable settings snapshot', async () => {
   const db = new TaskDb();
   const calls = [];
-  const result = await submitTask(input, { DB: db }, 'key-1', capabilities, fetch, async (_env, name, args) => {
+  const result = await submitTask(input, taskEnv(db), 'key-1', capabilities, fetch, async (_env, name, args) => {
     calls.push({ name, args });
     return { taskId: 'remote-1' };
   });

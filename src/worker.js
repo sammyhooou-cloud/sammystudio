@@ -111,7 +111,7 @@ async function api(request, env) {
     try {
       return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID(), () => getKlingStatus(env)));
     } catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      if (error instanceof TaskError) return json({ error: error.message, ...(error.task ? { task: error.task } : {}) }, error.status);
       return json({ error: '任务处理失败' }, 500);
     }
   }

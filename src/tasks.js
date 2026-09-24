@@ -1,9 +1,10 @@
 import { callTool } from './kling-mcp.js';
 
 export class TaskError extends Error {
-  constructor(message, status) {
+  constructor(message, status, task) {
     super(message);
     this.status = status;
+    if (task) this.task = task;
   }
 }
 
@@ -48,6 +49,32 @@ function taskDto(task) {
   return { id: task.id, remote_id: task.remote_id || null, status: task.status };
 }
 
+const recoveryKey = (id) => `task-recovery/${id}.json`;
+
+async function saveSettings(db, projectId, settings) {
+  try {
+    await db.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at').bind(projectId, JSON.stringify(settings), Date.now()).run();
+  } catch {
+    throw new TaskError('项目设置保存失败', 500);
+  }
+}
+
+async function writeRecovery(media, record) {
+  const body = JSON.stringify(record);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await media.put(recoveryKey(record.id), body, { httpMetadata: { contentType: 'application/json' } });
+      return;
+    } catch {
+      if (attempt === 2) throw new TaskError('任务恢复记录保存失败', 503, { id: record.id, remote_id: record.remoteId, status: 'submitting' });
+    }
+  }
+}
+
+async function deleteRecovery(media, id) {
+  try { await media.delete(recoveryKey(id)); } catch {}
+}
+
 async function markFailed(db, id) {
   try {
     await db.prepare('UPDATE video_tasks SET status = ?, updated_at = ? WHERE id = ?').bind('failed', Date.now(), id).run();
@@ -65,6 +92,32 @@ async function finalizeTask(db, id, remoteId, result) {
   }
 }
 
+async function replayTask(task, env, projectId) {
+  if (task.status === 'submitting' && !task.remote_id) {
+    let object;
+    try { object = await env.MEDIA.get(recoveryKey(task.id)); } catch { return taskDto(task); }
+    if (!object) return taskDto(task);
+    let record;
+    try { record = JSON.parse(await object.text()); } catch { throw new TaskError('任务恢复记录无效', 500); }
+    if (record.id !== task.id || record.projectId !== projectId || !record.remoteId) throw new TaskError('任务恢复记录无效', 500);
+    await finalizeTask(env.DB, task.id, record.remoteId, record.result);
+    await saveSettings(env.DB, projectId, record.settings);
+    await deleteRecovery(env.MEDIA, task.id);
+    return taskDto({ id: task.id, remote_id: record.remoteId, status: 'queued' });
+  }
+  if (task.request_json) {
+    let valid;
+    try { valid = JSON.parse(task.request_json); } catch {}
+    if (valid) {
+      const settings = settingsSnapshot(valid);
+      const saved = await env.DB.prepare('SELECT settings_json FROM project_settings WHERE project_id = ?').bind(projectId).first();
+      if (saved?.settings_json !== JSON.stringify(settings)) await saveSettings(env.DB, projectId, settings);
+    }
+  }
+  if (task.status === 'queued') await deleteRecovery(env.MEDIA, task.id);
+  return taskDto(task);
+}
+
 export async function submitTask(input, env, idempotencyKey, capabilitiesSource, fetcher = fetch, toolCaller = callTool) {
   const projectId = String(input?.projectId || '').trim();
   if (!projectId) throw new TaskError('请选择项目', 400);
@@ -72,9 +125,9 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   if (!project) throw new TaskError('请选有效项目', 400);
   const internalKey = JSON.stringify([projectId, idempotencyKey]);
   const existing = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(internalKey, projectId).first();
-  if (existing) return taskDto(existing);
+  if (existing) return replayTask(existing, env, projectId);
   const legacy = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(idempotencyKey, projectId).first();
-  if (legacy) return taskDto(legacy);
+  if (legacy) return replayTask(legacy, env, projectId);
   if (typeof env.DB.batch !== 'function') throw new TaskError('任务保存失败', 500);
   const capabilities = await loadCapabilities(capabilitiesSource);
   let valid;
@@ -115,11 +168,10 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
     await markFailed(env.DB, id);
     throw new TaskError('视频生成服务返回无效', 502);
   }
+  const settings = settingsSnapshot(valid);
+  await writeRecovery(env.MEDIA, { id, projectId, remoteId, result: { taskId: remoteId }, settings });
   await finalizeTask(env.DB, id, remoteId, result);
-  try {
-    await env.DB.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at').bind(projectId, JSON.stringify(settingsSnapshot(valid)), createdAt).run();
-  } catch {
-    throw new TaskError('项目设置保存失败', 500);
-  }
+  await saveSettings(env.DB, projectId, settings);
+  await deleteRecovery(env.MEDIA, id);
   return taskDto({ id, remote_id: remoteId, status: 'queued' });
 }
