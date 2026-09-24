@@ -80,9 +80,11 @@ test('controller suppresses stale upload responses and revokes replacement URLs'
   const first = harness.controller.select({ name: 'one.png', type: 'image/png', size: 1 }, 'p');
   const second = harness.controller.select({ name: 'two.png', type: 'image/png', size: 1 }, 'p');
   assert.deepEqual(harness.revoked, ['blob:one.png']);
-  harness.requests[0].resolve({ uploadId: 'stale' }); await first;
+  harness.requests[0].resolve({ uploadId: 'stale' });
+  assert.deepEqual(await first, { uploadId: 'stale', current: false });
   assert.equal(harness.controller.uploadId, '');
-  harness.requests[1].resolve({ uploadId: 'current' }); await second;
+  harness.requests[1].resolve({ uploadId: 'current' });
+  assert.deepEqual(await second, { uploadId: 'current', current: true });
   assert.equal(harness.controller.uploadId, 'current');
 });
 

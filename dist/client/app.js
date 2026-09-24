@@ -39,6 +39,43 @@ export function storeCurrentProjectId(storage, projectId) {
   try { storage?.setItem('currentProjectId', projectId); return Boolean(storage); } catch { return false; }
 }
 
+export function createProjectDrafts() {
+  const drafts = new Map();
+  return {
+    save(projectId, settings) { if (projectId) drafts.set(projectId, { ...settings }); },
+    load(projectId, fallback = {}) { return { ...(drafts.get(projectId) ?? fallback) }; },
+  };
+}
+
+export function createSubmissionAttemptController(keyFactory = () => crypto.randomUUID(), storage = null) {
+  const storageKey = 'klingPendingAttempts';
+  let saved = [];
+  try { const value = JSON.parse(storage?.getItem(storageKey) || '[]'); if (Array.isArray(value)) saved = value; } catch {}
+  const pending = new Map(saved.filter((entry) => Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'string'));
+  let inFlight = false;
+  const persist = () => { try { storage?.setItem(storageKey, JSON.stringify([...pending])); } catch {} };
+  return {
+    get inFlight() { return inFlight; },
+    begin(payload) {
+      if (inFlight) return null;
+      const signature = JSON.stringify(payload);
+      const key = pending.get(signature) || keyFactory();
+      pending.set(signature, key);
+      persist();
+      inFlight = true;
+      return { key, signature, payload };
+    },
+    settle(attempt, definitiveSuccess) {
+      inFlight = false;
+      if (definitiveSuccess && pending.get(attempt.signature) === attempt.key) { pending.delete(attempt.signature); persist(); }
+    },
+  };
+}
+
+export function nextPollDelay(current, success) { return success ? 3000 : Math.min(Math.max(current, 3000) * 2, 30000); }
+export function shouldSaveStaleUpload(startProjectEpoch, currentProjectEpoch) { return startProjectEpoch !== currentProjectEpoch; }
+export function sidebarShouldBeInert(open, mobile) { return mobile && !open; }
+
 export function createRetryableLoader(load) {
   let active = null;
   return () => {
@@ -96,7 +133,7 @@ function hasVideoExtension(value) {
 }
 
 function videoTyped(value) {
-  return [value?.type, value?.mediaType, value?.media_type, value?.mimeType, value?.mime_type, value?.kind]
+  return [value?.type, value?.mediaType, value?.media_type, value?.mimeType, value?.mime_type, value?.contentType, value?.kind]
     .some((item) => typeof item === 'string' && /(?:^|[\/_-])video(?:$|[\/_-])|^video\//i.test(item));
 }
 
@@ -111,7 +148,7 @@ export function extractVideoUrl(value) {
   for (const key of ['video', 'result', 'data']) {
     const found = extractVideoUrl(value[key]); if (found) return found;
   }
-  for (const key of ['videos', 'outputs']) {
+  for (const key of ['videos', 'outputs', 'works']) {
     if (!Array.isArray(value[key])) continue;
     for (const output of value[key]) {
       const found = extractVideoUrl(output); if (found) return found;
@@ -202,7 +239,7 @@ export function buildGenerationPayload(value) {
 async function request(path, options = {}) {
   const response = await fetch(path, options);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || '请求失败');
+  if (!response.ok) { const error = new Error(body.error || '请求失败'); error.task = body.task; error.status = response.status; throw error; }
   return body;
 }
 
@@ -218,7 +255,10 @@ function setup() {
   const duration = document.querySelector('#duration');
   const ratio = document.querySelector('#aspect-ratio');
   let mode = 'text', capabilities = {}, projects = [], imageCount = 1, projectTasks = [];
-  let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false;
+  let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, projectEpoch = 0;
+  const drafts = createProjectDrafts();
+  const attempts = createSubmissionAttemptController(undefined, attemptStorage());
+  let pollTimer = null, pollSequence = 0, polledTaskKey = '';
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
@@ -227,14 +267,16 @@ function setup() {
     request: (form) => request('/api/uploads', { method: 'POST', body: form }),
     render: (state) => { if (state) renderImagePreview(previewView, state); else { previewView.preview.hidden = true; previewView.empty.hidden = false; } updateSubmitDisabled(); },
   });
-  function clearImage() { imageInput.value = ''; uploadController.remove(); }
-  projectChangeHandler = () => { imageInput.value = ''; uploadController.projectSwitch(); };
+  function clearImage() { imageInput.value = ''; uploadController.remove(); saveDraft(); }
+  projectChangeHandler = () => { projectEpoch += 1; imageInput.value = ''; uploadController.projectSwitch(); };
   window.addEventListener('beforeunload', () => uploadController.unload(), { once: true });
 
   const projectList = document.querySelector('#project-list');
   const projectError = document.querySelector('#project-error');
   const drawerToggle = document.querySelector('#project-drawer-toggle');
   const sidebar = document.querySelector('#project-sidebar');
+  const sidebarCollapse = document.querySelector('#sidebar-collapse');
+  const workspaceShell = document.querySelector('.workspace-shell');
   const backdrop = document.querySelector('#project-backdrop');
   const createForm = document.querySelector('#create-project-form');
   const renameForm = document.querySelector('#rename-project-form');
@@ -243,7 +285,34 @@ function setup() {
   const retryWorkspace = document.querySelector('#workspace-retry');
 
   function updateSubmitDisabled() {
-    document.querySelector('#generate').disabled = projectSwitchBusy || (mode === 'image' && !uploadController.canSubmit);
+    document.querySelector('#generate').disabled = projectSwitchBusy || attempts.inFlight || (mode === 'image' && !uploadController.canSubmit);
+  }
+
+  function draftSnapshot() {
+    return { mode, prompt: document.querySelector('#prompt').value, model: modelSelect.value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount, uploadId: uploadController.uploadId };
+  }
+  function saveDraft() { drafts.save(currentProjectId, draftSnapshot()); }
+
+  function stopPolling() { if (pollTimer) clearTimeout(pollTimer); pollTimer = null; polledTaskKey = ''; pollSequence += 1; }
+  function pollActiveTask() {
+    const task = projectTasks[0];
+    if (!task || !['queued', 'generating', 'submitting'].includes(task.status)) { stopPolling(); return; }
+    const key = `${currentProjectId}:${task.id}`;
+    if (polledTaskKey === key) return;
+    stopPolling(); polledTaskKey = key;
+    const sequence = pollSequence; const projectId = currentProjectId;
+    let delay = 3000;
+    const tick = async () => {
+      if (sequence !== pollSequence || currentProjectId !== projectId) return;
+      try {
+        const updated = await request(`/api/video/tasks/${encodeURIComponent(task.id)}?projectId=${encodeURIComponent(projectId)}`);
+        if (sequence !== pollSequence || currentProjectId !== projectId) return;
+        projectTasks = projectTasks.map((item) => item.id === task.id ? { ...item, remoteId: updated.remote_id, status: updated.status, resultJson: updated.resultJson ?? item.resultJson, updatedAt: Date.now() } : item);
+        delay = nextPollDelay(delay, true); renderTasks();
+      } catch { delay = nextPollDelay(delay, false); }
+      if (sequence === pollSequence && polledTaskKey === key) pollTimer = setTimeout(tick, delay);
+    };
+    pollTimer = setTimeout(tick, delay);
   }
 
   function setProjectSwitchBusy(busy) {
@@ -257,7 +326,11 @@ function setup() {
     try { return window.localStorage; } catch { return null; }
   }
 
-  function isMobileDrawer() { return matchMedia('(max-width: 760px)').matches; }
+  function attemptStorage() {
+    try { return window.sessionStorage; } catch { return null; }
+  }
+
+  function isMobileDrawer() { return matchMedia('(max-width: 1200px)').matches; }
 
   function setModalState(active) {
     if (active) { sidebar.setAttribute('role', 'dialog'); sidebar.setAttribute('aria-modal', 'true'); }
@@ -272,12 +345,21 @@ function setup() {
     const { modal: modalOpen } = drawerModalState(open, isMobileDrawer());
     drawerOpen = open;
     sidebar.classList.toggle('open', open);
+    sidebar.inert = sidebarShouldBeInert(open, isMobileDrawer());
     backdrop.hidden = !open;
     drawerToggle.setAttribute('aria-expanded', String(open));
     setModalState(modalOpen);
     if (modalOpen) document.querySelector('#new-project').focus();
     if (returnFocus) drawerToggle.focus();
     else if (!open && focusTarget) focusTarget.focus();
+  }
+  let sidebarCollapsed = false;
+  function setSidebarCollapsed(value) {
+    sidebarCollapsed = value;
+    workspaceShell.classList.toggle('sidebar-collapsed', value);
+    sidebarCollapse.setAttribute('aria-expanded', String(!value));
+    sidebarCollapse.setAttribute('aria-label', value ? '展开项目导航' : '收起项目导航');
+    for (const element of [projectList, createForm, document.querySelector('#new-project'), document.querySelector('#rename-project-mobile'), projectError, retryWorkspace]) element.inert = value && !isMobileDrawer();
   }
 
   function renderProjects() {
@@ -302,7 +384,8 @@ function setup() {
   }
 
   function applyWorkspace(workspaceState) {
-    const state = workspaceFormState(capabilities, mode, workspaceState?.settings || {});
+    const settings = drafts.load(currentProjectId, workspaceState?.settings || {});
+    const state = workspaceFormState(capabilities, mode, settings);
     mode = state.mode;
     document.querySelectorAll('[data-mode]').forEach((button) => {
       const active = button.dataset.mode === mode;
@@ -318,7 +401,7 @@ function setup() {
     duration.value = state.duration;
     ratio.value = state.aspectRatio;
     imageCount = state.imageCount;
-    const restoredImage = workspaceImageState(currentProjectId, workspaceState?.settings, workspaceState?.assets);
+    const restoredImage = workspaceImageState(currentProjectId, settings, workspaceState?.assets);
     if (restoredImage && mode === 'image') uploadController.restore(restoredImage.asset, restoredImage.url);
     else clearImage();
     projectTasks = Array.isArray(workspaceState?.tasks) ? workspaceState.tasks : [];
@@ -341,16 +424,17 @@ function setup() {
     if (!state.current) {
       empty.hidden = false; progress.hidden = true; clearVideoElement(video);
       document.querySelector('#task-state').textContent = '等待提交'; document.querySelector('#task-id').textContent = '';
-      return;
+      pollActiveTask(); return;
     }
     renderSelectedTask(state.current);
+    pollActiveTask();
   }
 
   function renderSelectedTask(task) {
     const state = workspaceTaskState([task]);
     document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false;
-    document.querySelector('#task-state').textContent = task.status || '未知状态';
-    document.querySelector('#task-id').textContent = `任务 ${task.id || '—'}`;
+    document.querySelector('#task-state').textContent = task.status === 'unknown' ? '状态待核对' : task.status || '未知状态';
+    document.querySelector('#task-id').textContent = task.status === 'unknown' ? `任务 ${task.id || '—'}：提交结果未知，请勿重复创建。` : `任务 ${task.id || '—'}`;
     const video = document.querySelector('#result-video');
     clearVideoElement(video);
     if (state.videoUrl) { video.src = state.videoUrl; video.hidden = false; }
@@ -376,6 +460,7 @@ function setup() {
       return;
     }
     const sequence = ++workspaceLoadSequence;
+    saveDraft();
     projectError.textContent = '正在加载项目…';
     if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
       returnFocus: drawerShouldReturnFocus(closeReason),
@@ -387,7 +472,7 @@ function setup() {
       commit: (workspaceState) => {
         if (sequence !== workspaceLoadSequence) return;
         commitProjectWorkspace(
-          () => { generationSequence += 1; },
+          () => { generationSequence += 1; stopPolling(); },
           () => {
             setCurrentProjectId(project.id);
             storeCurrentProjectId(projectStorage(), project.id);
@@ -425,10 +510,15 @@ function setup() {
 
   async function refreshStatus() {
     statusText.textContent = '正在检测';
+    const priorSettings = draftSnapshot();
     const status = await request('/api/kling/status'); capabilities = status.models || {};
     const online = status.connection === 'online'; statusLight.classList.toggle('online', online); statusText.textContent = online ? 'MCP 在线' : 'MCP 未连接';
     document.querySelector('#membership').textContent = status.membership ?? '—'; document.querySelector('#credits').textContent = status.credits ?? '暂不可用'; document.querySelector('#last-check').textContent = `最后检查 ${new Date(status.checkedAt).toLocaleTimeString()}`;
-    fillModels(); if (!online) statusText.parentElement.onclick = () => { location.href = '/api/kling/oauth/start'; };
+    fillModels();
+    const restored = workspaceFormState(capabilities, mode, priorSettings);
+    modelSelect.value = restored.model; updateOptions();
+    resolution.value = restored.resolution; duration.value = restored.duration; ratio.value = restored.aspectRatio;
+    if (!online) statusText.parentElement.onclick = () => { location.href = '/api/kling/oauth/start'; };
   }
   function applyAccountStatus(status) {
     const online = status.connection === 'online';
@@ -450,16 +540,27 @@ function setup() {
   request('/api/session').then(enterWorkspace).catch(() => {});
   document.querySelector('#password-toggle').onclick = () => { const input = document.querySelector('#password'); input.type = input.type === 'password' ? 'text' : 'password'; };
   loginForm.onsubmit = async (event) => { event.preventDefault(); try { await request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password: document.querySelector('#password').value }) }); await enterWorkspace(); } catch (error) { document.querySelector('#login-error').textContent = error.message; } };
-  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); document.querySelector('#upload-field').hidden = mode !== 'image'; if (mode !== 'image') clearImage(); updateSubmitDisabled(); fillModels(); });
-  modelSelect.onchange = updateOptions;
+  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); document.querySelector('#upload-field').hidden = mode !== 'image'; updateSubmitDisabled(); fillModels(); saveDraft(); });
+  modelSelect.onchange = () => { updateOptions(); saveDraft(); };
+  generator.addEventListener('input', saveDraft);
+  generator.addEventListener('change', saveDraft);
   imageInput.onchange = async (event) => {
     const file = event.target.files[0]; if (!file) return;
-    try { document.querySelector('#form-error').textContent = ''; await uploadController.select(file, currentProjectId); }
+    const selectedProjectId = currentProjectId;
+    const selectedProjectEpoch = projectEpoch;
+    try {
+      document.querySelector('#form-error').textContent = '';
+      const result = await uploadController.select(file, selectedProjectId);
+      if (result?.current && currentProjectId === selectedProjectId) saveDraft();
+      else if (result?.uploadId && shouldSaveStaleUpload(selectedProjectEpoch, projectEpoch)) drafts.save(selectedProjectId, { ...drafts.load(selectedProjectId), uploadId: result.uploadId });
+    }
     catch (error) { document.querySelector('#form-error').textContent = error.message; }
   };
   document.querySelector('#replace-image').onclick = () => openImageReplacement(imageInput);
   document.querySelector('#remove-image').onclick = clearImage;
   drawerToggle.onclick = () => setDrawer(!drawerOpen);
+  sidebarCollapse.onclick = () => setSidebarCollapsed(!sidebarCollapsed);
+  setDrawer(false);
   backdrop.onclick = () => setDrawer(closeProjectDrawer(drawerOpen, 'backdrop'), { returnFocus: true });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && drawerOpen) { setDrawer(false, { returnFocus: true }); return; }
@@ -469,7 +570,7 @@ function setup() {
     const next = nextDrawerFocusIndex(current < 0 ? (event.shiftKey ? 0 : -1) : current, focusable.length, event.shiftKey);
     if (next >= 0 && ((event.shiftKey && current <= 0) || (!event.shiftKey && current === focusable.length - 1) || current < 0)) { event.preventDefault(); focusable[next].focus(); }
   });
-  addEventListener('resize', () => { if (drawerOpen && !isMobileDrawer()) setDrawer(false); });
+  addEventListener('resize', () => { if (drawerOpen && !isMobileDrawer()) setDrawer(false); else sidebar.inert = sidebarShouldBeInert(drawerOpen, isMobileDrawer()); setSidebarCollapsed(sidebarCollapsed); });
   retryWorkspace.onclick = () => { enterWorkspace().catch(() => {}); };
   document.querySelector('#new-project').onclick = () => { createForm.hidden = false; document.querySelector('#new-project-name').focus(); };
   document.querySelector('#cancel-create-project').onclick = () => { createForm.hidden = true; createForm.reset(); projectError.textContent = ''; };
@@ -494,7 +595,42 @@ function setup() {
       projects = renameProjectInList(projects, project); renameForm.hidden = true; renderProjects();
     } catch (error) { projectError.textContent = error.message; }
   };
-  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const submittedProjectId = currentProjectId; const submissionToken = ++generationSequence; const submissionIsCurrent = () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence); const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; await performGenerationSubmission({ submit: () => request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }), isCurrent: submissionIsCurrent, success: (task) => { projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() }); renderTasks(); void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {}); }, fail: (error) => { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } }); };
+  generator.onsubmit = async (event) => {
+    event.preventDefault();
+    if (projectSwitchBusy || attempts.inFlight) return;
+    const submittedProjectId = currentProjectId;
+    const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount });
+    const errors = validateWorkspace(payload);
+    if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; }
+    const attempt = attempts.begin(payload);
+    if (!attempt) return;
+    updateSubmitDisabled();
+    saveDraft();
+    const submissionToken = ++generationSequence;
+    const submissionIsCurrent = () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence);
+    document.querySelector('#form-error').textContent = '';
+    document.querySelector('#result-empty').hidden = true;
+    document.querySelector('#result-progress').hidden = false;
+    document.querySelector('#task-state').textContent = '正在提交';
+    try {
+      const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': attempt.key }, body: JSON.stringify(payload) });
+      attempts.settle(attempt, Boolean(task.remote_id));
+      if (submissionIsCurrent()) {
+        projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+        renderTasks();
+        void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {});
+      }
+    } catch (error) {
+      attempts.settle(attempt, false);
+      if (submissionIsCurrent()) {
+        document.querySelector('#form-error').textContent = error.message;
+        if (error.task?.id) {
+          projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: error.task.id, remoteId: error.task.remote_id, status: error.task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+          renderTasks();
+        } else document.querySelector('#task-state').textContent = '提交结果待确认';
+      }
+    } finally { updateSubmitDisabled(); }
+  };
   document.querySelector('#refresh-status').onclick = refreshStatus;
   document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
 }

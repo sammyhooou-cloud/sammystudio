@@ -18,6 +18,24 @@ function resultsOf(query) {
   return query?.results ?? [];
 }
 
+export async function backfillLegacyRows(db, now = Date.now()) {
+  const marker = 'legacy_project_backfill_v1';
+  const done = await db.prepare('SELECT name FROM migration_markers WHERE name = ?').bind(marker).first();
+  if (done) return;
+  await db.batch([
+    db.prepare('INSERT OR IGNORE INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)').bind('uncategorized', '未分类项目', now, now),
+    db.prepare(`INSERT OR IGNORE INTO project_assets (project_id, object_id, created_at)
+      SELECT ?, stored_objects.id, stored_objects.created_at FROM stored_objects
+      WHERE NOT EXISTS (SELECT 1 FROM project_assets WHERE object_id = stored_objects.id)
+        AND NOT EXISTS (SELECT 1 FROM migration_markers WHERE name = ?)` ).bind('uncategorized', marker),
+    db.prepare(`INSERT OR IGNORE INTO project_tasks (project_id, task_id, created_at)
+      SELECT ?, video_tasks.id, video_tasks.created_at FROM video_tasks
+      WHERE NOT EXISTS (SELECT 1 FROM project_tasks WHERE task_id = video_tasks.id)
+        AND NOT EXISTS (SELECT 1 FROM migration_markers WHERE name = ?)` ).bind('uncategorized', marker),
+    db.prepare('INSERT OR IGNORE INTO migration_markers (name, applied_at) VALUES (?, ?)').bind(marker, now),
+  ]);
+}
+
 export async function ensureDefaultProject(db, idFactory = () => 'uncategorized', now = Date.now()) {
   const existing = await db
     .prepare('SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at ASC, id ASC LIMIT 1')
@@ -79,7 +97,7 @@ export async function readProjectWorkspace(db, id) {
   if (!project) throw new Error('项目不存在');
 
   const [assetQuery, taskQuery, setting] = await Promise.all([
-    db.prepare(`SELECT stored_objects.id, stored_objects.mime_type, stored_objects.size, stored_objects.created_at
+    db.prepare(`SELECT stored_objects.id, stored_objects.mime_type, stored_objects.size, stored_objects.filename, stored_objects.created_at
       FROM project_assets
       JOIN stored_objects ON stored_objects.id = project_assets.object_id
       WHERE project_assets.project_id = ?
@@ -104,6 +122,7 @@ export async function readProjectWorkspace(db, id) {
     project: projectRecord(project),
     assets: resultsOf(assetQuery).map((asset) => ({
       id: asset.id,
+      name: asset.filename || asset.id,
       mimeType: asset.mime_type,
       size: asset.size,
       createdAt: asset.created_at,

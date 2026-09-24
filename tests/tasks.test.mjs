@@ -1,15 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { submitTask } from '../src/tasks.js';
+import { submitTask, getTaskStatus } from '../src/tasks.js';
 
 const capabilities = {
   text_to_video: {
     models: [{
       model: 'kling-v1',
       arguments: [
+        { name: 'prompt', required: true },
         { name: 'duration', allowedValues: ['5'] },
         { name: 'resolution', allowedValues: ['720p'] },
         { name: 'aspect_ratio', allowedValues: ['16:9'] },
+        { name: 'imageCount' },
       ],
     }],
   },
@@ -95,6 +97,11 @@ class TaskDb {
           return { version };
         }
         if (sql.includes('JOIN project_tasks')) {
+          if (sql.includes('video_tasks.id = ?')) {
+            const [taskId, projectId] = this.values;
+            return db.projectTasks.some(({ task_id, project_id }) => task_id === taskId && project_id === projectId)
+              ? db.tasks.find(({ id }) => id === taskId) ?? null : null;
+          }
           const [idempotencyKey, projectId] = this.values;
           const taskIds = db.projectTasks.filter(({ project_id }) => project_id === projectId).map(({ task_id }) => task_id);
           return db.tasks.find(({ id, idempotency_key }) => idempotency_key === idempotencyKey && taskIds.includes(id)) ?? null;
@@ -128,10 +135,12 @@ class TaskDb {
           const task = db.tasks.find(({ id }) => id === values[4]);
           task.remote_id = values[0];
           task.status = values[1];
+          task.result_json = values[2];
         }
         else if (sql.startsWith('UPDATE video_tasks SET status')) {
-          const task = db.tasks.find(({ id }) => id === values[2]);
+          const task = db.tasks.find(({ id }) => id === (sql.includes('result_json') ? values[3] : values[2]));
           task.status = values[0];
+          if (sql.includes('result_json')) task.result_json = values[1];
         }
         else if (sql.startsWith('INSERT INTO project_tasks')) {
           if (db.failProjectTask) throw new Error('mapping unavailable');
@@ -175,6 +184,107 @@ test('same project idempotency replay returns its task without another Kling cal
   assert.deepEqual(result, { id: 'task-1', remote_id: 'remote-1', status: 'queued' });
   assert.equal(calls, 0);
   assert.equal(db.tasks.length, 1);
+});
+
+test('writes paid-call intent before generation and uses a stable trace identifier', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia(); let observed;
+  const result = await submitTask(input, taskEnv(db, media), 'intent-key', capabilities, fetch, async (_env, name, args) => {
+    assert.equal(name, 'text_to_video');
+    observed = JSON.parse(media.objects.get(`task-recovery/${db.tasks[0].id}.json`));
+    assert.equal(observed.idempotencyKey, 'intent-key');
+    assert.equal(observed.projectId, 'project-1');
+    assert.equal(args.taskTraceId, observed.traceId);
+    return { generationId: 'generation-1', status: 'submitted' };
+  });
+  assert.equal(result.remote_id, 'generation-1');
+  assert.equal(observed.request.prompt, input.prompt);
+});
+
+test('generation envelope includes only arguments declared by the selected model', async () => {
+  const db = new TaskDb();
+  const limited = { text_to_video: { models: [{ model: 'limited', arguments: [{ name: 'prompt' }, { name: 'duration', allowedValues: ['5'] }] }] } };
+  await submitTask({ ...input, model: 'limited' }, taskEnv(db), 'limited-model', limited, fetch, async (_env, _name, args) => {
+    assert.deepEqual(args.arguments, [{ name: 'prompt', value: input.prompt }, { name: 'duration', value: '5' }]);
+    return { generationId: 'generation-limited' };
+  });
+});
+
+test('ambiguous generation failure remains unknown and replay never makes another paid call', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia(); let calls = 0;
+  await assert.rejects(() => submitTask(input, taskEnv(db, media), 'lost-response', capabilities, fetch, async () => {
+    calls += 1; throw new Error('connection lost');
+  }));
+  assert.equal(db.tasks[0].status, 'unknown');
+  const replay = await submitTask(input, taskEnv(db, media), 'lost-response', capabilities, fetch, async () => { calls += 1; });
+  assert.equal(replay.status, 'unknown');
+  assert.equal(calls, 1);
+});
+
+test('orphaned intent becomes action-required after the crash window without a second paid call', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia();
+  const id = 'orphan-1';
+  db.tasks.push({ id, idempotency_key: '["project-1","orphan-key"]', remote_id: null, status: 'submitting', created_at: Date.now() - 6 * 60_000 });
+  db.projectTasks.push({ project_id: 'project-1', task_id: id });
+  media.objects.set(`task-recovery/${id}.json`, JSON.stringify({ id, projectId: 'project-1', idempotencyKey: 'orphan-key', traceId: 'trace', request: {}, settings: {}, settingsVersion: 1, remoteId: null, phase: 'intent' }));
+  let calls = 0;
+  const replay = await submitTask(input, taskEnv(db, media), 'orphan-key', capabilities, fetch, async () => { calls += 1; });
+  assert.equal(replay.status, 'unknown');
+  assert.equal(calls, 0);
+});
+
+test('accepted generation is finalized from known remote ID if post-response R2 update fails', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia();
+  const result = await submitTask(input, taskEnv(db, media), 'post-write-fail', capabilities, fetch, async () => {
+    media.failPutsRemaining = 3;
+    return { generationId: 'generation-known' };
+  });
+  assert.equal(result.remote_id, 'generation-known');
+  assert.equal(db.tasks[0].remote_id, 'generation-known');
+});
+
+test('status lookup checks ownership, polls by generationId, and stores completed works', async () => {
+  const db = new TaskDb(); db.tasks.push({ id: 'local-1', remote_id: 'generation-1', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'local-1' });
+  let calls = 0;
+  const task = await getTaskStatus('local-1', 'project-1', taskEnv(db), fetch, async (_env, name, args) => {
+    calls += 1; assert.equal(name, 'query_tasks'); assert.deepEqual(args, { generationId: 'generation-1' });
+    return { generationId: 'generation-1', status: 'COMPLETED', works: [{ contentType: 'video', url: 'https://cdn.test/result.mp4' }] };
+  });
+  assert.equal(task.status, 'succeeded');
+  assert.equal(JSON.parse(db.tasks[0].result_json).works[0].url, 'https://cdn.test/result.mp4');
+  await assert.rejects(() => getTaskStatus('local-1', 'other-project', taskEnv(db), fetch, async () => { calls += 1; }));
+  await getTaskStatus('local-1', 'project-1', taskEnv(db), fetch, async () => { calls += 1; });
+  assert.equal(calls, 1);
+});
+
+test('image generation uses Kling upload ticket and a multipart byte upload before paid call', async () => {
+  const db = new TaskDb(); db.upload = { object_key: 'references/asset-1', mime_type: 'image/png', filename: 'scene.png', size: 3 };
+  const media = new RecoveryMedia(); const originalGet = media.get.bind(media);
+  media.get = async (key) => key === 'references/asset-1' ? { arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer } : originalGet(key);
+  const imageCapabilities = { image_to_video: { models: [{ model: 'kling-v1', arguments: capabilities.text_to_video.models[0].arguments, inputs: [{ name: 'first_image' }] }] } };
+  let uploaded = false;
+  const fetcher = async (url, options) => {
+    assert.equal(url, 'https://upload.test/image');
+    assert.equal(options.method, 'POST');
+    assert.equal(options.body.get('ticket'), 'upload-ticket');
+    assert.equal(options.body.get('file').name, 'scene.png');
+    assert.deepEqual([...new Uint8Array(await options.body.get('file').arrayBuffer())], [1, 2, 3]);
+    uploaded = true;
+    return new Response(JSON.stringify({ url: 'https://cdn.test/scene.png' }), { headers: { 'content-type': 'application/json' } });
+  };
+  const task = await submitTask({ ...input, mode: 'image', uploadId: 'asset-1' }, taskEnv(db, media), 'image-ticket', imageCapabilities, fetcher, async (_env, name, args) => {
+    if (name === 'file_upload') {
+      assert.equal(args.filename, 'scene.png');
+      assert.equal('file' in args, false);
+      return { ticket: 'upload-ticket', uploadUrl: 'https://upload.test/image' };
+    }
+    assert.equal(name, 'image_to_video');
+    assert.equal(uploaded, true);
+    assert.equal(args.inputs[0].name, 'first_image');
+    assert.equal(args.inputs[0].url, 'https://cdn.test/scene.png');
+    return { generationId: 'generation-image' };
+  });
+  assert.equal(task.remote_id, 'generation-image');
 });
 
 test('same-project tasks saved with legacy external keys still replay without a paid call', async () => {
@@ -315,8 +425,9 @@ test('concurrent tasks atomically allocate distinct versions and higher recovery
   let calls = 0;
   const tool = async (_env, _name, args) => {
     calls += 1;
-    await new Promise((resolve) => releases.set(args.prompt, resolve));
-    return { taskId: `remote-${args.prompt}` };
+    const prompt = args.arguments.find(({ name }) => name === 'prompt').value;
+    await new Promise((resolve) => releases.set(prompt, resolve));
+    return { taskId: `remote-${prompt}` };
   };
 
   const taskAInput = { ...input, prompt: 'A' };
@@ -352,8 +463,9 @@ test('reverse completion keeps higher-version settings when version 2 saves befo
   const media = new RecoveryMedia();
   const releases = new Map();
   const tool = async (_env, _name, args) => {
-    await new Promise((resolve) => releases.set(args.prompt, resolve));
-    return { taskId: `remote-${args.prompt}` };
+    const prompt = args.arguments.find(({ name }) => name === 'prompt').value;
+    await new Promise((resolve) => releases.set(prompt, resolve));
+    return { taskId: `remote-${prompt}` };
   };
   const taskA = submitTask({ ...input, prompt: 'A' }, taskEnv(db, media), 'reverse-a', capabilities, fetch, tool);
   const taskB = submitTask({ ...input, prompt: 'B' }, taskEnv(db, media), 'reverse-b', capabilities, fetch, tool);
@@ -464,15 +576,15 @@ test('recovery record is minimal and excludes extra secrets or raw input data', 
   await assert.rejects(() => submitTask({ ...input, apiToken: 'secret-token', rawFile: [1, 2, 3] }, taskEnv(db, media), 'safe-recovery', capabilities, fetch, async () => ({ taskId: 'remote-safe', access_token: 'provider-secret' })));
   const record = JSON.parse([...media.objects.values()][0]);
 
-  assert.deepEqual(Object.keys(record).sort(), ['id', 'projectId', 'remoteId', 'result', 'settings', 'settingsVersion']);
+  assert.deepEqual(Object.keys(record).sort(), ['id', 'idempotencyKey', 'phase', 'projectId', 'remoteId', 'request', 'result', 'settings', 'settingsVersion', 'traceId']);
   assert.equal(typeof record.settingsVersion, 'number');
   assert.equal(record.remoteId, 'remote-safe');
-  assert.deepEqual(record.result, { taskId: 'remote-safe' });
+  assert.deepEqual(record.result, { generationId: 'remote-safe' });
   assert.equal(JSON.stringify(record).includes('secret'), false);
   assert.equal(JSON.stringify(record).includes('rawFile'), false);
 });
 
-test('recovery write failure is bounded and returns the remote id without provider internals', async () => {
+test('intent write failure is bounded and prevents a paid provider call', async () => {
   const db = new TaskDb();
   const media = new RecoveryMedia();
   media.failPutsRemaining = 3;
@@ -480,11 +592,11 @@ test('recovery write failure is bounded and returns the remote id without provid
 
   await assert.rejects(
     () => submitTask(input, taskEnv(db, media), 'recovery-put-fail', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-visible', secret: 'provider-secret' }; }),
-    (error) => error.status === 503 && error.message === '任务恢复记录保存失败' && error.task?.remote_id === 'remote-visible' && !JSON.stringify(error).includes('provider-secret'),
+    (error) => error.status === 503 && error.message === '任务恢复记录保存失败' && !JSON.stringify(error).includes('provider-secret'),
   );
-  assert.equal(calls, 1);
+  assert.equal(calls, 0);
   assert.equal(media.putAttempts, 3);
-  assert.equal(db.tasks[0].status, 'submitting');
+  assert.equal(db.tasks[0].status, 'failed');
 });
 
 test('database without batch support fails before a paid call or reservation write', async () => {
@@ -513,24 +625,41 @@ test('missing R2 image object returns a controlled server error before provider 
   assert.equal(calls, 0);
 });
 
-test('provider failure is marked failed and returned as a sanitized gateway error', async () => {
-  const db = new TaskDb();
-
-  await assert.rejects(
-    () => submitTask(input, { DB: db }, 'provider-failure', capabilities, fetch, async () => { throw new Error('provider secret response'); }),
-    (error) => error.status === 502 && error.message === '视频生成服务暂不可用' && !error.message.includes('secret'),
-  );
+test('image storage read errors fail before any paid call', async () => {
+  const db = new TaskDb(); db.upload = { object_key: 'references/unavailable' };
+  const imageCapabilities = { image_to_video: { models: [{ model: 'kling-v1', arguments: capabilities.text_to_video.models[0].arguments }] } };
+  let calls = 0;
+  await assert.rejects(() => submitTask({ ...input, mode: 'image', uploadId: 'asset-1' }, { DB: db, MEDIA: { get: async () => { throw new Error('secret storage detail'); } } }, 'storage-error', imageCapabilities, fetch, async () => { calls += 1; }),
+    (error) => error.status === 500 && error.message === '参考图存储不可用');
+  assert.equal(calls, 0);
   assert.equal(db.tasks[0].status, 'failed');
 });
 
-test('provider success without a task id is marked failed and rejected as malformed', async () => {
+test('empty paid response is action-required rather than permanently submitting', async () => {
+  const db = new TaskDb();
+  await assert.rejects(() => submitTask(input, taskEnv(db), 'empty-response', capabilities, fetch, async () => null),
+    (error) => error.task?.status === 'unknown');
+  assert.equal(db.tasks[0].status, 'unknown');
+});
+
+test('provider response loss is marked unknown and returned as a sanitized gateway error', async () => {
   const db = new TaskDb();
 
   await assert.rejects(
-    () => submitTask(input, { DB: db }, 'malformed-provider', capabilities, fetch, async () => ({ status: 'accepted' })),
-    (error) => error.status === 502 && error.message === '视频生成服务返回无效',
+    () => submitTask(input, taskEnv(db), 'provider-failure', capabilities, fetch, async () => { throw new Error('provider secret response'); }),
+    (error) => error.status === 502 && error.task?.status === 'unknown' && !error.message.includes('secret'),
   );
-  assert.equal(db.tasks[0].status, 'failed');
+  assert.equal(db.tasks[0].status, 'unknown');
+});
+
+test('provider success without a task id remains unknown', async () => {
+  const db = new TaskDb();
+
+  await assert.rejects(
+    () => submitTask(input, taskEnv(db), 'malformed-provider', capabilities, fetch, async () => ({ status: 'accepted' })),
+    (error) => error.status === 502 && error.task?.status === 'unknown',
+  );
+  assert.equal(db.tasks[0].status, 'unknown');
   assert.equal(db.tasks[0].remote_id, null);
 });
 

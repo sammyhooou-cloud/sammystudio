@@ -12,6 +12,7 @@ function env() {
 class RouteDb {
   constructor() {
     this.projects = [{ id: 'project-1', name: '项目一', created_at: 1, updated_at: 1 }];
+    this.migrationMarkers = [];
   }
 
   prepare(sql) {
@@ -21,6 +22,7 @@ class RouteDb {
       bind(...values) { return { ...statement, values }; },
       async first() {
         if (sql.includes('FROM admin_sessions')) return { token_hash: 'valid', expires_at: Date.now() + 60_000 };
+        if (sql.includes('FROM migration_markers')) return db.migrationMarkers.includes(this.values[0]) ? { name: this.values[0] } : null;
         if (sql.includes('FROM project_settings')) return null;
         if (sql.includes('FROM projects') && sql.includes('WHERE id = ?')) return db.projects.find(({ id }) => id === this.values[0]) ?? null;
         if (sql.includes('FROM projects')) return db.projects[0] ?? null;
@@ -33,6 +35,8 @@ class RouteDb {
       },
       async run() {
         const values = this.values;
+        if (sql.startsWith('INSERT OR IGNORE INTO migration_markers')) { db.migrationMarkers.push(values[0]); return { success: true }; }
+        if (sql.startsWith('INSERT OR IGNORE INTO projects')) { if (!db.projects.some(({ id }) => id === values[0])) db.projects.push({ id: values[0], name: values[1], created_at: values[2], updated_at: values[3] }); return { success: true }; }
         if (sql.startsWith('INSERT INTO projects')) {
           db.projects.push({ id: values[0], name: values[1], created_at: values[2], updated_at: values[3] });
           return { success: true, meta: { changes: 1 } };
@@ -55,7 +59,7 @@ class RouteDb {
   }
 }
 
-const sessionHeaders = { cookie: 'keling_session=test-token', 'content-type': 'application/json' };
+const sessionHeaders = { cookie: 'keling_session=test-token', origin: 'https://site.test', 'content-type': 'application/json' };
 
 async function projectRequest(db, pathname, method = 'GET', body) {
   return worker.fetch(new Request(`https://site.test${pathname}`, {
@@ -95,7 +99,7 @@ class UploadDb extends RouteDb {
       bind(...values) { return { ...this, values }; },
       async run() {
         if (sql.startsWith('INSERT INTO stored_objects')) {
-          db.storedObjects.push({ id: this.values[0], object_key: this.values[1] });
+          db.storedObjects.push({ id: this.values[0], object_key: this.values[1], filename: this.values[4] });
         } else {
           db.projectAssets.push({ project_id: this.values[0], object_id: this.values[1], created_at: this.values[2] });
         }
@@ -136,12 +140,17 @@ class TaskRouteDb extends RouteDb {
     if (sql.includes('FROM oauth_tokens')) {
       return { async first() { db.statusQueries += 1; return null; } };
     }
-    if (!sql.includes('FROM video_tasks')) return base;
+    if (!sql.startsWith('SELECT') || !sql.includes('FROM video_tasks')) return base;
     return {
       values: [],
       bind(...values) { return { ...this, values }; },
       async first() {
         if (sql.includes('JOIN project_tasks')) {
+          if (sql.includes('video_tasks.id = ?')) {
+            const [id, projectId] = this.values;
+            return db.projectTasks.some(({ task_id, project_id }) => task_id === id && project_id === projectId)
+              ? db.tasks.find((task) => task.id === id) ?? null : null;
+          }
           const [idempotencyKey, projectId] = this.values;
           const taskIds = db.projectTasks.filter(({ project_id }) => project_id === projectId).map(({ task_id }) => task_id);
           return db.tasks.find(({ id, idempotency_key }) => idempotency_key === idempotencyKey && taskIds.includes(id)) ?? null;
@@ -151,6 +160,20 @@ class TaskRouteDb extends RouteDb {
     };
   }
 }
+
+test('task status route requires authentication and project ownership', async () => {
+  const db = new TaskRouteDb();
+  db.tasks.push({ id: 'task-1', remote_id: null, status: 'unknown', result_json: null });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
+  const runtime = { DB: db, MEDIA: { get: async () => null } };
+  const owned = await worker.fetch(new Request('https://site.test/api/video/tasks/task-1?projectId=project-1', { headers: sessionHeaders }), runtime, {});
+  assert.equal(owned.status, 200);
+  assert.equal((await owned.json()).status, 'unknown');
+  const foreign = await worker.fetch(new Request('https://site.test/api/video/tasks/task-1?projectId=project-2', { headers: sessionHeaders }), runtime, {});
+  assert.equal(foreign.status, 404);
+  const anonymous = await worker.fetch(new Request('https://site.test/api/video/tasks/task-1?projectId=project-1'), runtime, {});
+  assert.equal(anonymous.status, 401);
+});
 
 function taskRequest(projectId, idempotencyKey = 'shared-key') {
   return new Request('https://site.test/api/video/tasks', {
@@ -166,7 +189,7 @@ function uploadRequest(projectId) {
   form.append('file', new Blob(['image'], { type: 'image/png' }), 'image.png');
   return new Request('https://site.test/api/uploads', {
     method: 'POST',
-    headers: { cookie: 'keling_session=test-token' },
+    headers: { cookie: 'keling_session=test-token', origin: 'https://site.test' },
     body: form,
   });
 }
@@ -187,7 +210,7 @@ test('project routes require a session', async () => {
   ]) {
     const response = await worker.fetch(new Request(`https://site.test${pathname}`, {
       method,
-      headers: method === 'GET' ? undefined : { 'content-type': 'application/json' },
+      headers: method === 'GET' ? undefined : { origin: 'https://site.test', 'content-type': 'application/json' },
       body: method === 'GET' ? undefined : JSON.stringify({ name: '项目' }),
     }), env(), {});
     assert.equal(response.status, 401, `${method} ${pathname}`);
@@ -198,7 +221,7 @@ test('authenticated project routes wire list, create, rename, and workspace read
   const db = new RouteDb();
   const listed = await projectRequest(db, '/api/projects');
   assert.equal(listed.status, 200);
-  assert.equal((await listed.json()).projects[0].id, 'project-1');
+  assert.equal((await listed.json()).projects.some(({ id }) => id === 'project-1'), true);
 
   const createdResponse = await projectRequest(db, '/api/projects', 'POST', JSON.stringify({ name: '  新项目  ' }));
   assert.equal(createdResponse.status, 201);
@@ -264,6 +287,7 @@ test('upload links the stored object to the selected project', async () => {
   assert.deepEqual(db.projectAssets, [{ project_id: 'project-1', object_id: uploadId, created_at: db.projectAssets[0].created_at }]);
   assert.equal(db.storedObjects[0].id, uploadId);
   assert.equal(db.storedObjects[0].object_key, `references/${uploadId}`);
+  assert.equal(db.storedObjects[0].filename, 'image.png');
   assert.deepEqual(mediaKeys, [`references/${uploadId}`]);
 });
 

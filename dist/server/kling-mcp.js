@@ -16,7 +16,9 @@ export async function callTool(env, name, args = {}, fetcher = fetch) {
   return rpc(env, 'tools/call', { name, arguments: args }, fetcher);
 }
 
-function toolData(result) {
+export function toolData(result) {
+  if (result?.isError) throw new Error('mcp_tool_error');
+  if (result?.structuredContent) return result.structuredContent;
   const text = result?.content?.find?.((item) => item.type === 'text')?.text;
   if (!text) return result;
   try { return JSON.parse(text); } catch { return { message: text }; }
@@ -24,9 +26,10 @@ function toolData(result) {
 
 export async function getKlingStatus(env, fetcher = fetch) {
   try {
-    const identity = toolData(await callTool(env, 'who_am_i', { tools: ['text_to_video', 'image_to_video'] }, fetcher));
+    const identity = toolData(await callTool(env, 'who_am_i', {}, fetcher));
     const credits = toolData(await callTool(env, 'query_membership_and_credits', {}, fetcher));
-    return { connection: 'online', membership: credits.membership ?? credits.member ?? null, credits: credits.credits ?? credits.balance ?? null, models: identity.availableModels || {}, checkedAt: new Date().toISOString() };
+    const models = Object.fromEntries(Object.entries(identity.availableModels || {}).map(([key, value]) => [key, Array.isArray(value) ? { models: value } : value]));
+    return { connection: 'online', membership: credits.membership ?? credits.member ?? null, credits: credits.credits ?? credits.balance ?? null, models, checkedAt: new Date().toISOString() };
   } catch (error) {
     return { connection: 'offline', membership: null, credits: null, models: {}, checkedAt: new Date().toISOString(), message: error.message === 'not_authorized' ? '请连接可灵 MCP' : '可灵 MCP 暂不可用' };
   }

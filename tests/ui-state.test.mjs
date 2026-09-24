@@ -27,7 +27,64 @@ import {
   performGenerationSubmission,
   commitProjectWorkspace,
   refreshAccountSnapshot,
+  createSubmissionAttemptController,
+  createProjectDrafts,
+  nextPollDelay,
+  shouldSaveStaleUpload,
+  sidebarShouldBeInert,
 } from '../public/app.js';
+
+test('double submit is locked immediately and ambiguous retry reuses the same key', () => {
+  let next = 0;
+  const attempts = createSubmissionAttemptController(() => `key-${++next}`);
+  const first = attempts.begin({ projectId: 'a', prompt: 'ocean' });
+  assert.equal(attempts.inFlight, true);
+  assert.equal(attempts.begin({ projectId: 'a', prompt: 'ocean' }), null);
+  attempts.settle(first, false);
+  assert.equal(attempts.begin({ projectId: 'a', prompt: 'ocean' }).key, first.key);
+  attempts.settle(first, false);
+  const changed = attempts.begin({ projectId: 'a', prompt: 'forest' });
+  assert.notEqual(changed.key, first.key);
+  attempts.settle(changed, true);
+  assert.equal(attempts.begin({ projectId: 'a', prompt: 'forest' }).key, 'key-3');
+});
+
+test('an unresolved attempt keeps its key across a tab reload', () => {
+  const values = new Map();
+  const storage = { getItem: (key) => values.get(key) || null, setItem: (key, value) => values.set(key, value) };
+  const first = createSubmissionAttemptController(() => 'original-key', storage);
+  const attempt = first.begin({ projectId: 'p', prompt: 'scene' });
+  first.settle(attempt, false);
+  const reloaded = createSubmissionAttemptController(() => 'new-key', storage);
+  assert.equal(reloaded.begin({ projectId: 'p', prompt: 'scene' }).key, 'original-key');
+});
+
+test('session drafts restore per-project controls including upload removal', () => {
+  const drafts = createProjectDrafts();
+  drafts.save('a', { prompt: 'unsubmitted', uploadId: 'asset-a' });
+  drafts.save('b', { prompt: 'other', uploadId: '' });
+  assert.deepEqual(drafts.load('a', { prompt: 'submitted', uploadId: '' }), { prompt: 'unsubmitted', uploadId: 'asset-a' });
+  drafts.save('a', { prompt: 'unsubmitted', uploadId: '' });
+  assert.equal(drafts.load('a', { uploadId: 'asset-a' }).uploadId, '');
+  assert.equal(drafts.load('c', { prompt: 'server' }).prompt, 'server');
+});
+
+test('polling backs off within a 30 second ceiling and resets after success', () => {
+  assert.equal(nextPollDelay(3000, false), 6000);
+  assert.equal(nextPollDelay(30000, false), 30000);
+  assert.equal(nextPollDelay(30000, true), 3000);
+});
+
+test('late upload response restores its project after switching away and back', () => {
+  assert.equal(shouldSaveStaleUpload(1, 2), true);
+  assert.equal(shouldSaveStaleUpload(1, 1), false);
+});
+
+test('closed mobile navigation is inert while desktop navigation stays usable', () => {
+  assert.equal(sidebarShouldBeInert(false, true), true);
+  assert.equal(sidebarShouldBeInert(true, true), false);
+  assert.equal(sidebarShouldBeInert(false, false), false);
+});
 
 const capabilities = {
   text_to_video: { models: [{ model: 'turbo', arguments: [{ name: 'duration', allowedValues: ['5', '10'] }, { name: 'resolution', allowedValues: ['720p', '1080p'] }, { name: 'aspect_ratio', allowedValues: ['16:9', '9:16'] }] }] },
@@ -177,6 +234,7 @@ test('video URL extraction accepts known video results and rejects unrelated or 
   assert.equal(extractVideoUrl({ data: { video_url: '/media/result.webm' } }), '/media/result.webm');
   assert.equal(extractVideoUrl({ outputs: [{ type: 'video', url: 'https://cdn.test/output?id=1' }] }), 'https://cdn.test/output?id=1');
   assert.equal(extractVideoUrl({ outputs: [{ url: 'https://cdn.test/output.mp4' }] }), 'https://cdn.test/output.mp4');
+  assert.equal(extractVideoUrl({ works: [{ contentType: 'video', url: 'https://cdn.test/output' }] }), 'https://cdn.test/output');
   for (const result of [
     { thumbnail_url: 'https://cdn.test/thumb.jpg' },
     { statusUrl: 'https://cdn.test/status' },

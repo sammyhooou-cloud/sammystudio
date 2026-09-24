@@ -15,6 +15,7 @@ const statements = [
   'CREATE INDEX IF NOT EXISTS idx_project_tasks_project_created ON project_tasks(project_id, created_at)',
   'CREATE TABLE IF NOT EXISTS project_settings (project_id TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS project_settings_versions (project_id TEXT PRIMARY KEY, version INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS migration_markers (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)',
 ];
 
 let initialized = false;
@@ -23,5 +24,7 @@ export async function ensureSchema(db) {
   if (initialized) return;
   if (typeof db.batch === 'function') await db.batch(statements.map((sql) => db.prepare(sql)));
   else for (const sql of statements) await db.prepare(sql).run();
+  try { await db.prepare('ALTER TABLE stored_objects ADD COLUMN filename TEXT').run(); }
+  catch (error) { if (!/duplicate column name/i.test(String(error?.message))) throw error; }
   initialized = true;
 }

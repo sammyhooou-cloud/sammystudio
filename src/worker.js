@@ -1,10 +1,10 @@
 import { createSession, deleteSession, requireSession, unauthorized } from './auth.js';
 import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
-import { submitTask, TaskError } from './tasks.js';
+import { submitTask, getTaskStatus, TaskError } from './tasks.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
-import { createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
+import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
 
 const securityHeaders = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'permissions-policy': 'camera=(), microphone=(), geolocation=()', 'content-security-policy': "default-src 'self'; img-src 'self' blob: data:; media-src 'self' https:; style-src 'self'; script-src 'self'; connect-src 'self' https://klingai.com" };
 
@@ -30,7 +30,22 @@ function siteAsset(pathname) {
   const asset = siteAssets.get(key);
   if (!asset) return null;
   const body = asset.base64 ? Uint8Array.from(atob(asset.body), (char) => char.charCodeAt(0)) : asset.body;
-  return new Response(body, { headers: { 'content-type': asset.type, 'cache-control': key === '/index.html' ? 'no-cache' : 'public, max-age=31536000, immutable' } });
+  return new Response(body, { headers: { 'content-type': asset.type, 'cache-control': asset.base64 ? 'public, max-age=31536000, immutable' : 'no-cache, must-revalidate' } });
+}
+
+export function mutationRequestError(request) {
+  if (!['POST', 'PATCH', 'DELETE'].includes(request.method)) return null;
+  const origin = request.headers.get('origin');
+  if (!origin || origin !== new URL(request.url).origin) return json({ error: '请求来源无效' }, 403);
+  if (request.method === 'DELETE') return null;
+  const type = request.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
+  const expected = new URL(request.url).pathname === '/api/uploads' ? 'multipart/form-data' : 'application/json';
+  return type === expected ? null : json({ error: '请求内容类型无效' }, 415);
+}
+
+export function sanitizeFilename(name) {
+  const basename = String(name || '').split(/[\\/]/).at(-1).replace(/[\x00-\x1f\x7f]/g, '').trim();
+  return basename.slice(0, 255) || 'reference-image';
 }
 
 async function upload(request, env) {
@@ -51,7 +66,7 @@ async function upload(request, env) {
     return json({ error: '上传存储失败' }, 500);
   }
   const statements = [
-    env.DB.prepare('INSERT INTO stored_objects (id, object_key, mime_type, size, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, key, file.type, file.size, createdAt),
+    env.DB.prepare('INSERT INTO stored_objects (id, object_key, mime_type, size, filename, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(id, key, file.type, file.size, sanitizeFilename(file.name), createdAt),
     env.DB.prepare('INSERT INTO project_assets (project_id, object_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
   ];
   try {
@@ -78,11 +93,19 @@ async function projectAsset(env, projectId, assetId) {
 async function api(request, env) {
   const url = new URL(request.url);
   if (url.pathname === '/api/health') return json({ ok: true });
+  const mutationError = mutationRequestError(request);
+  if (mutationError) return mutationError;
   if (url.pathname === '/api/session' && request.method === 'POST') return createSession(await request.json(), env);
   const session = await requireSession(request, env);
   if (!session && url.pathname !== '/api/kling/oauth/callback') return unauthorized();
   if (url.pathname === '/api/session' && request.method === 'GET') return json({ authenticated: true });
   if (url.pathname === '/api/session' && request.method === 'DELETE') return deleteSession(request, env);
+  if ((url.pathname === '/api/projects' && ['GET', 'POST'].includes(request.method)) ||
+      (request.method === 'POST' && ['/api/uploads', '/api/video/tasks'].includes(url.pathname))) {
+    if (typeof env.DB.batch !== 'function') return json({ error: url.pathname === '/api/uploads' ? '上传保存失败' : '任务保存失败' }, 500);
+    try { await backfillLegacyRows(env.DB); }
+    catch { return json({ error: '项目迁移暂不可用' }, 503); }
+  }
   if (url.pathname === '/api/projects' && request.method === 'GET') return json({ projects: await listProjects(env.DB) });
   if (url.pathname === '/api/projects' && request.method === 'POST') {
     try { return json(await createProject(env.DB, await request.json()), 201); }
@@ -132,6 +155,17 @@ async function api(request, env) {
     } catch (error) {
       if (error instanceof TaskError) return json({ error: error.message, ...(error.task ? { task: error.task } : {}) }, error.status);
       return json({ error: '任务处理失败' }, 500);
+    }
+  }
+  const taskMatch = url.pathname.match(/^\/api\/video\/tasks\/([^/]+)$/);
+  if (taskMatch && request.method === 'GET') {
+    const id = decodeProjectId(taskMatch[1]);
+    const projectId = url.searchParams.get('projectId');
+    if (!id || !projectId) return json({ error: '任务参数无效' }, 400);
+    try { return json(await getTaskStatus(id, projectId, env)); }
+    catch (error) {
+      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      return json({ error: '任务状态暂不可用' }, 503);
     }
   }
   return json({ error: '接口不存在' }, 404);

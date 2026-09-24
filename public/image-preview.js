@@ -69,9 +69,10 @@ export function createImageUploadController(adapters) {
       const form = adapters.createFormData(); form.append('file', file); form.append('projectId', projectId);
       try {
         const result = await adapters.request(form);
-        if (current !== selection) return;
+        if (current !== selection) return { uploadId: result.uploadId, current: false };
         uploadId = result.uploadId; canSubmit = Boolean(uploadId);
         adapters.render(imagePreviewState(file, objectUrl, canSubmit ? 'uploaded' : 'failed'));
+        return { uploadId, current: true };
       } catch (error) {
         if (current !== selection) return;
         uploadId = ''; canSubmit = false; adapters.render(imagePreviewState(file, objectUrl, 'failed'));

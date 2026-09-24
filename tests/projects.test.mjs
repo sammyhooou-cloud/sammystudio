@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createProject,
+  backfillLegacyRows,
   ensureDefaultProject,
   listProjects,
   normalizeProjectName,
@@ -33,6 +34,7 @@ class FakeD1 {
     this.runs = [];
     this.batchCount = 0;
     this.failAssetBackfillOnce = false;
+    this.migrationMarkers = [];
   }
 
   prepare(sql) {
@@ -45,6 +47,7 @@ class FakeD1 {
       },
       async first() {
         const values = this.values;
+        if (sql.includes('FROM migration_markers')) return db.migrationMarkers.includes(values[0]) ? { name: values[0] } : null;
         if (sql.includes('WHERE id = ?')) {
           return db.projects.find(({ id }) => id === values[0]) ?? null;
         }
@@ -112,6 +115,7 @@ class FakeD1 {
             }
           }
         }
+        if (sql.startsWith('INSERT OR IGNORE INTO migration_markers')) db.migrationMarkers.push(values[0]);
         return { success: true };
       },
     };
@@ -124,6 +128,7 @@ class FakeD1 {
       projects: structuredClone(this.projects),
       projectAssets: structuredClone(this.projectAssets),
       projectTasks: structuredClone(this.projectTasks),
+      migrationMarkers: structuredClone(this.migrationMarkers),
     };
     try {
       const results = [];
@@ -133,10 +138,25 @@ class FakeD1 {
       this.projects = snapshot.projects;
       this.projectAssets = snapshot.projectAssets;
       this.projectTasks = snapshot.projectTasks;
+      this.migrationMarkers = snapshot.migrationMarkers;
       throw error;
     }
   }
 }
+
+test('one-time legacy migration assigns unassociated rows even when projects exist', async () => {
+  const db = new FakeD1();
+  db.projects.push({ id: 'existing', name: 'Existing', created_at: 1, updated_at: 1 });
+  db.storedObjects.push({ id: 'legacy-file', created_at: 2, filename: null });
+  db.videoTasks.push({ id: 'legacy-task', created_at: 3 });
+  await backfillLegacyRows(db, 10);
+  assert.deepEqual(db.projectAssets.map(({ object_id }) => object_id), ['legacy-file']);
+  assert.equal(db.projectAssets[0].project_id, 'uncategorized');
+  assert.equal(db.projectTasks[0].project_id, 'uncategorized');
+  db.storedObjects.push({ id: 'new-unassociated', created_at: 11 });
+  await backfillLegacyRows(db, 12);
+  assert.equal(db.projectAssets.some(({ object_id }) => object_id === 'new-unassociated'), false);
+});
 
 test('creates and returns one default project idempotently', async () => {
   const db = new FakeD1();
@@ -234,7 +254,7 @@ test('reads only assets and tasks linked to one project and parses settings', as
   const db = new FakeD1();
   db.projects.push({ id: 'project-a', name: 'A', created_at: 1, updated_at: 2 });
   db.storedObjects.push(
-    { id: 'asset-a', object_key: 'references/a', mime_type: 'image/png', size: 11, created_at: 30 },
+    { id: 'asset-a', object_key: 'references/a', mime_type: 'image/png', size: 11, filename: 'first-frame.png', created_at: 30 },
     { id: 'asset-b', object_key: 'references/b', mime_type: 'image/jpeg', size: 22, created_at: 40 },
   );
   db.videoTasks.push(
@@ -249,6 +269,7 @@ test('reads only assets and tasks linked to one project and parses settings', as
 
   assert.equal(workspace.project.id, 'project-a');
   assert.deepEqual(workspace.assets.map(({ id }) => id), ['asset-a']);
+  assert.equal(workspace.assets[0].name, 'first-frame.png');
   assert.deepEqual(workspace.tasks.map(({ id }) => id), ['task-a']);
   assert.deepEqual(workspace.settings, { duration: 5 });
   assert.equal('objectKey' in workspace.assets[0], false);
@@ -264,4 +285,12 @@ test('falls back to empty settings and rejects missing projects', async () => {
   db.projectSettings.push({ project_id: 'project-a', settings_json: '{broken', updated_at: 3 });
   assert.deepEqual((await readProjectWorkspace(db, 'project-a')).settings, {});
   await assert.rejects(() => readProjectWorkspace(db, 'missing'), { message: '项目不存在' });
+});
+
+test('legacy stored objects use their id as a display name when filename is absent', async () => {
+  const db = new FakeD1();
+  db.projects.push({ id: 'project-a', name: 'A', created_at: 1, updated_at: 1 });
+  db.storedObjects.push({ id: 'legacy-asset', mime_type: 'image/png', size: 1, created_at: 2 });
+  db.projectAssets.push({ project_id: 'project-a', object_id: 'legacy-asset', created_at: 2 });
+  assert.equal((await readProjectWorkspace(db, 'project-a')).assets[0].name, 'legacy-asset');
 });
