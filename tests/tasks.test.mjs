@@ -265,6 +265,32 @@ test('settings failure after core finalization replays the tracked remote task',
   assert.equal(media.deleted.length, 1);
 });
 
+test('same-timestamp newer task gets a monotonic settings version and repairs on replay', async () => {
+  const originalNow = Date.now;
+  Date.now = () => 10_000;
+  try {
+    const db = new TaskDb();
+    const media = new RecoveryMedia();
+    await submitTask({ ...input, prompt: 'prompt A' }, taskEnv(db, media), 'same-time-a', capabilities, fetch, async () => ({ taskId: 'remote-a' }));
+    assert.equal(db.settings[0].updated_at, 10_000);
+    db.failSettings = true;
+
+    await assert.rejects(() => submitTask({ ...input, prompt: 'prompt B' }, taskEnv(db, media), 'same-time-b', capabilities, fetch, async () => ({ taskId: 'remote-b' })));
+    const record = JSON.parse([...media.objects.values()][0]);
+    assert.equal(record.settingsVersion, 10_001);
+    assert.equal(db.settings[0].updated_at, 10_000);
+    db.failSettings = false;
+
+    const replay = await submitTask({ ...input, prompt: 'prompt B' }, taskEnv(db, media), 'same-time-b', capabilities, fetch, async () => { throw new Error('provider must not run'); });
+    assert.equal(replay.remote_id, 'remote-b');
+    assert.equal(db.settings[0].updated_at, 10_001);
+    assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'prompt B');
+    assert.equal(media.objects.size, 0);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test('replaying an older queued task does not roll back newer project settings', async () => {
   const db = new TaskDb();
   const media = new RecoveryMedia();
@@ -293,7 +319,7 @@ test('stale recovery cleanup does not overwrite newer project settings', async (
   const taskA = await submitTask(taskAInput, taskEnv(db, media), 'stale-a', capabilities, fetch, async () => ({ taskId: 'remote-stale-a' }));
   const staleRecord = JSON.parse([...media.objects.values()][0]);
   await submitTask(taskBInput, taskEnv(db, media), 'stale-b', capabilities, fetch, async () => ({ taskId: 'remote-stale-b' }));
-  db.settings[0].updated_at = staleRecord.createdAt + 1;
+  db.settings[0].updated_at = staleRecord.settingsVersion + 1;
   const settingsBeforeReplay = db.settings[0].settings_json;
 
   const replay = await submitTask(taskAInput, taskEnv(db, media), 'stale-a', capabilities, fetch, async () => { throw new Error('provider must not run'); });
@@ -344,8 +370,8 @@ test('recovery record is minimal and excludes extra secrets or raw input data', 
   await assert.rejects(() => submitTask({ ...input, apiToken: 'secret-token', rawFile: [1, 2, 3] }, taskEnv(db, media), 'safe-recovery', capabilities, fetch, async () => ({ taskId: 'remote-safe', access_token: 'provider-secret' })));
   const record = JSON.parse([...media.objects.values()][0]);
 
-  assert.deepEqual(Object.keys(record).sort(), ['createdAt', 'id', 'projectId', 'remoteId', 'result', 'settings']);
-  assert.equal(typeof record.createdAt, 'number');
+  assert.deepEqual(Object.keys(record).sort(), ['id', 'projectId', 'remoteId', 'result', 'settings', 'settingsVersion']);
+  assert.equal(typeof record.settingsVersion, 'number');
   assert.equal(record.remoteId, 'remote-safe');
   assert.deepEqual(record.result, { taskId: 'remote-safe' });
   assert.equal(JSON.stringify(record).includes('secret'), false);

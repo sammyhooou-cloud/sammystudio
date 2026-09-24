@@ -51,9 +51,9 @@ function taskDto(task) {
 
 const recoveryKey = (id) => `task-recovery/${id}.json`;
 
-async function saveSettings(db, projectId, settings) {
+async function saveSettings(db, projectId, settings, settingsVersion) {
   try {
-    await db.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at').bind(projectId, JSON.stringify(settings), Date.now()).run();
+    await db.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at').bind(projectId, JSON.stringify(settings), settingsVersion).run();
   } catch {
     throw new TaskError('项目设置保存失败', 500);
   }
@@ -98,7 +98,7 @@ async function replayTask(task, env, projectId) {
   if (!object) return taskDto(task);
   let record;
   try { record = JSON.parse(await object.text()); } catch { throw new TaskError('任务恢复记录无效', 500); }
-  if (record.id !== task.id || record.projectId !== projectId || !record.remoteId || !record.settings || !Number.isFinite(record.createdAt)) throw new TaskError('任务恢复记录无效', 500);
+  if (record.id !== task.id || record.projectId !== projectId || !record.remoteId || !record.settings || !Number.isFinite(record.settingsVersion)) throw new TaskError('任务恢复记录无效', 500);
   let replayed = task;
   if (task.status === 'submitting' && !task.remote_id) {
     await finalizeTask(env.DB, task.id, record.remoteId, record.result);
@@ -106,7 +106,7 @@ async function replayTask(task, env, projectId) {
   }
   if (replayed.status === 'queued') {
     const current = await env.DB.prepare('SELECT settings_json, updated_at FROM project_settings WHERE project_id = ?').bind(projectId).first();
-    if (!current || Number(current.updated_at) < record.createdAt) await saveSettings(env.DB, projectId, record.settings);
+    if (!current || Number(current.updated_at) < record.settingsVersion) await saveSettings(env.DB, projectId, record.settings, record.settingsVersion);
     await deleteRecovery(env.MEDIA, task.id);
   }
   return taskDto(replayed);
@@ -127,10 +127,12 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   let valid;
   try { valid = validateTask(input, capabilities); }
   catch (error) { throw new TaskError(error.message, 400); }
+  const currentSettings = await env.DB.prepare('SELECT updated_at FROM project_settings WHERE project_id = ?').bind(projectId).first();
+  const settingsVersion = Math.max(Date.now(), Number(currentSettings?.updated_at || 0) + 1);
   const id = crypto.randomUUID();
   const createdAt = Date.now();
   const reservation = [
-    env.DB.prepare('INSERT INTO video_tasks (id, idempotency_key, remote_id, mode, status, request_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(id, internalKey, null, valid.mode, 'submitting', JSON.stringify(valid), createdAt, createdAt),
+    env.DB.prepare('INSERT INTO video_tasks (id, idempotency_key, remote_id, mode, status, request_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(id, internalKey, null, valid.mode, 'submitting', JSON.stringify({ ...valid, settingsVersion }), createdAt, createdAt),
     env.DB.prepare('INSERT INTO project_tasks (project_id, task_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
   ];
   try {
@@ -163,9 +165,9 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
     throw new TaskError('视频生成服务返回无效', 502);
   }
   const settings = settingsSnapshot(valid);
-  await writeRecovery(env.MEDIA, { id, projectId, remoteId, result: { taskId: remoteId }, settings, createdAt });
+  await writeRecovery(env.MEDIA, { id, projectId, remoteId, result: { taskId: remoteId }, settings, settingsVersion });
   await finalizeTask(env.DB, id, remoteId, result);
-  await saveSettings(env.DB, projectId, settings);
+  await saveSettings(env.DB, projectId, settings, settingsVersion);
   await deleteRecovery(env.MEDIA, id);
   return taskDto({ id, remote_id: remoteId, status: 'queued' });
 }
