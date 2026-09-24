@@ -9,6 +9,7 @@ const assets = [
   ['/styles.css', 'public/styles.css', 'text/css; charset=utf-8', false],
   ['/project-navigation.css', 'public/project-navigation.css', 'text/css; charset=utf-8', false],
   ['/image-preview.css', 'public/image-preview.css', 'text/css; charset=utf-8', false],
+  ['/task-history.css', 'public/task-history.css', 'text/css; charset=utf-8', false],
   ['/app.js', 'public/app.js', 'text/javascript; charset=utf-8', false],
   ['/image-preview.js', 'public/image-preview.js', 'text/javascript; charset=utf-8', false],
   ['/assets/alpine-runner.jpg', 'public/assets/alpine-runner.jpg', 'image/jpeg', true],

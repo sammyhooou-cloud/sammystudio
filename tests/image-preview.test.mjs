@@ -97,6 +97,18 @@ test('controller revokes URLs on removal, project switch, and unload', () => {
   }
 });
 
+test('controller restores an authenticated server asset without creating or revoking an object URL', () => {
+  const harness = uploadHarness();
+  harness.controller.restore({ id: 'asset-7', mimeType: 'image/webp', size: 2048 }, '/api/projects/project-1/assets/asset-7');
+  assert.equal(harness.controller.uploadId, 'asset-7');
+  assert.equal(harness.controller.canSubmit, true);
+  assert.equal(harness.created.length, 0);
+  assert.equal(harness.renders.at(-1).src, '/api/projects/project-1/assets/asset-7');
+  assert.equal(harness.renders.at(-1).format, 'WebP');
+  harness.controller.remove();
+  assert.equal(harness.revoked.length, 0);
+});
+
 test('replacement clears the input before opening the picker without clearing preview state', () => {
   const events = [];
   const input = { _value: 'C:/fakepath/frame.png', set value(value) { events.push(['value', value]); this._value = value; }, click() { events.push(['click']); } };

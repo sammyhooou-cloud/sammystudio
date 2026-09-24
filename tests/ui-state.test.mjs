@@ -18,6 +18,9 @@ import {
   upsertProject,
   validateWorkspace,
   workspaceFormState,
+  workspaceImageState,
+  workspaceTaskState,
+  prependProjectTask,
 } from '../public/app.js';
 
 const capabilities = {
@@ -125,15 +128,47 @@ test('empty project workspace resets values inherited from a populated project',
     mode: 'text', prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16',
   });
   const empty = workspaceFormState(capabilities, 'text', {});
-  assert.deepEqual(populated, { mode: 'text', prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16' });
-  assert.deepEqual(empty, { mode: 'text', prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9' });
+  assert.deepEqual(populated, { mode: 'text', prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16', imageCount: 1 });
+  assert.deepEqual(empty, { mode: 'text', prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9', imageCount: 1 });
 });
 
 test('workspace form state restores cross-mode projects without inheriting the previous mode', () => {
   const image = workspaceFormState(capabilities, 'text', { mode: 'image', model: 'image-pro', resolution: '1080p', duration: '5', aspectRatio: '1:1' });
   const text = workspaceFormState(capabilities, 'image', { mode: 'text', model: 'turbo' });
-  assert.deepEqual(image, { mode: 'image', prompt: '', model: 'image-pro', resolution: '1080p', duration: '5', aspectRatio: '1:1' });
-  assert.deepEqual(text, { mode: 'text', prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9' });
+  assert.deepEqual(image, { mode: 'image', prompt: '', model: 'image-pro', resolution: '1080p', duration: '5', aspectRatio: '1:1', imageCount: 1 });
+  assert.deepEqual(text, { mode: 'text', prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9', imageCount: 1 });
+});
+
+test('workspace form state restores imageCount and clears it for an empty workspace', () => {
+  assert.equal(workspaceFormState(capabilities, 'text', { imageCount: '4' }).imageCount, 4);
+  assert.equal(workspaceFormState(capabilities, 'text', {}).imageCount, 1);
+});
+
+test('workspace image state restores only an asset owned by the loaded workspace', () => {
+  const asset = { id: 'asset-a', mimeType: 'image/png', size: 42 };
+  assert.deepEqual(workspaceImageState('project-a', { uploadId: 'asset-a' }, [asset]), {
+    asset,
+    url: '/api/projects/project-a/assets/asset-a',
+  });
+  assert.equal(workspaceImageState('project-a', { uploadId: 'asset-b' }, [asset]), null);
+  assert.equal(workspaceImageState('project-a', {}, [asset]), null);
+});
+
+test('workspace task state is isolated, keeps latest status, and finds a usable video URL', () => {
+  const tasks = [
+    { id: '<task-a>', status: 'done', resultJson: '{"data":{"video_url":"https://cdn.test/a.mp4"}}' },
+    { id: 'task-b', status: 'queued', resultJson: '{broken' },
+  ];
+  const state = workspaceTaskState(tasks);
+  assert.equal(state.current.id, '<task-a>');
+  assert.equal(state.current.status, 'done');
+  assert.equal(state.videoUrl, 'https://cdn.test/a.mp4');
+  assert.deepEqual(workspaceTaskState([]), { tasks: [], current: null, videoUrl: '' });
+});
+
+test('new task is prepended only to the active project task list', () => {
+  assert.deepEqual(prependProjectTask('project-a', 'project-a', [{ id: 'old' }], { id: 'new', status: 'queued' }).map(({ id }) => id), ['new', 'old']);
+  assert.deepEqual(prependProjectTask('project-a', 'project-b', [{ id: 'old' }], { id: 'foreign' }).map(({ id }) => id), ['old']);
 });
 
 test('workspace form state falls back to text mode for missing or invalid saved modes', () => {

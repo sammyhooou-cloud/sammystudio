@@ -75,7 +75,38 @@ export function workspaceFormState(capabilities, _previousMode, settings = {}) {
     resolution: choose(settings.resolution, options.resolutions),
     duration: choose(settings.duration, options.durations),
     aspectRatio: choose(settings.aspectRatio, options.aspectRatios),
+    imageCount: Number.isFinite(Number(settings.imageCount)) && Number(settings.imageCount) > 0 ? Number(settings.imageCount) : 1,
   };
+}
+
+export function workspaceImageState(projectId, settings = {}, assets = []) {
+  const uploadId = typeof settings.uploadId === 'string' ? settings.uploadId : '';
+  const asset = assets.find(({ id }) => id === uploadId);
+  if (!projectId || !asset) return null;
+  return { asset, url: `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(asset.id)}` };
+}
+
+function findVideoUrl(value) {
+  if (typeof value === 'string') return /^https:\/\/[^\s]+$/i.test(value) && /(?:video|\.mp4|\.webm|\.mov)(?:[/?#]|$)/i.test(value) ? value : '';
+  if (!value || typeof value !== 'object') return '';
+  for (const [key, nested] of Object.entries(value)) {
+    if (typeof nested === 'string' && /(?:video|url)/i.test(key) && /^https:\/\/[^\s]+$/i.test(nested)) return nested;
+    const found = findVideoUrl(nested); if (found) return found;
+  }
+  return '';
+}
+
+export function workspaceTaskState(tasks = []) {
+  const safeTasks = Array.isArray(tasks) ? tasks : [];
+  const current = safeTasks[0] || null;
+  let result = null;
+  try { result = current?.resultJson ? JSON.parse(current.resultJson) : null; } catch {}
+  return { tasks: safeTasks, current, videoUrl: findVideoUrl(result) };
+}
+
+export function prependProjectTask(activeProjectId, submittedProjectId, tasks, task) {
+  if (!task?.id || activeProjectId !== submittedProjectId) return tasks;
+  return [task, ...tasks.filter(({ id }) => id !== task.id)].slice(0, 100);
 }
 
 export async function performProjectSwitch({ load, setBusy, commit, fail }) {
@@ -132,7 +163,7 @@ function setup() {
   const resolution = document.querySelector('#resolution');
   const duration = document.querySelector('#duration');
   const ratio = document.querySelector('#aspect-ratio');
-  let mode = 'text', capabilities = {}, projects = [];
+  let mode = 'text', capabilities = {}, projects = [], imageCount = 1, projectTasks = [];
   let drawerOpen = false, workspaceLoadSequence = 0, projectSwitchBusy = false;
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
@@ -232,6 +263,42 @@ function setup() {
     resolution.value = state.resolution;
     duration.value = state.duration;
     ratio.value = state.aspectRatio;
+    imageCount = state.imageCount;
+    const restoredImage = workspaceImageState(currentProjectId, workspaceState?.settings, workspaceState?.assets);
+    if (restoredImage && mode === 'image') uploadController.restore(restoredImage.asset, restoredImage.url);
+    else clearImage();
+    projectTasks = Array.isArray(workspaceState?.tasks) ? workspaceState.tasks : [];
+    renderTasks();
+  }
+
+  function renderTasks() {
+    const state = workspaceTaskState(projectTasks);
+    const empty = document.querySelector('#result-empty');
+    const progress = document.querySelector('#result-progress');
+    const video = document.querySelector('#result-video');
+    const history = document.querySelector('#task-history');
+    history.replaceChildren();
+    for (const task of state.tasks) {
+      const item = document.createElement('button'); item.type = 'button'; item.className = 'task-history-item';
+      const id = document.createElement('strong'); id.textContent = task.id || '未知任务';
+      const status = document.createElement('span'); status.textContent = task.status || '未知状态';
+      item.append(id, status); item.onclick = () => renderSelectedTask(task); history.append(item);
+    }
+    if (!state.current) {
+      empty.hidden = false; progress.hidden = true; video.hidden = true; video.removeAttribute('src');
+      document.querySelector('#task-state').textContent = '等待提交'; document.querySelector('#task-id').textContent = '';
+      return;
+    }
+    renderSelectedTask(state.current);
+  }
+
+  function renderSelectedTask(task) {
+    const state = workspaceTaskState([task]);
+    document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false;
+    document.querySelector('#task-state').textContent = task.status || '未知状态';
+    document.querySelector('#task-id').textContent = `任务 ${task.id || '—'}`;
+    const video = document.querySelector('#result-video');
+    if (state.videoUrl) { video.src = state.videoUrl; video.hidden = false; } else { video.hidden = true; video.removeAttribute('src'); }
   }
 
   function showProjectLoadError(error) {
@@ -359,7 +426,7 @@ function setup() {
       projects = renameProjectInList(projects, project); renameForm.hidden = true; renderProjects();
     } catch (error) { projectError.textContent = error.message; }
   };
-  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const payload = buildGenerationPayload({ projectId: currentProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount: 1 }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); document.querySelector('#task-id').textContent = `任务 ${task.id}`; await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
+  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const submittedProjectId = currentProjectId; const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() }); renderTasks(); await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
   document.querySelector('#refresh-status').onclick = refreshStatus;
   document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
 }

@@ -44,6 +44,12 @@ export function createImageUploadController(adapters) {
   return {
     get uploadId() { return uploadId; },
     get canSubmit() { return canSubmit; },
+    restore(asset, src) {
+      selection += 1; revokeCurrent();
+      uploadId = asset?.id || ''; canSubmit = Boolean(uploadId && src);
+      if (!canSubmit) { adapters.render(null); return; }
+      adapters.render(imagePreviewState({ name: asset.name || `参考图 ${asset.id}`, type: asset.mimeType || '', size: asset.size }, src, 'uploaded'));
+    },
     async select(file, projectId) {
       selection += 1; const current = selection;
       uploadId = ''; canSubmit = false; revokeCurrent();

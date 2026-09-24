@@ -77,6 +77,17 @@ class UploadDb extends RouteDb {
   prepare(sql) {
     const base = super.prepare(sql);
     const db = this;
+    if (sql.includes('stored_objects.object_key') && sql.includes('JOIN project_assets')) {
+      return {
+        values: [],
+        bind(...values) { return { ...this, values }; },
+        async first() {
+          const [assetId, projectId] = this.values;
+          const linked = db.projectAssets.some((row) => row.project_id === projectId && row.object_id === assetId);
+          return linked ? db.storedObjects.find(({ id }) => id === assetId) ?? null : null;
+        },
+      };
+    }
     if (!sql.startsWith('INSERT INTO stored_objects') && !sql.startsWith('INSERT INTO project_assets')) return base;
     return {
       sql,
@@ -254,6 +265,36 @@ test('upload links the stored object to the selected project', async () => {
   assert.equal(db.storedObjects[0].id, uploadId);
   assert.equal(db.storedObjects[0].object_key, `references/${uploadId}`);
   assert.deepEqual(mediaKeys, [`references/${uploadId}`]);
+});
+
+test('authenticated asset route returns owned R2 bytes with stored MIME and safe caching', async () => {
+  const db = new UploadDb();
+  db.storedObjects.push({ id: 'asset-1', object_key: 'references/asset-1', mime_type: 'image/png' });
+  db.projectAssets.push({ project_id: 'project-1', object_id: 'asset-1', created_at: 1 });
+  const response = await worker.fetch(new Request('https://site.test/api/projects/project-1/assets/asset-1', { headers: sessionHeaders }), {
+    DB: db,
+    MEDIA: { get: async (key) => key === 'references/asset-1' ? new Response(new Uint8Array([1, 2, 3])) : null },
+  }, {});
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(response.headers.get('cache-control'), 'private, max-age=3600');
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [1, 2, 3]);
+});
+
+test('asset route hides missing and cross-project objects and requires authentication', async () => {
+  const db = new UploadDb();
+  db.projects.push({ id: 'project-2', name: 'Two', created_at: 2, updated_at: 2 });
+  db.storedObjects.push({ id: 'asset-1', object_key: 'references/asset-1', mime_type: 'image/png' });
+  db.projectAssets.push({ project_id: 'project-1', object_id: 'asset-1', created_at: 1 });
+  let reads = 0;
+  const runtime = { DB: db, MEDIA: { get: async () => { reads += 1; return new Response('secret'); } } };
+  const unauthorized = await worker.fetch(new Request('https://site.test/api/projects/project-1/assets/asset-1'), runtime, {});
+  const crossProject = await worker.fetch(new Request('https://site.test/api/projects/project-2/assets/asset-1', { headers: sessionHeaders }), runtime, {});
+  const missing = await worker.fetch(new Request('https://site.test/api/projects/project-1/assets/missing', { headers: sessionHeaders }), runtime, {});
+  assert.equal(unauthorized.status, 401);
+  assert.equal(crossProject.status, 404);
+  assert.equal(missing.status, 404);
+  assert.equal(reads, 0);
 });
 
 test('upload deletes the R2 object and sanitizes the response when database persistence fails', async () => {

@@ -63,6 +63,18 @@ async function upload(request, env) {
   return json({ uploadId: id });
 }
 
+async function projectAsset(env, projectId, assetId) {
+  const asset = await env.DB.prepare(`SELECT stored_objects.object_key, stored_objects.mime_type
+    FROM stored_objects
+    JOIN project_assets ON project_assets.object_id = stored_objects.id
+    WHERE stored_objects.id = ? AND project_assets.project_id = ?`).bind(assetId, projectId).first();
+  if (!asset) return json({ error: '资产不存在' }, 404);
+  let object;
+  try { object = await env.MEDIA.get(asset.object_key); } catch { return json({ error: '资产不存在' }, 404); }
+  if (!object) return json({ error: '资产不存在' }, 404);
+  return new Response(object.body ?? object, { headers: { 'content-type': asset.mime_type || 'application/octet-stream', 'cache-control': 'private, max-age=3600' } });
+}
+
 async function api(request, env) {
   const url = new URL(request.url);
   if (url.pathname === '/api/health') return json({ ok: true });
@@ -78,6 +90,13 @@ async function api(request, env) {
       if (projectInputError(error)) return json({ error: error instanceof SyntaxError ? '请提供有效的 JSON' : error.message }, 400);
       throw error;
     }
+  }
+  const assetMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/assets\/([^/]+)$/);
+  if (assetMatch && request.method === 'GET') {
+    const projectId = decodeProjectId(assetMatch[1]);
+    const assetId = decodeProjectId(assetMatch[2]);
+    if (projectId === null || assetId === null) return json({ error: '资产 ID 格式无效' }, 400);
+    return projectAsset(env, projectId, assetId);
   }
   const workspaceMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/workspace$/);
   if (workspaceMatch && request.method === 'GET') {
