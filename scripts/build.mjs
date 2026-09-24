@@ -7,6 +7,7 @@ await cp('src', 'dist/server', { recursive: true });
 const assets = [
   ['/index.html', 'public/index.html', 'text/html; charset=utf-8', false],
   ['/styles.css', 'public/styles.css', 'text/css; charset=utf-8', false],
+  ['/project-navigation.css', 'public/project-navigation.css', 'text/css; charset=utf-8', false],
   ['/image-preview.css', 'public/image-preview.css', 'text/css; charset=utf-8', false],
   ['/app.js', 'public/app.js', 'text/javascript; charset=utf-8', false],
   ['/image-preview.js', 'public/image-preview.js', 'text/javascript; charset=utf-8', false],

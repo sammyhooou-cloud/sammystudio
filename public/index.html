@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#070907"><meta name="description" content="可灵视频生成工作台">
-  <title>可灵工作台 · 视频生成</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/image-preview.css">
+  <title>可灵工作台 · 视频生成</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/project-navigation.css"><link rel="stylesheet" href="/image-preview.css">
 </head>
 <body>
   <main class="stage">
@@ -15,8 +15,19 @@
       </div>
     </section>
     <section id="workspace-view" class="workspace" hidden>
-      <header class="workspace-head"><div><p class="eyebrow">VIDEO GENERATION</p><h1>生成动态想象</h1></div><div class="account-strip"><div class="status"><i id="status-light"></i><span id="status-text">正在检测</span></div><div><small>会员</small><strong id="membership">—</strong></div><div><small>点数余额</small><strong id="credits">—</strong></div><button id="refresh-status" class="icon-button" title="刷新状态">↻</button><button id="logout" class="text-button">退出</button></div></header>
-      <div class="workspace-grid">
+      <button id="project-drawer-toggle" class="project-drawer-toggle" type="button" aria-expanded="false" aria-controls="project-sidebar"><span>项目</span><strong id="mobile-project-name">—</strong></button>
+      <div id="project-backdrop" class="project-backdrop" hidden></div>
+      <div class="workspace-shell">
+        <aside id="project-sidebar" class="project-sidebar" aria-label="项目导航">
+          <div class="project-sidebar-head"><div><p class="eyebrow">PROJECTS</p><h2>项目</h2></div><button id="new-project" class="project-add" type="button" aria-label="新建项目">＋</button></div>
+          <form id="create-project-form" class="project-inline-form" hidden><label for="new-project-name">项目名称</label><input id="new-project-name" maxlength="60" autocomplete="off" required><div><button class="project-save" type="submit">创建</button><button id="cancel-create-project" class="project-cancel" type="button">取消</button></div></form>
+          <nav id="project-list" class="project-list" aria-label="项目列表"></nav>
+          <button id="rename-project-mobile" class="project-item" type="button"><span>✎</span><strong>重命名当前项目</strong></button>
+          <p id="project-error" class="error" aria-live="polite"></p>
+        </aside>
+        <div class="workspace-main">
+          <header class="workspace-head"><div><p class="eyebrow">VIDEO GENERATION</p><h1>生成动态想象</h1><p class="current-project-line">当前项目 <strong id="current-project-name">—</strong><button id="rename-project" type="button">重命名</button></p><form id="rename-project-form" class="rename-project-form" hidden><input id="rename-project-name" maxlength="60" aria-label="新项目名称" required><button type="submit">保存</button><button id="cancel-rename-project" type="button">取消</button></form></div><div class="account-strip"><div class="status"><i id="status-light"></i><span id="status-text">正在检测</span></div><div><small>会员</small><strong id="membership">—</strong></div><div><small>点数余额</small><strong id="credits">—</strong></div><button id="refresh-status" class="icon-button" title="刷新状态">↻</button><button id="logout" class="text-button">退出</button></div></header>
+          <div class="workspace-grid">
         <form id="generator-form" class="generator panel">
           <div class="mode-tabs"><button type="button" class="active" data-mode="text">文生视频</button><button type="button" data-mode="image">图生视频</button></div>
           <label class="wide">提示词<textarea id="prompt" rows="5" placeholder="描述镜头、主体、动作、光线与氛围"></textarea></label>
@@ -25,8 +36,10 @@
           <p id="form-error" class="error wide" aria-live="polite"></p><button id="generate" class="primary wide" type="submit">开始生成 <span>↗</span></button>
         </form>
         <aside class="result panel"><div class="result-head"><div><p class="eyebrow">CURRENT TASK</p><h2>生成结果</h2></div><span id="task-state">等待提交</span></div><div id="result-empty" class="empty"><b>◌</b><p>设置参数并提交后，任务进度与视频将在这里出现。</p></div><div id="result-progress" hidden><div class="progress"><i></i></div><h3>可灵正在生成视频</h3><p id="task-id"></p></div><video id="result-video" controls hidden></video></aside>
+          </div>
+          <p id="last-check" class="last-check">尚未连接</p>
+        </div>
       </div>
-      <p id="last-check" class="last-check">尚未连接</p>
     </section>
   </main><script type="module" src="/app.js"></script>
 </body></html>
