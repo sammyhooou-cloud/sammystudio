@@ -1,8 +1,5 @@
 {
   "project_id": "appgprj_6ab47eea36f88191a54f7310abe42c68",
-  "static": {
-    "directory": "dist/client"
-  },
   "d1": "DB",
   "r2": "MEDIA"
 }

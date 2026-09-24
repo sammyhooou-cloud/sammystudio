@@ -2,6 +2,7 @@ import { createSession, deleteSession, requireSession, unauthorized } from './au
 import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
 import { submitTask } from './tasks.js';
+import { siteAssets } from './site-assets.js';
 
 const securityHeaders = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'permissions-policy': 'camera=(), microphone=(), geolocation=()', 'content-security-policy': "default-src 'self'; img-src 'self' blob: data:; media-src 'self' https:; style-src 'self'; script-src 'self'; connect-src 'self' https://klingai.com" };
 
@@ -12,6 +13,14 @@ function withSecurity(response) {
 }
 
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8' } });
+
+function siteAsset(pathname) {
+  const key = pathname === '/' ? '/index.html' : pathname;
+  const asset = siteAssets.get(key);
+  if (!asset) return null;
+  const body = asset.base64 ? Uint8Array.from(atob(asset.body), (char) => char.charCodeAt(0)) : asset.body;
+  return new Response(body, { headers: { 'content-type': asset.type, 'cache-control': key === '/index.html' ? 'no-cache' : 'public, max-age=31536000, immutable' } });
+}
 
 async function upload(request, env) {
   const form = await request.formData();
@@ -47,7 +56,7 @@ async function api(request, env) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const response = url.pathname.startsWith('/api/') ? await api(request, env, ctx) : await env.ASSETS.fetch(request);
+    const response = url.pathname.startsWith('/api/') ? await api(request, env, ctx) : siteAsset(url.pathname) || (env.ASSETS ? await env.ASSETS.fetch(request) : new Response('Not found', { status: 404 }));
     return withSecurity(response);
   },
 };
