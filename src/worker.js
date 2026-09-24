@@ -99,12 +99,11 @@ async function api(request, env) {
     let input;
     try { input = await request.json(); }
     catch { return json({ error: '请提供有效的 JSON' }, 400); }
-    const projectId = String(input?.projectId || '').trim();
-    if (!projectId) return json({ error: '请选择项目' }, 400);
-    if (!await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first()) return json({ error: '请选有效项目' }, 400);
-    const status = await getKlingStatus(env);
-    if (status.connection !== 'online') return json({ error: '请先连接可灵 MCP' }, 409);
-    try { return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID(), status.models)); } catch (error) { return json({ error: error.message }, 400); }
+    try {
+      return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID(), () => getKlingStatus(env)));
+    } catch (error) {
+      return json({ error: error.message }, error.status || 400);
+    }
   }
   return json({ error: '接口不存在' }, 404);
 }

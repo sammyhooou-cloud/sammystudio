@@ -28,7 +28,18 @@ function settingsSnapshot(valid) {
   };
 }
 
-export async function submitTask(input, env, idempotencyKey, capabilities, fetcher = fetch, toolCaller = callTool) {
+async function loadCapabilities(source) {
+  if (typeof source !== 'function') return source;
+  const status = await source();
+  if (status.connection !== 'online') {
+    const error = new Error('请先连接可灵 MCP');
+    error.status = 409;
+    throw error;
+  }
+  return status.models;
+}
+
+export async function submitTask(input, env, idempotencyKey, capabilitiesSource, fetcher = fetch, toolCaller = callTool) {
   const projectId = String(input?.projectId || '').trim();
   if (!projectId) throw new Error('请选择项目');
   const project = await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first();
@@ -37,6 +48,7 @@ export async function submitTask(input, env, idempotencyKey, capabilities, fetch
   if (existing) return existing;
   const collision = await env.DB.prepare('SELECT id FROM video_tasks WHERE idempotency_key = ?').bind(idempotencyKey).first();
   if (collision) throw new Error('幂等键已用于其他项目');
+  const capabilities = await loadCapabilities(capabilitiesSource);
   const valid = validateTask(input, capabilities);
   const id = crypto.randomUUID();
   let result;

@@ -92,6 +92,44 @@ class UploadDb extends RouteDb {
   }
 }
 
+class TaskRouteDb extends RouteDb {
+  constructor() {
+    super();
+    this.tasks = [];
+    this.projectTasks = [];
+    this.statusQueries = 0;
+  }
+
+  prepare(sql) {
+    const base = super.prepare(sql);
+    const db = this;
+    if (sql.includes('FROM oauth_tokens')) {
+      return { async first() { db.statusQueries += 1; return null; } };
+    }
+    if (!sql.includes('FROM video_tasks')) return base;
+    return {
+      values: [],
+      bind(...values) { return { ...this, values }; },
+      async first() {
+        if (sql.includes('JOIN project_tasks')) {
+          const [idempotencyKey, projectId] = this.values;
+          const taskIds = db.projectTasks.filter(({ project_id }) => project_id === projectId).map(({ task_id }) => task_id);
+          return db.tasks.find(({ id, idempotency_key }) => idempotency_key === idempotencyKey && taskIds.includes(id)) ?? null;
+        }
+        return db.tasks.find(({ idempotency_key }) => idempotency_key === this.values[0]) ?? null;
+      },
+    };
+  }
+}
+
+function taskRequest(projectId, idempotencyKey = 'shared-key') {
+  return new Request('https://site.test/api/video/tasks', {
+    method: 'POST',
+    headers: { ...sessionHeaders, 'idempotency-key': idempotencyKey },
+    body: JSON.stringify({ projectId, mode: 'text', model: 'kling-v1', prompt: 'ocean', duration: 5, resolution: '720p', aspectRatio: '16:9' }),
+  });
+}
+
 function uploadRequest(projectId) {
   const form = new FormData();
   if (projectId !== undefined) form.append('projectId', projectId);
@@ -209,4 +247,40 @@ test('task route rejects an invalid project before checking Kling status', async
 
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: '请选有效项目' });
+});
+
+test('task route replays a same-project idempotency key without checking offline MCP status', async () => {
+  const db = new TaskRouteDb();
+  const existing = { id: 'task-1', idempotency_key: 'shared-key', remote_id: 'remote-1', status: 'queued' };
+  db.tasks.push(existing);
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
+
+  const response = await worker.fetch(taskRequest('project-1'), { DB: db }, {});
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), existing);
+  assert.equal(db.statusQueries, 0);
+});
+
+test('task route rejects a cross-project idempotency collision without checking MCP status', async () => {
+  const db = new TaskRouteDb();
+  db.projects.push({ id: 'project-2', name: 'Project 2', created_at: 2, updated_at: 2 });
+  db.tasks.push({ id: 'task-1', idempotency_key: 'shared-key', remote_id: 'remote-secret', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
+
+  const response = await worker.fetch(taskRequest('project-2'), { DB: db }, {});
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: '幂等键已用于其他项目' });
+  assert.equal(db.statusQueries, 0);
+});
+
+test('fresh task still checks status and rejects an offline MCP connection', async () => {
+  const db = new TaskRouteDb();
+
+  const response = await worker.fetch(taskRequest('project-1', 'fresh-key'), { DB: db }, {});
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), { error: '请先连接可灵 MCP' });
+  assert.equal(db.statusQueries, 1);
 });
