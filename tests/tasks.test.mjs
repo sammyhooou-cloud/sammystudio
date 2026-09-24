@@ -33,6 +33,7 @@ class TaskDb {
     this.projectTasks = [];
     this.settings = [];
     this.batchCount = 0;
+    this.queries = [];
   }
 
   prepare(sql) {
@@ -42,6 +43,12 @@ class TaskDb {
       values: [],
       bind(...values) { return { ...statement, values }; },
       async first() {
+        db.queries.push({ sql, values: this.values });
+        if (sql.includes('JOIN project_tasks')) {
+          const [idempotencyKey, projectId] = this.values;
+          const taskIds = db.projectTasks.filter(({ project_id }) => project_id === projectId).map(({ task_id }) => task_id);
+          return db.tasks.find(({ id, idempotency_key }) => idempotency_key === idempotencyKey && taskIds.includes(id)) ?? null;
+        }
         if (sql.includes('FROM video_tasks')) return db.tasks.find(({ idempotency_key }) => idempotency_key === this.values[0]) ?? null;
         if (sql.includes('FROM projects')) return db.projects.find(({ id }) => id === this.values[0]) ?? null;
         if (sql.includes('FROM stored_objects')) return null;
@@ -64,6 +71,36 @@ class TaskDb {
     return Promise.all(statements.map((statement) => statement.run()));
   }
 }
+
+test('same project idempotency replay returns its task without another Kling call', async () => {
+  const db = new TaskDb();
+  const existing = { id: 'task-1', idempotency_key: 'shared-key', remote_id: 'remote-1', status: 'queued' };
+  db.tasks.push(existing);
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1', created_at: 1 });
+  let calls = 0;
+
+  const result = await submitTask(input, { DB: db }, 'shared-key', capabilities, fetch, async () => { calls += 1; });
+
+  assert.deepEqual(result, existing);
+  assert.equal(calls, 0);
+  assert.equal(db.tasks.length, 1);
+});
+
+test('cross-project idempotency collision is rejected without exposing or generating a task', async () => {
+  const db = new TaskDb();
+  db.projects.push({ id: 'project-2' });
+  db.tasks.push({ id: 'task-project-1', idempotency_key: 'shared-key', remote_id: 'secret-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-project-1', created_at: 1 });
+  let calls = 0;
+
+  await assert.rejects(
+    () => submitTask({ ...input, projectId: 'project-2' }, { DB: db }, 'shared-key', capabilities, fetch, async () => { calls += 1; }),
+    { message: '幂等键已用于其他项目' },
+  );
+  assert.equal(calls, 0);
+  assert.equal(db.tasks.length, 1);
+  assert.deepEqual(db.projectTasks, [{ project_id: 'project-1', task_id: 'task-project-1', created_at: 1 }]);
+});
 
 test('image task cannot use an upload associated with another project', async () => {
   const db = new TaskDb();

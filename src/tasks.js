@@ -29,12 +29,14 @@ function settingsSnapshot(valid) {
 }
 
 export async function submitTask(input, env, idempotencyKey, capabilities, fetcher = fetch, toolCaller = callTool) {
-  const existing = await env.DB.prepare('SELECT * FROM video_tasks WHERE idempotency_key = ?').bind(idempotencyKey).first();
-  if (existing) return existing;
   const projectId = String(input?.projectId || '').trim();
   if (!projectId) throw new Error('请选择项目');
   const project = await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first();
   if (!project) throw new Error('请选有效项目');
+  const existing = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(idempotencyKey, projectId).first();
+  if (existing) return existing;
+  const collision = await env.DB.prepare('SELECT id FROM video_tasks WHERE idempotency_key = ?').bind(idempotencyKey).first();
+  if (collision) throw new Error('幂等键已用于其他项目');
   const valid = validateTask(input, capabilities);
   const id = crypto.randomUUID();
   let result;
