@@ -25,7 +25,7 @@
           <button id="rename-project-mobile" class="project-item" type="button"><span>✎</span><strong>重命名当前项目</strong></button>
           <p id="project-error" class="error" aria-live="polite"></p>
         </aside>
-        <div class="workspace-main">
+        <div class="workspace-main" tabindex="-1">
           <header class="workspace-head"><div><p class="eyebrow">VIDEO GENERATION</p><h1>生成动态想象</h1><p class="current-project-line">当前项目 <strong id="current-project-name">—</strong><button id="rename-project" type="button">重命名</button></p><form id="rename-project-form" class="rename-project-form" hidden><input id="rename-project-name" maxlength="60" aria-label="新项目名称" required><button type="submit">保存</button><button id="cancel-rename-project" type="button">取消</button></form></div><div class="account-strip"><div class="status"><i id="status-light"></i><span id="status-text">正在检测</span></div><div><small>会员</small><strong id="membership">—</strong></div><div><small>点数余额</small><strong id="credits">—</strong></div><button id="refresh-status" class="icon-button" title="刷新状态">↻</button><button id="logout" class="text-button">退出</button></div></header>
           <div class="workspace-grid">
         <form id="generator-form" class="generator panel">

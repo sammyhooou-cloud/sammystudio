@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import {
   buildGenerationPayload,
   closeProjectDrawer,
+  drawerShouldReturnFocus,
   optionsForModel,
+  readStoredProjectId,
   renameProjectInList,
   selectCurrentProject,
+  shouldSwitchProject,
+  storeCurrentProjectId,
   upsertProject,
   validateWorkspace,
 } from '../public/app.js';
@@ -47,4 +51,29 @@ test('drawer closes on backdrop, escape, and project selection only', () => {
   for (const reason of ['backdrop', 'escape', 'selection']) assert.equal(closeProjectDrawer(true, reason), false);
   assert.equal(closeProjectDrawer(true, 'unrelated'), true);
   assert.equal(closeProjectDrawer(false, 'escape'), false);
+});
+
+test('does not switch or clear pending state when selecting the current project', () => {
+  assert.equal(shouldSwitchProject('project-1', { id: 'project-1' }), false);
+  assert.equal(shouldSwitchProject('project-1', { id: 'project-2' }), true);
+  assert.equal(shouldSwitchProject('', { id: 'project-1' }), true);
+});
+
+test('project storage helpers degrade safely when localStorage is unavailable', () => {
+  const unavailable = {
+    getItem() { throw new Error('blocked'); },
+    setItem() { throw new Error('blocked'); },
+  };
+  assert.equal(readStoredProjectId(unavailable), '');
+  assert.equal(storeCurrentProjectId(unavailable, 'project-1'), false);
+  const values = new Map();
+  const storage = { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) };
+  assert.equal(storeCurrentProjectId(storage, 'project-2'), true);
+  assert.equal(readStoredProjectId(storage), 'project-2');
+});
+
+test('drawer returns focus only for dismiss actions', () => {
+  assert.equal(drawerShouldReturnFocus('backdrop'), true);
+  assert.equal(drawerShouldReturnFocus('escape'), true);
+  assert.equal(drawerShouldReturnFocus('selection'), false);
 });

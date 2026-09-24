@@ -23,6 +23,22 @@ export function closeProjectDrawer(open, reason) {
   return open && !['backdrop', 'escape', 'selection'].includes(reason);
 }
 
+export function drawerShouldReturnFocus(reason) {
+  return reason === 'backdrop' || reason === 'escape';
+}
+
+export function shouldSwitchProject(selectedId, project) {
+  return Boolean(project?.id) && project.id !== selectedId;
+}
+
+export function readStoredProjectId(storage) {
+  try { return storage?.getItem('currentProjectId') || ''; } catch { return ''; }
+}
+
+export function storeCurrentProjectId(storage, projectId) {
+  try { storage?.setItem('currentProjectId', projectId); return Boolean(storage); } catch { return false; }
+}
+
 export function optionsForModel(capabilities, mode, modelId) {
   const group = mode === 'text' ? capabilities.text_to_video : capabilities.image_to_video;
   const model = group?.models?.find((item) => item.model === modelId);
@@ -93,13 +109,18 @@ function setup() {
   const createForm = document.querySelector('#create-project-form');
   const renameForm = document.querySelector('#rename-project-form');
 
-  function setDrawer(open, returnFocus = false) {
+  function projectStorage() {
+    try { return window.localStorage; } catch { return null; }
+  }
+
+  function setDrawer(open, { returnFocus = false, focusTarget = null } = {}) {
     drawerOpen = open;
     sidebar.classList.toggle('open', open);
     backdrop.hidden = !open;
     drawerToggle.setAttribute('aria-expanded', String(open));
     if (open && matchMedia('(max-width: 760px)').matches) document.querySelector('#new-project').focus();
     if (returnFocus) drawerToggle.focus();
+    else if (!open && focusTarget) focusTarget.focus();
   }
 
   function renderProjects() {
@@ -135,12 +156,24 @@ function setup() {
 
   async function switchProject(project, closeReason) {
     if (!project) return;
+    const drawerWasOpen = drawerOpen;
+    if (!shouldSwitchProject(currentProjectId, project)) {
+      renderProjects();
+      if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
+        returnFocus: drawerShouldReturnFocus(closeReason),
+        focusTarget: drawerWasOpen && closeReason === 'selection' ? document.querySelector('.workspace-main') : null,
+      });
+      return;
+    }
     const sequence = ++workspaceLoadSequence;
     projectError.textContent = '';
     setCurrentProjectId(project.id);
-    localStorage.setItem('currentProjectId', project.id);
+    storeCurrentProjectId(projectStorage(), project.id);
     renderProjects();
-    if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), closeReason === 'selection');
+    if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
+      returnFocus: drawerShouldReturnFocus(closeReason),
+      focusTarget: drawerWasOpen && closeReason === 'selection' ? document.querySelector('.workspace-main') : null,
+    });
     try {
       const workspaceState = await request(`/api/projects/${encodeURIComponent(project.id)}/workspace`);
       if (sequence === workspaceLoadSequence && currentProjectId === project.id) applyWorkspace(workspaceState);
@@ -152,7 +185,7 @@ function setup() {
   async function loadProjects() {
     const response = await request('/api/projects');
     projects = response.projects || [];
-    const selected = selectCurrentProject(projects, localStorage.getItem('currentProjectId'));
+    const selected = selectCurrentProject(projects, readStoredProjectId(projectStorage()));
     renderProjects();
     if (selected) await switchProject(selected);
     else projectError.textContent = '暂无可用项目';
@@ -188,8 +221,8 @@ function setup() {
   document.querySelector('#replace-image').onclick = () => openImageReplacement(imageInput);
   document.querySelector('#remove-image').onclick = clearImage;
   drawerToggle.onclick = () => setDrawer(!drawerOpen);
-  backdrop.onclick = () => setDrawer(closeProjectDrawer(drawerOpen, 'backdrop'), true);
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && drawerOpen) setDrawer(closeProjectDrawer(drawerOpen, 'escape'), true); });
+  backdrop.onclick = () => setDrawer(closeProjectDrawer(drawerOpen, 'backdrop'), { returnFocus: true });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && drawerOpen) setDrawer(closeProjectDrawer(drawerOpen, 'escape'), { returnFocus: true }); });
   document.querySelector('#new-project').onclick = () => { createForm.hidden = false; document.querySelector('#new-project-name').focus(); };
   document.querySelector('#cancel-create-project').onclick = () => { createForm.hidden = true; createForm.reset(); projectError.textContent = ''; };
   createForm.onsubmit = async (event) => {
