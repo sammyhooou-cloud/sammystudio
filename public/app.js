@@ -61,13 +61,15 @@ export function drawerModalState(open, mobile) {
   return { modal, backgroundInert: modal };
 }
 
-export function workspaceFormState(capabilities, mode, settings = {}) {
+export function workspaceFormState(capabilities, _previousMode, settings = {}) {
+  const mode = settings.mode === 'image' || settings.mode === 'text' ? settings.mode : 'text';
   const group = mode === 'text' ? capabilities.text_to_video : capabilities.image_to_video;
   const models = group?.models || [];
   const model = models.some(({ model: id }) => id === settings.model) ? settings.model : (models[0]?.model || '');
   const options = optionsForModel(capabilities, mode, model);
   const choose = (value, values) => values.includes(String(value)) ? String(value) : (values[0] || '');
   return {
+    mode,
     prompt: typeof settings.prompt === 'string' ? settings.prompt : '',
     model,
     resolution: choose(settings.resolution, options.resolutions),
@@ -215,9 +217,16 @@ function setup() {
   }
 
   function applyWorkspace(workspaceState) {
-    fillModels();
     const state = workspaceFormState(capabilities, mode, workspaceState?.settings || {});
+    mode = state.mode;
+    document.querySelectorAll('[data-mode]').forEach((button) => {
+      const active = button.dataset.mode === mode;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    document.querySelector('#upload-field').hidden = mode !== 'image';
     document.querySelector('#prompt').value = state.prompt;
+    fillModels();
     modelSelect.value = state.model;
     updateOptions();
     resolution.value = state.resolution;
@@ -306,7 +315,7 @@ function setup() {
   request('/api/session').then(enterWorkspace).catch(() => {});
   document.querySelector('#password-toggle').onclick = () => { const input = document.querySelector('#password'); input.type = input.type === 'password' ? 'text' : 'password'; };
   loginForm.onsubmit = async (event) => { event.preventDefault(); try { await request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password: document.querySelector('#password').value }) }); await enterWorkspace(); } catch (error) { document.querySelector('#login-error').textContent = error.message; } };
-  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelector('#upload-field').hidden = mode !== 'image'; if (mode !== 'image') clearImage(); updateSubmitDisabled(); fillModels(); });
+  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); document.querySelector('#upload-field').hidden = mode !== 'image'; if (mode !== 'image') clearImage(); updateSubmitDisabled(); fillModels(); });
   modelSelect.onchange = updateOptions;
   imageInput.onchange = async (event) => {
     const file = event.target.files[0]; if (!file) return;

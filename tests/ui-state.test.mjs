@@ -20,7 +20,10 @@ import {
   workspaceFormState,
 } from '../public/app.js';
 
-const capabilities = { text_to_video: { models: [{ model: 'turbo', arguments: [{ name: 'duration', allowedValues: ['5', '10'] }, { name: 'resolution', allowedValues: ['720p', '1080p'] }, { name: 'aspect_ratio', allowedValues: ['16:9', '9:16'] }] }] } };
+const capabilities = {
+  text_to_video: { models: [{ model: 'turbo', arguments: [{ name: 'duration', allowedValues: ['5', '10'] }, { name: 'resolution', allowedValues: ['720p', '1080p'] }, { name: 'aspect_ratio', allowedValues: ['16:9', '9:16'] }] }] },
+  image_to_video: { models: [{ model: 'image-pro', arguments: [{ name: 'duration', allowedValues: ['5'] }, { name: 'resolution', allowedValues: ['1080p'] }, { name: 'aspect_ratio', allowedValues: ['1:1', '16:9'] }] }] },
+};
 
 test('filters options from model capabilities', () => {
   assert.deepEqual(optionsForModel(capabilities, 'text', 'turbo').resolutions, ['720p', '1080p']);
@@ -119,11 +122,24 @@ test('drawer is modal only while open on mobile', () => {
 
 test('empty project workspace resets values inherited from a populated project', () => {
   const populated = workspaceFormState(capabilities, 'text', {
-    prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16',
+    mode: 'text', prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16',
   });
   const empty = workspaceFormState(capabilities, 'text', {});
-  assert.deepEqual(populated, { prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16' });
-  assert.deepEqual(empty, { prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9' });
+  assert.deepEqual(populated, { mode: 'text', prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16' });
+  assert.deepEqual(empty, { mode: 'text', prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9' });
+});
+
+test('workspace form state restores cross-mode projects without inheriting the previous mode', () => {
+  const image = workspaceFormState(capabilities, 'text', { mode: 'image', model: 'image-pro', resolution: '1080p', duration: '5', aspectRatio: '1:1' });
+  const text = workspaceFormState(capabilities, 'image', { mode: 'text', model: 'turbo' });
+  assert.deepEqual(image, { mode: 'image', prompt: '', model: 'image-pro', resolution: '1080p', duration: '5', aspectRatio: '1:1' });
+  assert.deepEqual(text, { mode: 'text', prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9' });
+});
+
+test('workspace form state falls back to text mode for missing or invalid saved modes', () => {
+  assert.equal(workspaceFormState(capabilities, 'image', {}).mode, 'text');
+  assert.equal(workspaceFormState(capabilities, 'image', { mode: 'unknown', model: 'image-pro' }).mode, 'text');
+  assert.equal(workspaceFormState(capabilities, 'image', { mode: 'unknown', model: 'image-pro' }).model, 'turbo');
 });
 
 test('project switch controller preserves selection and surfaces a visible failure', async () => {
