@@ -3,7 +3,6 @@
   "static": {
     "directory": "dist/client"
   },
-  "worker": "dist/server/worker.js",
   "d1": "DB",
   "r2": "MEDIA"
 }
