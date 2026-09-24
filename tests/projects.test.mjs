@@ -17,7 +17,12 @@ test('rejects project names longer than 60 characters', () => {
 class FakeD1 {
   constructor() {
     this.projects = [];
+    this.storedObjects = [];
+    this.videoTasks = [];
+    this.projectAssets = [];
+    this.projectTasks = [];
     this.runs = [];
+    this.failAssetBackfillOnce = false;
   }
 
   prepare(sql) {
@@ -33,13 +38,31 @@ class FakeD1 {
           },
           async run() {
             db.runs.push({ sql, values });
-            if (sql.startsWith('INSERT INTO projects')) {
+            if (sql.startsWith('INSERT OR IGNORE INTO projects') && !db.projects.some(({ id }) => id === values[0])) {
               db.projects.push({
                 id: values[0],
                 name: values[1],
                 created_at: values[2],
                 updated_at: values[3],
               });
+            }
+            if (sql.startsWith('INSERT OR IGNORE INTO project_assets')) {
+              if (db.failAssetBackfillOnce) {
+                db.failAssetBackfillOnce = false;
+                throw new Error('simulated asset backfill failure');
+              }
+              for (const object of db.storedObjects) {
+                if (!db.projectAssets.some(({ object_id }) => object_id === object.id)) {
+                  db.projectAssets.push({ project_id: values[0], object_id: object.id, created_at: object.created_at });
+                }
+              }
+            }
+            if (sql.startsWith('INSERT OR IGNORE INTO project_tasks')) {
+              for (const task of db.videoTasks) {
+                if (!db.projectTasks.some(({ task_id }) => task_id === task.id)) {
+                  db.projectTasks.push({ project_id: values[0], task_id: task.id, created_at: task.created_at });
+                }
+              }
             }
             return { success: true };
           },
@@ -57,9 +80,10 @@ class FakeD1 {
 
 test('creates and returns one default project idempotently', async () => {
   const db = new FakeD1();
-  const idFactory = () => 'project-default';
+  db.storedObjects.push({ id: 'object-1', created_at: 101 });
+  db.videoTasks.push({ id: 'task-1', created_at: 202 });
 
-  const created = await ensureDefaultProject(db, idFactory, 1234);
+  const created = await ensureDefaultProject(db, () => 'project-default', 1234);
   const existing = await ensureDefaultProject(db, () => 'must-not-be-used', 9999);
 
   assert.deepEqual(created, {
@@ -69,9 +93,9 @@ test('creates and returns one default project idempotently', async () => {
     updated_at: 1234,
   });
   assert.deepEqual(existing, created);
-  assert.equal(db.runs.filter(({ sql }) => sql.startsWith('INSERT INTO projects')).length, 1);
-  assert.equal(db.runs.filter(({ sql }) => sql.includes('project_assets')).length, 1);
-  assert.equal(db.runs.filter(({ sql }) => sql.includes('project_tasks')).length, 1);
+  assert.equal(db.runs.filter(({ sql }) => sql.includes('INTO projects')).length, 1);
+  assert.deepEqual(db.projectAssets, [{ project_id: 'project-default', object_id: 'object-1', created_at: 101 }]);
+  assert.deepEqual(db.projectTasks, [{ project_id: 'project-default', task_id: 'task-1', created_at: 202 }]);
 });
 
 test('returns the earliest existing project without creating a default', async () => {
@@ -84,5 +108,34 @@ test('returns the earliest existing project without creating a default', async (
   const project = await ensureDefaultProject(db, () => 'unused', 30);
 
   assert.equal(project.id, 'older');
-  assert.equal(db.runs.length, 0);
+  assert.equal(db.runs.filter(({ sql }) => sql.includes('project_assets')).length, 1);
+  assert.equal(db.runs.filter(({ sql }) => sql.includes('project_tasks')).length, 1);
+});
+
+test('repairs incomplete backfills when initialization is retried', async () => {
+  const db = new FakeD1();
+  db.storedObjects.push({ id: 'object-1', created_at: 101 });
+  db.videoTasks.push({ id: 'task-1', created_at: 202 });
+  db.failAssetBackfillOnce = true;
+
+  await assert.rejects(() => ensureDefaultProject(db, () => 'project-default', 1234), /simulated asset backfill failure/);
+  const project = await ensureDefaultProject(db, () => 'must-not-be-used', 9999);
+
+  assert.equal(project.id, 'project-default');
+  assert.equal(db.projects.length, 1);
+  assert.deepEqual(db.projectAssets, [{ project_id: 'project-default', object_id: 'object-1', created_at: 101 }]);
+  assert.deepEqual(db.projectTasks, [{ project_id: 'project-default', task_id: 'task-1', created_at: 202 }]);
+});
+
+test('prevents duplicate default projects during concurrent initialization', async () => {
+  const db = new FakeD1();
+
+  const [first, second] = await Promise.all([
+    ensureDefaultProject(db, undefined, 1234),
+    ensureDefaultProject(db, undefined, 1234),
+  ]);
+
+  assert.equal(first.id, 'uncategorized');
+  assert.deepEqual(second, first);
+  assert.equal(db.projects.length, 1);
 });

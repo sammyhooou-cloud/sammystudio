@@ -5,30 +5,28 @@ export function normalizeProjectName(name) {
   return normalized;
 }
 
-export async function ensureDefaultProject(db, idFactory = crypto.randomUUID, now = Date.now()) {
-  const existing = await db
+export async function ensureDefaultProject(db, idFactory = () => 'uncategorized', now = Date.now()) {
+  let project = await db
     .prepare('SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at ASC, id ASC LIMIT 1')
     .first();
-  if (existing) return existing;
-
-  const project = {
-    id: idFactory(),
-    name: '未分类项目',
-    created_at: now,
-    updated_at: now,
-  };
+  if (!project) {
+    const id = idFactory();
+    await db
+      .prepare('INSERT OR IGNORE INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)')
+      .bind(id, '未分类项目', now, now)
+      .run();
+    project = await db
+      .prepare('SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at ASC, id ASC LIMIT 1')
+      .first();
+  }
 
   await db
-    .prepare('INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)')
-    .bind(project.id, project.name, project.created_at, project.updated_at)
+    .prepare('INSERT OR IGNORE INTO project_assets (project_id, object_id, created_at) SELECT ?, id, created_at FROM stored_objects')
+    .bind(project.id)
     .run();
   await db
-    .prepare('INSERT OR IGNORE INTO project_assets (project_id, object_id, created_at) SELECT ?, id, ? FROM stored_objects')
-    .bind(project.id, now)
-    .run();
-  await db
-    .prepare('INSERT OR IGNORE INTO project_tasks (project_id, task_id, created_at) SELECT ?, id, ? FROM video_tasks')
-    .bind(project.id, now)
+    .prepare('INSERT OR IGNORE INTO project_tasks (project_id, task_id, created_at) SELECT ?, id, created_at FROM video_tasks')
+    .bind(project.id)
     .run();
 
   return project;
