@@ -4,6 +4,7 @@ import { getKlingStatus } from './kling-mcp.js';
 import { submitTask } from './tasks.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
+import { createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
 
 const securityHeaders = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'permissions-policy': 'camera=(), microphone=(), geolocation=()', 'content-security-policy': "default-src 'self'; img-src 'self' blob: data:; media-src 'self' https:; style-src 'self'; script-src 'self'; connect-src 'self' https://klingai.com" };
 
@@ -14,6 +15,10 @@ function withSecurity(response) {
 }
 
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8' } });
+
+function projectInputError(error) {
+  return error instanceof SyntaxError || ['项目名称不能为空', '项目名称不能超过60个字符'].includes(error?.message);
+}
 
 function siteAsset(pathname) {
   const key = pathname === '/' ? '/index.html' : pathname;
@@ -42,6 +47,31 @@ async function api(request, env) {
   if (!session && url.pathname !== '/api/kling/oauth/callback') return unauthorized();
   if (url.pathname === '/api/session' && request.method === 'GET') return json({ authenticated: true });
   if (url.pathname === '/api/session' && request.method === 'DELETE') return deleteSession(request, env);
+  if (url.pathname === '/api/projects' && request.method === 'GET') return json({ projects: await listProjects(env.DB) });
+  if (url.pathname === '/api/projects' && request.method === 'POST') {
+    try { return json(await createProject(env.DB, await request.json()), 201); }
+    catch (error) {
+      if (projectInputError(error)) return json({ error: error instanceof SyntaxError ? '请提供有效的 JSON' : error.message }, 400);
+      throw error;
+    }
+  }
+  const workspaceMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/workspace$/);
+  if (workspaceMatch && request.method === 'GET') {
+    try { return json(await readProjectWorkspace(env.DB, decodeURIComponent(workspaceMatch[1]))); }
+    catch (error) {
+      if (error.message === '项目不存在') return json({ error: error.message }, 404);
+      throw error;
+    }
+  }
+  const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (projectMatch && request.method === 'PATCH') {
+    try { return json(await renameProject(env.DB, decodeURIComponent(projectMatch[1]), await request.json())); }
+    catch (error) {
+      if (error.message === '项目不存在') return json({ error: error.message }, 404);
+      if (projectInputError(error)) return json({ error: error instanceof SyntaxError ? '请提供有效的 JSON' : error.message }, 400);
+      throw error;
+    }
+  }
   if (url.pathname === '/api/kling/status' && request.method === 'GET') return json(await getKlingStatus(env));
   if (url.pathname === '/api/kling/oauth/start' && request.method === 'GET') return Response.redirect((await beginAuthorization(request, env)).url.toString(), 302);
   if (url.pathname === '/api/kling/oauth/callback' && request.method === 'GET') { try { await finishAuthorization(request, env); return Response.redirect(`${url.origin}/?authorized=1`, 302); } catch (error) { return Response.redirect(`${url.origin}/?oauth_error=1`, 302); } }

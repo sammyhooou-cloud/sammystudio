@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ensureDefaultProject, normalizeProjectName } from '../src/projects.js';
+import {
+  createProject,
+  ensureDefaultProject,
+  listProjects,
+  normalizeProjectName,
+  readProjectWorkspace,
+  renameProject,
+} from '../src/projects.js';
 
 test('normalizes project names by trimming surrounding whitespace', () => {
   assert.equal(normalizeProjectName('  项目 A  '), '项目 A');
@@ -21,6 +28,7 @@ class FakeD1 {
     this.videoTasks = [];
     this.projectAssets = [];
     this.projectTasks = [];
+    this.projectSettings = [];
     this.runs = [];
     this.batchCount = 0;
     this.failAssetBackfillOnce = false;
@@ -35,10 +43,32 @@ class FakeD1 {
         return { ...statement, values };
       },
       async first() {
+        const values = this.values;
+        if (sql.includes('WHERE id = ?')) {
+          return db.projects.find(({ id }) => id === values[0]) ?? null;
+        }
+        if (sql.includes('FROM project_settings')) {
+          return db.projectSettings.find(({ project_id }) => project_id === values[0]) ?? null;
+        }
         if (sql.includes('FROM projects')) {
           return [...db.projects].sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id))[0] ?? null;
         }
         throw new Error(`Unexpected first query: ${sql}`);
+      },
+      async all() {
+        const values = this.values;
+        if (sql.includes('FROM projects')) {
+          return { results: [...db.projects].sort((a, b) => b.updated_at - a.updated_at || a.id.localeCompare(b.id)) };
+        }
+        if (sql.includes('FROM project_assets')) {
+          const ids = db.projectAssets.filter((link) => link.project_id === values[0]).map((link) => link.object_id);
+          return { results: db.storedObjects.filter(({ id }) => ids.includes(id)).sort((a, b) => b.created_at - a.created_at) };
+        }
+        if (sql.includes('FROM project_tasks')) {
+          const ids = db.projectTasks.filter((link) => link.project_id === values[0]).map((link) => link.task_id);
+          return { results: db.videoTasks.filter(({ id }) => ids.includes(id)).sort((a, b) => b.updated_at - a.updated_at) };
+        }
+        throw new Error(`Unexpected all query: ${sql}`);
       },
       async run() {
         const values = this.values;
@@ -50,6 +80,17 @@ class FakeD1 {
             created_at: values[2],
             updated_at: values[3],
           });
+        }
+        if (sql.startsWith('INSERT INTO projects')) {
+          db.projects.push({ id: values[0], name: values[1], created_at: values[2], updated_at: values[3] });
+          return { success: true, meta: { changes: 1 } };
+        }
+        if (sql.startsWith('UPDATE projects')) {
+          const project = db.projects.find(({ id }) => id === values[2]);
+          if (!project) return { success: true, meta: { changes: 0 } };
+          project.name = values[0];
+          project.updated_at = values[1];
+          return { success: true, meta: { changes: 1 } };
         }
         if (sql.startsWith('INSERT OR IGNORE INTO project_assets')) {
           if (db.failAssetBackfillOnce) {
@@ -162,4 +203,62 @@ test('prevents duplicate default projects during concurrent initialization', asy
   assert.equal(first.id, 'uncategorized');
   assert.deepEqual(second, first);
   assert.equal(db.projects.length, 1);
+});
+
+test('lists projects most recently updated after ensuring the default project', async () => {
+  const db = new FakeD1();
+  db.projects.push(
+    { id: 'older', name: '较早', created_at: 10, updated_at: 20 },
+    { id: 'newer', name: '较新', created_at: 30, updated_at: 40 },
+  );
+
+  assert.deepEqual(await listProjects(db), [
+    { id: 'newer', name: '较新', createdAt: 30, updatedAt: 40 },
+    { id: 'older', name: '较早', createdAt: 10, updatedAt: 20 },
+  ]);
+});
+
+test('creates and renames a normalized project', async () => {
+  const db = new FakeD1();
+  const created = await createProject(db, { name: '  新项目  ' }, () => 'project-1', 100);
+  const renamed = await renameProject(db, 'project-1', { name: '  更名后  ' }, 200);
+
+  assert.deepEqual(created, { id: 'project-1', name: '新项目', createdAt: 100, updatedAt: 100 });
+  assert.deepEqual(renamed, { id: 'project-1', name: '更名后', createdAt: 100, updatedAt: 200 });
+  await assert.rejects(() => renameProject(db, 'missing', { name: '不存在' }, 300), { message: '项目不存在' });
+});
+
+test('reads only assets and tasks linked to one project and parses settings', async () => {
+  const db = new FakeD1();
+  db.projects.push({ id: 'project-a', name: 'A', created_at: 1, updated_at: 2 });
+  db.storedObjects.push(
+    { id: 'asset-a', object_key: 'references/a', mime_type: 'image/png', size: 11, created_at: 30 },
+    { id: 'asset-b', object_key: 'references/b', mime_type: 'image/jpeg', size: 22, created_at: 40 },
+  );
+  db.videoTasks.push(
+    { id: 'task-a', idempotency_key: 'secret-a', remote_id: 'remote-a', mode: 'image', status: 'done', request_json: '{}', result_json: '{"url":"a"}', created_at: 10, updated_at: 50 },
+    { id: 'task-b', idempotency_key: 'secret-b', remote_id: 'remote-b', mode: 'text', status: 'queued', request_json: '{}', result_json: null, created_at: 20, updated_at: 60 },
+  );
+  db.projectAssets.push({ project_id: 'project-a', object_id: 'asset-a', created_at: 30 }, { project_id: 'project-b', object_id: 'asset-b', created_at: 40 });
+  db.projectTasks.push({ project_id: 'project-a', task_id: 'task-a', created_at: 10 }, { project_id: 'project-b', task_id: 'task-b', created_at: 20 });
+  db.projectSettings.push({ project_id: 'project-a', settings_json: '{"duration":5}', updated_at: 70 });
+
+  const workspace = await readProjectWorkspace(db, 'project-a');
+
+  assert.equal(workspace.project.id, 'project-a');
+  assert.deepEqual(workspace.assets.map(({ id }) => id), ['asset-a']);
+  assert.deepEqual(workspace.tasks.map(({ id }) => id), ['task-a']);
+  assert.deepEqual(workspace.settings, { duration: 5 });
+  assert.equal('objectKey' in workspace.assets[0], false);
+  assert.equal('idempotencyKey' in workspace.tasks[0], false);
+});
+
+test('falls back to empty settings and rejects missing projects', async () => {
+  const db = new FakeD1();
+  db.projects.push({ id: 'project-a', name: 'A', created_at: 1, updated_at: 2 });
+
+  assert.deepEqual((await readProjectWorkspace(db, 'project-a')).settings, {});
+  db.projectSettings.push({ project_id: 'project-a', settings_json: '{broken', updated_at: 3 });
+  assert.deepEqual((await readProjectWorkspace(db, 'project-a')).settings, {});
+  await assert.rejects(() => readProjectWorkspace(db, 'missing'), { message: '项目不存在' });
 });
