@@ -35,7 +35,10 @@ class TaskDb {
     this.batchCount = 0;
     this.queries = [];
     this.failReservation = false;
-    this.failFinalization = false;
+    this.failProjectTask = false;
+    this.finalizationFailuresRemaining = 0;
+    this.finalizationAttempts = 0;
+    this.failSettings = false;
     this.upload = null;
   }
 
@@ -64,7 +67,11 @@ class TaskDb {
           db.tasks.push({ id: values[0], idempotency_key: values[1], remote_id: values[2], mode: values[3], status: values[4], request_json: values[5] });
         }
         else if (sql.startsWith('UPDATE video_tasks SET remote_id')) {
-          if (db.failFinalization) throw new Error('database unavailable');
+          db.finalizationAttempts += 1;
+          if (db.finalizationFailuresRemaining > 0) {
+            db.finalizationFailuresRemaining -= 1;
+            throw new Error('database unavailable');
+          }
           const task = db.tasks.find(({ id }) => id === values[4]);
           task.remote_id = values[0];
           task.status = values[1];
@@ -73,8 +80,14 @@ class TaskDb {
           const task = db.tasks.find(({ id }) => id === values[2]);
           task.status = values[0];
         }
-        else if (sql.startsWith('INSERT INTO project_tasks')) db.projectTasks.push({ project_id: values[0], task_id: values[1], created_at: values[2] });
-        else if (sql.startsWith('INSERT INTO project_settings')) db.settings = [{ project_id: values[0], settings_json: values[1], updated_at: values[2] }];
+        else if (sql.startsWith('INSERT INTO project_tasks')) {
+          if (db.failProjectTask) throw new Error('mapping unavailable');
+          db.projectTasks.push({ project_id: values[0], task_id: values[1], created_at: values[2] });
+        }
+        else if (sql.startsWith('INSERT INTO project_settings')) {
+          if (db.failSettings) throw new Error('settings unavailable');
+          db.settings = [{ project_id: values[0], settings_json: values[1], updated_at: values[2] }];
+        }
         else throw new Error(`Unexpected run query: ${sql}`);
         return { success: true };
       },
@@ -85,7 +98,14 @@ class TaskDb {
   async batch(statements) {
     this.batchCount += 1;
     if (this.failReservation && statements.some(({ sql }) => sql?.startsWith('INSERT INTO video_tasks'))) throw new Error('database unavailable');
-    return Promise.all(statements.map((statement) => statement.run()));
+    const snapshot = structuredClone({ tasks: this.tasks, projectTasks: this.projectTasks, settings: this.settings });
+    try { return await Promise.all(statements.map((statement) => statement.run())); }
+    catch (error) {
+      this.tasks = snapshot.tasks;
+      this.projectTasks = snapshot.projectTasks;
+      this.settings = snapshot.settings;
+      throw error;
+    }
   }
 }
 
@@ -173,20 +193,58 @@ test('reservation persistence failure prevents a paid call and returns a sanitiz
   assert.deepEqual(db.tasks, []);
 });
 
-test('finalization failure leaves a submitting reservation that prevents another paid call', async () => {
+test('reservation mapping failure rolls back the task and prevents a paid call', async () => {
   const db = new TaskDb();
-  db.failFinalization = true;
+  db.failProjectTask = true;
   let calls = 0;
 
   await assert.rejects(
-    () => submitTask(input, { DB: db }, 'finalize-key', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-1' }; }),
+    () => submitTask(input, { DB: db }, 'mapping-key', capabilities, fetch, async () => { calls += 1; }),
     (error) => error.status === 500 && error.message === '任务保存失败',
   );
-  const replay = await submitTask(input, { DB: db }, 'finalize-key', capabilities, fetch, async () => { calls += 1; });
+  assert.equal(calls, 0);
+  assert.deepEqual(db.tasks, []);
+  assert.deepEqual(db.projectTasks, []);
+});
+
+test('settings failure after core finalization replays the tracked remote task', async () => {
+  const db = new TaskDb();
+  db.failSettings = true;
+  let calls = 0;
+
+  await assert.rejects(
+    () => submitTask(input, { DB: db }, 'settings-key', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-1' }; }),
+    (error) => error.status === 500 && error.message === '项目设置保存失败',
+  );
+  const replay = await submitTask(input, { DB: db }, 'settings-key', capabilities, fetch, async () => { calls += 1; });
 
   assert.equal(calls, 1);
-  assert.equal(replay.status, 'submitting');
-  assert.equal(replay.remote_id, null);
+  assert.deepEqual(replay, { id: replay.id, remote_id: 'remote-1', status: 'queued' });
+});
+
+test('core finalization retries transient database failures without another provider call', async () => {
+  const db = new TaskDb();
+  db.finalizationFailuresRemaining = 2;
+  let calls = 0;
+
+  const result = await submitTask(input, { DB: db }, 'retry-finalize', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-retry' }; });
+
+  assert.equal(calls, 1);
+  assert.equal(db.finalizationAttempts, 3);
+  assert.deepEqual(result, { id: result.id, remote_id: 'remote-retry', status: 'queued' });
+});
+
+test('database without batch support fails before a paid call or reservation write', async () => {
+  const db = new TaskDb();
+  db.batch = undefined;
+  let calls = 0;
+
+  await assert.rejects(
+    () => submitTask(input, { DB: db }, 'no-batch', capabilities, fetch, async () => { calls += 1; }),
+    (error) => error.status === 500 && error.message === '任务保存失败',
+  );
+  assert.equal(calls, 0);
+  assert.deepEqual(db.tasks, []);
 });
 
 test('missing R2 image object returns a controlled server error before provider upload', async () => {
@@ -210,6 +268,17 @@ test('provider failure is marked failed and returned as a sanitized gateway erro
     (error) => error.status === 502 && error.message === '视频生成服务暂不可用' && !error.message.includes('secret'),
   );
   assert.equal(db.tasks[0].status, 'failed');
+});
+
+test('provider success without a task id is marked failed and rejected as malformed', async () => {
+  const db = new TaskDb();
+
+  await assert.rejects(
+    () => submitTask(input, { DB: db }, 'malformed-provider', capabilities, fetch, async () => ({ status: 'accepted' })),
+    (error) => error.status === 502 && error.message === '视频生成服务返回无效',
+  );
+  assert.equal(db.tasks[0].status, 'failed');
+  assert.equal(db.tasks[0].remote_id, null);
 });
 
 test('image task cannot use an upload associated with another project', async () => {
@@ -255,6 +324,6 @@ test('task links the generated task and saves a serializable settings snapshot',
   assert.deepEqual(JSON.parse(db.settings[0].settings_json), {
     mode: 'text', model: 'kling-v1', prompt: 'ocean at dawn', uploadId: null, duration: '5', resolution: '720p', aspectRatio: '16:9', imageCount: '1',
   });
-  assert.equal(db.batchCount, 2);
+  assert.equal(db.batchCount, 1);
   assert.doesNotThrow(() => JSON.stringify(JSON.parse(db.settings[0].settings_json)));
 });

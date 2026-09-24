@@ -71,6 +71,7 @@ class UploadDb extends RouteDb {
     this.storedObjects = [];
     this.projectAssets = [];
     this.failBatch = false;
+    this.failMapping = false;
   }
 
   prepare(sql) {
@@ -94,7 +95,19 @@ class UploadDb extends RouteDb {
 
   async batch(statements) {
     if (this.failBatch && statements.some(({ sql }) => sql?.startsWith('INSERT INTO stored_objects'))) throw new Error('database credentials leaked');
-    return super.batch(statements);
+    const snapshot = structuredClone({ storedObjects: this.storedObjects, projectAssets: this.projectAssets });
+    try {
+      const results = [];
+      for (const statement of statements) {
+        if (this.failMapping && statement.sql?.startsWith('INSERT INTO project_assets')) throw new Error('mapping unavailable');
+        results.push(await statement.run());
+      }
+      return results;
+    } catch (error) {
+      this.storedObjects = snapshot.storedObjects;
+      this.projectAssets = snapshot.projectAssets;
+      throw error;
+    }
   }
 }
 
@@ -269,6 +282,34 @@ test('upload sanitizes object storage failures', async () => {
 
   assert.equal(response.status, 500);
   assert.deepEqual(await response.json(), { error: '上传存储失败' });
+});
+
+test('upload requires transactional batch support before writing R2', async () => {
+  const db = new UploadDb();
+  db.batch = undefined;
+  let writes = 0;
+
+  const response = await worker.fetch(uploadRequest('project-1'), { DB: db, MEDIA: { put: async () => { writes += 1; } } }, {});
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: '上传保存失败' });
+  assert.equal(writes, 0);
+});
+
+test('upload mapping failure rolls back database rows and deletes the R2 object', async () => {
+  const db = new UploadDb();
+  db.failMapping = true;
+  const deleted = [];
+
+  const response = await worker.fetch(uploadRequest('project-1'), {
+    DB: db,
+    MEDIA: { put: async () => {}, delete: async (key) => { deleted.push(key); } },
+  }, {});
+
+  assert.equal(response.status, 500);
+  assert.equal(deleted.length, 1);
+  assert.deepEqual(db.storedObjects, []);
+  assert.deepEqual(db.projectAssets, []);
 });
 
 test('task route rejects an invalid project before checking Kling status', async () => {

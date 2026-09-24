@@ -41,6 +41,7 @@ async function upload(request, env) {
   if (!projectId) return json({ error: '请选择项目' }, 400);
   const project = await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first();
   if (!project) return json({ error: '请选有效项目' }, 400);
+  if (typeof env.DB.batch !== 'function') return json({ error: '上传保存失败' }, 500);
   const id = crypto.randomUUID();
   const key = `references/${id}`;
   const createdAt = Date.now();
@@ -54,8 +55,7 @@ async function upload(request, env) {
     env.DB.prepare('INSERT INTO project_assets (project_id, object_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
   ];
   try {
-    if (typeof env.DB.batch === 'function') await env.DB.batch(statements);
-    else for (const statement of statements) await statement.run();
+    await env.DB.batch(statements);
   } catch {
     try { await env.MEDIA.delete(key); } catch {}
     return json({ error: '上传保存失败' }, 500);

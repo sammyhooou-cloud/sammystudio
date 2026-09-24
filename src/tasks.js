@@ -54,6 +54,17 @@ async function markFailed(db, id) {
   } catch {}
 }
 
+async function finalizeTask(db, id, remoteId, result) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await db.prepare('UPDATE video_tasks SET remote_id = ?, status = ?, result_json = ?, updated_at = ? WHERE id = ?').bind(remoteId, 'queued', JSON.stringify(result), Date.now(), id).run();
+      return;
+    } catch {
+      if (attempt === 2) throw new TaskError('任务保存失败', 500);
+    }
+  }
+}
+
 export async function submitTask(input, env, idempotencyKey, capabilitiesSource, fetcher = fetch, toolCaller = callTool) {
   const projectId = String(input?.projectId || '').trim();
   if (!projectId) throw new TaskError('请选择项目', 400);
@@ -64,6 +75,7 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   if (existing) return taskDto(existing);
   const legacy = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(idempotencyKey, projectId).first();
   if (legacy) return taskDto(legacy);
+  if (typeof env.DB.batch !== 'function') throw new TaskError('任务保存失败', 500);
   const capabilities = await loadCapabilities(capabilitiesSource);
   let valid;
   try { valid = validateTask(input, capabilities); }
@@ -75,8 +87,7 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
     env.DB.prepare('INSERT INTO project_tasks (project_id, task_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
   ];
   try {
-    if (typeof env.DB.batch === 'function') await env.DB.batch(reservation);
-    else for (const statement of reservation) await statement.run();
+    await env.DB.batch(reservation);
   } catch {
     const reserved = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(internalKey, projectId).first();
     if (reserved) return taskDto(reserved);
@@ -100,15 +111,15 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
     throw new TaskError('视频生成服务暂不可用', 502);
   }
   const remoteId = result.taskId || result.task_id || result.id || null;
-  const statements = [
-    env.DB.prepare('UPDATE video_tasks SET remote_id = ?, status = ?, result_json = ?, updated_at = ? WHERE id = ?').bind(remoteId, 'queued', JSON.stringify(result), Date.now(), id),
-    env.DB.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at').bind(projectId, JSON.stringify(settingsSnapshot(valid)), createdAt),
-  ];
+  if (!remoteId) {
+    await markFailed(env.DB, id);
+    throw new TaskError('视频生成服务返回无效', 502);
+  }
+  await finalizeTask(env.DB, id, remoteId, result);
   try {
-    if (typeof env.DB.batch === 'function') await env.DB.batch(statements);
-    else for (const statement of statements) await statement.run();
+    await env.DB.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at').bind(projectId, JSON.stringify(settingsSnapshot(valid)), createdAt).run();
   } catch {
-    throw new TaskError('任务保存失败', 500);
+    throw new TaskError('项目设置保存失败', 500);
   }
   return taskDto({ id, remote_id: remoteId, status: 'queued' });
 }
