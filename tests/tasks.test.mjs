@@ -34,6 +34,9 @@ class TaskDb {
     this.settings = [];
     this.batchCount = 0;
     this.queries = [];
+    this.failReservation = false;
+    this.failFinalization = false;
+    this.upload = null;
   }
 
   prepare(sql) {
@@ -51,12 +54,25 @@ class TaskDb {
         }
         if (sql.includes('FROM video_tasks')) return db.tasks.find(({ idempotency_key }) => idempotency_key === this.values[0]) ?? null;
         if (sql.includes('FROM projects')) return db.projects.find(({ id }) => id === this.values[0]) ?? null;
-        if (sql.includes('FROM stored_objects')) return null;
+        if (sql.includes('FROM stored_objects')) return db.upload;
         throw new Error(`Unexpected first query: ${sql}`);
       },
       async run() {
         const values = this.values;
-        if (sql.startsWith('INSERT INTO video_tasks')) db.tasks.push({ id: values[0], idempotency_key: values[1], request_json: values[5] });
+        if (sql.startsWith('INSERT INTO video_tasks')) {
+          if (db.tasks.some(({ idempotency_key }) => idempotency_key === values[1])) throw new Error('UNIQUE constraint failed: video_tasks.idempotency_key');
+          db.tasks.push({ id: values[0], idempotency_key: values[1], remote_id: values[2], mode: values[3], status: values[4], request_json: values[5] });
+        }
+        else if (sql.startsWith('UPDATE video_tasks SET remote_id')) {
+          if (db.failFinalization) throw new Error('database unavailable');
+          const task = db.tasks.find(({ id }) => id === values[4]);
+          task.remote_id = values[0];
+          task.status = values[1];
+        }
+        else if (sql.startsWith('UPDATE video_tasks SET status')) {
+          const task = db.tasks.find(({ id }) => id === values[2]);
+          task.status = values[0];
+        }
         else if (sql.startsWith('INSERT INTO project_tasks')) db.projectTasks.push({ project_id: values[0], task_id: values[1], created_at: values[2] });
         else if (sql.startsWith('INSERT INTO project_settings')) db.settings = [{ project_id: values[0], settings_json: values[1], updated_at: values[2] }];
         else throw new Error(`Unexpected run query: ${sql}`);
@@ -68,38 +84,132 @@ class TaskDb {
 
   async batch(statements) {
     this.batchCount += 1;
+    if (this.failReservation && statements.some(({ sql }) => sql?.startsWith('INSERT INTO video_tasks'))) throw new Error('database unavailable');
     return Promise.all(statements.map((statement) => statement.run()));
   }
 }
 
 test('same project idempotency replay returns its task without another Kling call', async () => {
   const db = new TaskDb();
-  const existing = { id: 'task-1', idempotency_key: 'shared-key', remote_id: 'remote-1', status: 'queued' };
+  const existing = { id: 'task-1', idempotency_key: '["project-1","shared-key"]', remote_id: 'remote-1', status: 'queued' };
   db.tasks.push(existing);
   db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1', created_at: 1 });
   let calls = 0;
 
   const result = await submitTask(input, { DB: db }, 'shared-key', capabilities, fetch, async () => { calls += 1; });
 
-  assert.deepEqual(result, existing);
+  assert.deepEqual(result, { id: 'task-1', remote_id: 'remote-1', status: 'queued' });
   assert.equal(calls, 0);
   assert.equal(db.tasks.length, 1);
 });
 
-test('cross-project idempotency collision is rejected without exposing or generating a task', async () => {
+test('same-project tasks saved with legacy external keys still replay without a paid call', async () => {
+  const db = new TaskDb();
+  db.tasks.push({ id: 'legacy-task', idempotency_key: 'legacy-key', remote_id: 'legacy-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'legacy-task', created_at: 1 });
+  let calls = 0;
+
+  const result = await submitTask(input, { DB: db }, 'legacy-key', capabilities, fetch, async () => { calls += 1; });
+
+  assert.deepEqual(result, { id: 'legacy-task', remote_id: 'legacy-remote', status: 'queued' });
+  assert.equal(calls, 0);
+});
+
+test('the same external idempotency key is independent across projects', async () => {
   const db = new TaskDb();
   db.projects.push({ id: 'project-2' });
-  db.tasks.push({ id: 'task-project-1', idempotency_key: 'shared-key', remote_id: 'secret-remote', status: 'queued' });
+  db.tasks.push({ id: 'task-project-1', idempotency_key: '["project-1","shared-key"]', remote_id: 'secret-remote', status: 'queued' });
   db.projectTasks.push({ project_id: 'project-1', task_id: 'task-project-1', created_at: 1 });
   let calls = 0;
 
+  const result = await submitTask({ ...input, projectId: 'project-2' }, { DB: db }, 'shared-key', capabilities, fetch, async () => {
+    calls += 1;
+    return { taskId: 'remote-project-2' };
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.remote_id, 'remote-project-2');
+  assert.equal(db.tasks.length, 2);
+  assert.equal(db.tasks[1].idempotency_key, '["project-2","shared-key"]');
+  assert.equal(db.projectTasks[1].project_id, 'project-2');
+});
+
+test('concurrent same-project submissions reserve once and make one paid Kling call', async () => {
+  const db = new TaskDb();
+  let calls = 0;
+  let release;
+  const paidCall = new Promise((resolve) => { release = resolve; });
+  const tool = async () => {
+    calls += 1;
+    await paidCall;
+    return { taskId: 'remote-race' };
+  };
+
+  const first = submitTask(input, { DB: db }, 'race-key', capabilities, fetch, tool);
+  const second = submitTask(input, { DB: db }, 'race-key', capabilities, fetch, tool);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls, 1);
+  assert.equal(db.tasks.length, 1);
+  assert.equal(db.tasks[0].status, 'submitting');
+  release();
+  const results = await Promise.all([first, second]);
+
+  assert.equal(calls, 1);
+  assert.equal(results[0].id, results[1].id);
+  assert.deepEqual(results[0], { id: results[0].id, remote_id: 'remote-race', status: 'queued' });
+  assert.deepEqual(results[1], { id: results[1].id, remote_id: null, status: 'submitting' });
+});
+
+test('reservation persistence failure prevents a paid call and returns a sanitized server error', async () => {
+  const db = new TaskDb();
+  db.failReservation = true;
+  let calls = 0;
+
   await assert.rejects(
-    () => submitTask({ ...input, projectId: 'project-2' }, { DB: db }, 'shared-key', capabilities, fetch, async () => { calls += 1; }),
-    { message: '幂等键已用于其他项目' },
+    () => submitTask(input, { DB: db }, 'persist-key', capabilities, fetch, async () => { calls += 1; }),
+    (error) => error.status === 500 && error.message === '任务保存失败' && !error.message.includes('database'),
   );
   assert.equal(calls, 0);
-  assert.equal(db.tasks.length, 1);
-  assert.deepEqual(db.projectTasks, [{ project_id: 'project-1', task_id: 'task-project-1', created_at: 1 }]);
+  assert.deepEqual(db.tasks, []);
+});
+
+test('finalization failure leaves a submitting reservation that prevents another paid call', async () => {
+  const db = new TaskDb();
+  db.failFinalization = true;
+  let calls = 0;
+
+  await assert.rejects(
+    () => submitTask(input, { DB: db }, 'finalize-key', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-1' }; }),
+    (error) => error.status === 500 && error.message === '任务保存失败',
+  );
+  const replay = await submitTask(input, { DB: db }, 'finalize-key', capabilities, fetch, async () => { calls += 1; });
+
+  assert.equal(calls, 1);
+  assert.equal(replay.status, 'submitting');
+  assert.equal(replay.remote_id, null);
+});
+
+test('missing R2 image object returns a controlled server error before provider upload', async () => {
+  const db = new TaskDb();
+  db.upload = { object_key: 'references/missing' };
+  const imageCapabilities = { image_to_video: { models: [{ model: 'kling-v1', arguments: capabilities.text_to_video.models[0].arguments }] } };
+  let calls = 0;
+
+  await assert.rejects(
+    () => submitTask({ ...input, mode: 'image', uploadId: 'asset-1' }, { DB: db, MEDIA: { get: async () => null } }, 'missing-file', imageCapabilities, fetch, async () => { calls += 1; }),
+    (error) => error.status === 500 && error.message === '参考图存储不可用',
+  );
+  assert.equal(calls, 0);
+});
+
+test('provider failure is marked failed and returned as a sanitized gateway error', async () => {
+  const db = new TaskDb();
+
+  await assert.rejects(
+    () => submitTask(input, { DB: db }, 'provider-failure', capabilities, fetch, async () => { throw new Error('provider secret response'); }),
+    (error) => error.status === 502 && error.message === '视频生成服务暂不可用' && !error.message.includes('secret'),
+  );
+  assert.equal(db.tasks[0].status, 'failed');
 });
 
 test('image task cannot use an upload associated with another project', async () => {
@@ -145,6 +255,6 @@ test('task links the generated task and saves a serializable settings snapshot',
   assert.deepEqual(JSON.parse(db.settings[0].settings_json), {
     mode: 'text', model: 'kling-v1', prompt: 'ocean at dawn', uploadId: null, duration: '5', resolution: '720p', aspectRatio: '16:9', imageCount: '1',
   });
-  assert.equal(db.batchCount, 1);
+  assert.equal(db.batchCount, 2);
   assert.doesNotThrow(() => JSON.stringify(JSON.parse(db.settings[0].settings_json)));
 });

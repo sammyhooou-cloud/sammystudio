@@ -70,6 +70,7 @@ class UploadDb extends RouteDb {
     super();
     this.storedObjects = [];
     this.projectAssets = [];
+    this.failBatch = false;
   }
 
   prepare(sql) {
@@ -89,6 +90,11 @@ class UploadDb extends RouteDb {
         return { success: true };
       },
     };
+  }
+
+  async batch(statements) {
+    if (this.failBatch && statements.some(({ sql }) => sql?.startsWith('INSERT INTO stored_objects'))) throw new Error('database credentials leaked');
+    return super.batch(statements);
   }
 }
 
@@ -237,6 +243,34 @@ test('upload links the stored object to the selected project', async () => {
   assert.deepEqual(mediaKeys, [`references/${uploadId}`]);
 });
 
+test('upload deletes the R2 object and sanitizes the response when database persistence fails', async () => {
+  const db = new UploadDb();
+  db.failBatch = true;
+  const written = [];
+  const deleted = [];
+  const response = await worker.fetch(uploadRequest('project-1'), {
+    DB: db,
+    MEDIA: {
+      put: async (key) => { written.push(key); },
+      delete: async (key) => { deleted.push(key); },
+    },
+  }, {});
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: '上传保存失败' });
+  assert.deepEqual(deleted, written);
+});
+
+test('upload sanitizes object storage failures', async () => {
+  const response = await worker.fetch(uploadRequest('project-1'), {
+    DB: new UploadDb(),
+    MEDIA: { put: async () => { throw new Error('secret storage endpoint'); } },
+  }, {});
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: '上传存储失败' });
+});
+
 test('task route rejects an invalid project before checking Kling status', async () => {
   const db = new RouteDb();
   const response = await worker.fetch(new Request('https://site.test/api/video/tasks', {
@@ -251,28 +285,28 @@ test('task route rejects an invalid project before checking Kling status', async
 
 test('task route replays a same-project idempotency key without checking offline MCP status', async () => {
   const db = new TaskRouteDb();
-  const existing = { id: 'task-1', idempotency_key: 'shared-key', remote_id: 'remote-1', status: 'queued' };
+  const existing = { id: 'task-1', idempotency_key: '["project-1","shared-key"]', remote_id: 'remote-1', status: 'queued' };
   db.tasks.push(existing);
   db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
 
   const response = await worker.fetch(taskRequest('project-1'), { DB: db }, {});
 
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), existing);
+  assert.deepEqual(await response.json(), { id: 'task-1', remote_id: 'remote-1', status: 'queued' });
   assert.equal(db.statusQueries, 0);
 });
 
-test('task route rejects a cross-project idempotency collision without checking MCP status', async () => {
+test('task route treats the same external key in another project as a fresh task', async () => {
   const db = new TaskRouteDb();
   db.projects.push({ id: 'project-2', name: 'Project 2', created_at: 2, updated_at: 2 });
-  db.tasks.push({ id: 'task-1', idempotency_key: 'shared-key', remote_id: 'remote-secret', status: 'queued' });
+  db.tasks.push({ id: 'task-1', idempotency_key: '["project-1","shared-key"]', remote_id: 'remote-secret', status: 'queued' });
   db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
 
   const response = await worker.fetch(taskRequest('project-2'), { DB: db }, {});
 
-  assert.equal(response.status, 400);
-  assert.deepEqual(await response.json(), { error: '幂等键已用于其他项目' });
-  assert.equal(db.statusQueries, 0);
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), { error: '请先连接可灵 MCP' });
+  assert.equal(db.statusQueries, 1);
 });
 
 test('fresh task still checks status and rejects an offline MCP connection', async () => {
@@ -283,4 +317,19 @@ test('fresh task still checks status and rejects an offline MCP connection', asy
   assert.equal(response.status, 409);
   assert.deepEqual(await response.json(), { error: '请先连接可灵 MCP' });
   assert.equal(db.statusQueries, 1);
+});
+
+test('unexpected database failures return a sanitized server response', async () => {
+  class FailingDb extends RouteDb {
+    prepare(sql) {
+      const statement = super.prepare(sql);
+      if (!sql.includes('FROM projects') || !sql.includes('WHERE id = ?')) return statement;
+      return { bind() { return { async first() { throw new Error('database password leaked'); } }; } };
+    }
+  }
+
+  const response = await worker.fetch(taskRequest('project-1', 'db-failure'), { DB: new FailingDb() }, {});
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: '任务处理失败' });
 });

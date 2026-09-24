@@ -1,7 +1,7 @@
 import { createSession, deleteSession, requireSession, unauthorized } from './auth.js';
 import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
-import { submitTask } from './tasks.js';
+import { submitTask, TaskError } from './tasks.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
 import { createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
@@ -44,13 +44,22 @@ async function upload(request, env) {
   const id = crypto.randomUUID();
   const key = `references/${id}`;
   const createdAt = Date.now();
-  await env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
+  try {
+    await env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
+  } catch {
+    return json({ error: '上传存储失败' }, 500);
+  }
   const statements = [
     env.DB.prepare('INSERT INTO stored_objects (id, object_key, mime_type, size, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, key, file.type, file.size, createdAt),
     env.DB.prepare('INSERT INTO project_assets (project_id, object_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
   ];
-  if (typeof env.DB.batch === 'function') await env.DB.batch(statements);
-  else for (const statement of statements) await statement.run();
+  try {
+    if (typeof env.DB.batch === 'function') await env.DB.batch(statements);
+    else for (const statement of statements) await statement.run();
+  } catch {
+    try { await env.MEDIA.delete(key); } catch {}
+    return json({ error: '上传保存失败' }, 500);
+  }
   return json({ uploadId: id });
 }
 
@@ -102,7 +111,8 @@ async function api(request, env) {
     try {
       return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID(), () => getKlingStatus(env)));
     } catch (error) {
-      return json({ error: error.message }, error.status || 400);
+      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      return json({ error: '任务处理失败' }, 500);
     }
   }
   return json({ error: '接口不存在' }, 404);
