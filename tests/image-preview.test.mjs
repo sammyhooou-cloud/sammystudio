@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatBytes, imagePreviewState, renderImagePreview } from '../public/image-preview.js';
+import { createImageUploadController, formatBytes, imagePreviewState, openImageReplacement, renderImagePreview } from '../public/image-preview.js';
 
 test('formatBytes formats bytes, kilobytes, and megabytes', () => {
   assert.equal(formatBytes(512), '512 B');
@@ -37,4 +37,68 @@ test('renderImagePreview writes untrusted filenames as text', () => {
   assert.equal(view.details.textContent, 'PNG · 1 KB');
   assert.equal(view.empty.hidden, true);
   assert.equal(view.preview.hidden, false);
+});
+
+function uploadHarness() {
+  const created = [], revoked = [], forms = [], renders = [], requests = [];
+  const deferred = () => { let resolve, reject; const promise = new Promise((ok, no) => { resolve = ok; reject = no; }); return { promise, resolve, reject }; };
+  const controller = createImageUploadController({
+    createObjectURL(file) { created.push(file.name); return `blob:${file.name}`; },
+    revokeObjectURL(url) { revoked.push(url); },
+    createFormData() { const entries = []; forms.push(entries); return { append(key, value) { entries.push([key, value]); } }; },
+    request(form) { const pending = deferred(); requests.push({ form, ...pending }); return pending.promise; },
+    render(state) { renders.push(state); },
+  });
+  return { controller, created, revoked, forms, renders, requests };
+}
+
+test('controller creates a preview immediately and submits file with projectId', () => {
+  const harness = uploadHarness();
+  const file = { name: 'frame.png', type: 'image/png', size: 12 };
+  const pending = harness.controller.select(file, 'project-7');
+  assert.equal(harness.created[0], 'frame.png');
+  assert.equal(harness.renders[0].status, '上传中…');
+  assert.equal(harness.controller.canSubmit, false);
+  assert.deepEqual(harness.forms[0], [['file', file], ['projectId', 'project-7']]);
+  harness.requests[0].resolve({ uploadId: 'upload-7' });
+  return pending.then(() => { assert.equal(harness.controller.uploadId, 'upload-7'); assert.equal(harness.controller.canSubmit, true); });
+});
+
+test('controller clears uploadId and gates submission when upload fails', async () => {
+  const harness = uploadHarness();
+  const pending = harness.controller.select({ name: 'bad.png', type: 'image/png', size: 1 }, 'project-1');
+  harness.requests[0].reject(new Error('network'));
+  await assert.rejects(pending, /network/);
+  assert.equal(harness.controller.uploadId, '');
+  assert.equal(harness.controller.canSubmit, false);
+  assert.equal(harness.renders.at(-1).status, '上传失败');
+});
+
+test('controller suppresses stale upload responses and revokes replacement URLs', async () => {
+  const harness = uploadHarness();
+  const first = harness.controller.select({ name: 'one.png', type: 'image/png', size: 1 }, 'p');
+  const second = harness.controller.select({ name: 'two.png', type: 'image/png', size: 1 }, 'p');
+  assert.deepEqual(harness.revoked, ['blob:one.png']);
+  harness.requests[0].resolve({ uploadId: 'stale' }); await first;
+  assert.equal(harness.controller.uploadId, '');
+  harness.requests[1].resolve({ uploadId: 'current' }); await second;
+  assert.equal(harness.controller.uploadId, 'current');
+});
+
+test('controller revokes URLs on removal, project switch, and unload', () => {
+  for (const action of ['remove', 'projectSwitch', 'unload']) {
+    const harness = uploadHarness();
+    harness.controller.select({ name: `${action}.png`, type: 'image/png', size: 1 }, 'p');
+    harness.controller[action]();
+    assert.deepEqual(harness.revoked, [`blob:${action}.png`]);
+    assert.equal(harness.controller.uploadId, '');
+    assert.equal(harness.controller.canSubmit, false);
+  }
+});
+
+test('replacement clears the input before opening the picker without clearing preview state', () => {
+  const events = [];
+  const input = { _value: 'C:/fakepath/frame.png', set value(value) { events.push(['value', value]); this._value = value; }, click() { events.push(['click']); } };
+  openImageReplacement(input);
+  assert.deepEqual(events, [['value', ''], ['click']]);
 });

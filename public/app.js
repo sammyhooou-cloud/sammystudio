@@ -1,4 +1,4 @@
-import { imagePreviewState, renderImagePreview } from './image-preview.js';
+import { createImageUploadController, openImageReplacement, renderImagePreview } from './image-preview.js';
 
 let currentProjectId = '';
 let projectChangeHandler;
@@ -40,17 +40,18 @@ function setup() {
   const resolution = document.querySelector('#resolution');
   const duration = document.querySelector('#duration');
   const ratio = document.querySelector('#aspect-ratio');
-  let mode = 'text', uploadId = '', capabilities = {}, imageUrl = '', imageSelection = 0;
+  let mode = 'text', capabilities = {};
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
-  function clearImage() {
-    imageSelection += 1; uploadId = ''; imageInput.value = '';
-    if (imageUrl) URL.revokeObjectURL(imageUrl);
-    imageUrl = ''; previewView.preview.hidden = true; previewView.empty.hidden = false;
-  }
-  projectChangeHandler = clearImage;
-  window.addEventListener('beforeunload', () => { if (imageUrl) URL.revokeObjectURL(imageUrl); }, { once: true });
+  const uploadController = createImageUploadController({
+    createObjectURL: (file) => URL.createObjectURL(file), revokeObjectURL: (url) => URL.revokeObjectURL(url), createFormData: () => new FormData(),
+    request: (form) => request('/api/uploads', { method: 'POST', body: form }),
+    render: (state) => { if (state) renderImagePreview(previewView, state); else { previewView.preview.hidden = true; previewView.empty.hidden = false; } document.querySelector('#generate').disabled = mode === 'image' && !state?.canSubmit; },
+  });
+  function clearImage() { imageInput.value = ''; uploadController.remove(); }
+  projectChangeHandler = () => { imageInput.value = ''; uploadController.projectSwitch(); };
+  window.addEventListener('beforeunload', () => uploadController.unload(), { once: true });
 
   const fill = (select, values) => { select.innerHTML = values.map((value) => `<option value="${value}">${value}${select === duration ? ' 秒' : ''}</option>`).join(''); };
   function updateOptions() { const values = optionsForModel(capabilities, mode, modelSelect.value); fill(resolution, values.resolutions); fill(duration, values.durations); fill(ratio, values.aspectRatios); }
@@ -67,25 +68,18 @@ function setup() {
   request('/api/session').then(enterWorkspace).catch(() => {});
   document.querySelector('#password-toggle').onclick = () => { const input = document.querySelector('#password'); input.type = input.type === 'password' ? 'text' : 'password'; };
   loginForm.onsubmit = async (event) => { event.preventDefault(); try { await request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password: document.querySelector('#password').value }) }); await enterWorkspace(); } catch (error) { document.querySelector('#login-error').textContent = error.message; } };
-  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelector('#upload-field').hidden = mode !== 'image'; if (mode !== 'image') clearImage(); fillModels(); });
+  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelector('#upload-field').hidden = mode !== 'image'; if (mode !== 'image') clearImage(); document.querySelector('#generate').disabled = mode === 'image' && !uploadController.canSubmit; fillModels(); });
   modelSelect.onchange = updateOptions;
   imageInput.onchange = async (event) => {
     const file = event.target.files[0]; if (!file) return;
     const allowed = ['image/jpeg', 'image/png', 'image/webp'];
     if (!allowed.includes(file.type) || file.size > 15 * 1024 * 1024) { clearImage(); document.querySelector('#form-error').textContent = !allowed.includes(file.type) ? '仅支持 JPG、PNG 或 WebP 图片' : '图片不能超过 15MB'; return; }
-    if (imageUrl) URL.revokeObjectURL(imageUrl);
-    const selection = ++imageSelection;
-    imageUrl = URL.createObjectURL(file); uploadId = '';
-    renderImagePreview(previewView, imagePreviewState(file, imageUrl, 'uploading'));
-    const form = new FormData(); form.append('file', file);
-    if (!currentProjectId) { renderImagePreview(previewView, imagePreviewState(file, imageUrl, 'failed')); document.querySelector('#form-error').textContent = '请先选择项目'; return; }
-    form.append('projectId', currentProjectId);
-    try { document.querySelector('#form-error').textContent = ''; const result = await request('/api/uploads', { method: 'POST', body: form }); if (selection !== imageSelection) return; uploadId = result.uploadId; renderImagePreview(previewView, imagePreviewState(file, imageUrl, 'uploaded')); }
-    catch (error) { if (selection !== imageSelection) return; uploadId = ''; renderImagePreview(previewView, imagePreviewState(file, imageUrl, 'failed')); document.querySelector('#form-error').textContent = error.message; }
+    try { document.querySelector('#form-error').textContent = ''; await uploadController.select(file, currentProjectId); }
+    catch (error) { document.querySelector('#form-error').textContent = error.message; }
   };
-  document.querySelector('#replace-image').onclick = () => imageInput.click();
+  document.querySelector('#replace-image').onclick = () => openImageReplacement(imageInput);
   document.querySelector('#remove-image').onclick = clearImage;
-  generator.onsubmit = async (event) => { event.preventDefault(); const payload = { mode, uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount: 1 }; const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); document.querySelector('#task-id').textContent = `任务 ${task.id}`; await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
+  generator.onsubmit = async (event) => { event.preventDefault(); const payload = { mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount: 1 }; const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); document.querySelector('#task-id').textContent = `任务 ${task.id}`; await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
   document.querySelector('#refresh-status').onclick = refreshStatus;
   document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
 }

@@ -27,3 +27,51 @@ export function renderImagePreview(view, state) {
   view.name.textContent = state.name; view.details.textContent = `${state.format} · ${state.size}`; view.status.textContent = state.status;
   if (view.status.dataset) view.status.dataset.phase = state.canSubmit ? 'uploaded' : state.status === PHASES.failed.status ? 'failed' : 'uploading';
 }
+
+export function createImageUploadController(adapters) {
+  let objectUrl = '', uploadId = '', canSubmit = false, selection = 0;
+
+  function revokeCurrent() {
+    if (objectUrl) adapters.revokeObjectURL(objectUrl);
+    objectUrl = '';
+  }
+
+  function clear() {
+    selection += 1; uploadId = ''; canSubmit = false; revokeCurrent();
+    adapters.render(null);
+  }
+
+  return {
+    get uploadId() { return uploadId; },
+    get canSubmit() { return canSubmit; },
+    async select(file, projectId) {
+      selection += 1; const current = selection;
+      uploadId = ''; canSubmit = false; revokeCurrent();
+      objectUrl = adapters.createObjectURL(file);
+      adapters.render(imagePreviewState(file, objectUrl, 'uploading'));
+      if (!projectId) {
+        adapters.render(imagePreviewState(file, objectUrl, 'failed'));
+        throw new Error('请先选择项目');
+      }
+      const form = adapters.createFormData(); form.append('file', file); form.append('projectId', projectId);
+      try {
+        const result = await adapters.request(form);
+        if (current !== selection) return;
+        uploadId = result.uploadId; canSubmit = Boolean(uploadId);
+        adapters.render(imagePreviewState(file, objectUrl, canSubmit ? 'uploaded' : 'failed'));
+      } catch (error) {
+        if (current !== selection) return;
+        uploadId = ''; canSubmit = false; adapters.render(imagePreviewState(file, objectUrl, 'failed'));
+        throw error;
+      }
+    },
+    remove: clear,
+    projectSwitch: clear,
+    unload: clear,
+  };
+}
+
+export function openImageReplacement(input) {
+  input.value = '';
+  input.click();
+}
