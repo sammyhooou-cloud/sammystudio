@@ -21,6 +21,10 @@ import {
   workspaceImageState,
   workspaceTaskState,
   prependProjectTask,
+  clearVideoElement,
+  extractVideoUrl,
+  isCurrentSubmission,
+  performGenerationSubmission,
 } from '../public/app.js';
 
 const capabilities = {
@@ -164,6 +168,59 @@ test('workspace task state is isolated, keeps latest status, and finds a usable 
   assert.equal(state.current.status, 'done');
   assert.equal(state.videoUrl, 'https://cdn.test/a.mp4');
   assert.deepEqual(workspaceTaskState([]), { tasks: [], current: null, videoUrl: '' });
+});
+
+test('video URL extraction accepts known video results and rejects unrelated or unsafe URLs', () => {
+  assert.equal(extractVideoUrl({ videoUrl: 'https://cdn.test/watch/123' }), 'https://cdn.test/watch/123');
+  assert.equal(extractVideoUrl({ data: { video_url: '/media/result.webm' } }), '/media/result.webm');
+  assert.equal(extractVideoUrl({ outputs: [{ type: 'video', url: 'https://cdn.test/output?id=1' }] }), 'https://cdn.test/output?id=1');
+  assert.equal(extractVideoUrl({ outputs: [{ url: 'https://cdn.test/output.mp4' }] }), 'https://cdn.test/output.mp4');
+  for (const result of [
+    { thumbnail_url: 'https://cdn.test/thumb.jpg' },
+    { statusUrl: 'https://cdn.test/status' },
+    { outputs: [{ type: 'image', url: 'https://cdn.test/image.jpg' }] },
+    { videoUrl: 'javascript:alert(1)' },
+    { video_url: 'data:video/mp4;base64,AAAA' },
+  ]) assert.equal(extractVideoUrl(result), '');
+});
+
+test('video cleanup stops playback, detaches the resource, reloads, and hides the element', () => {
+  const events = [];
+  const video = {
+    hidden: false,
+    pause() { events.push('pause'); },
+    removeAttribute(name) { events.push(`remove:${name}`); },
+    load() { events.push('load'); },
+  };
+  clearVideoElement(video);
+  assert.deepEqual(events, ['pause', 'remove:src', 'load']);
+  assert.equal(video.hidden, true);
+});
+
+test('submission responses mutate UI only for the latest token in the submitted project', () => {
+  assert.equal(isCurrentSubmission('project-a', 'project-a', 3, 3), true);
+  assert.equal(isCurrentSubmission('project-b', 'project-a', 3, 3), false);
+  assert.equal(isCurrentSubmission('project-a', 'project-a', 2, 3), false);
+});
+
+test('stale project generation success and failure do not mutate the replacement workspace', async () => {
+  for (const outcome of ['success', 'failure']) {
+    const mutations = [];
+    let current = true;
+    const pending = performGenerationSubmission({
+      submit: async () => {
+        await Promise.resolve();
+        current = false;
+        if (outcome === 'failure') throw new Error('old project failed');
+        return { id: 'old-task' };
+      },
+      isCurrent: () => current,
+      success: () => mutations.push('success'),
+      fail: () => mutations.push('failure'),
+    });
+    assert.equal(await pending, false);
+    assert.deepEqual(mutations, []);
+  }
 });
 
 test('new task is prepended only to the active project task list', () => {

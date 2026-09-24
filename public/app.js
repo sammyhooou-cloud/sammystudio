@@ -86,12 +86,36 @@ export function workspaceImageState(projectId, settings = {}, assets = []) {
   return { asset, url: `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(asset.id)}` };
 }
 
-function findVideoUrl(value) {
-  if (typeof value === 'string') return /^https:\/\/[^\s]+$/i.test(value) && /(?:video|\.mp4|\.webm|\.mov)(?:[/?#]|$)/i.test(value) ? value : '';
+function safeMediaUrl(value) {
+  if (typeof value !== 'string' || /\s/.test(value)) return '';
+  return /^https:\/\/[^\s]+$/i.test(value) || /^\/(?!\/)/.test(value) ? value : '';
+}
+
+function hasVideoExtension(value) {
+  return /\.(?:mp4|webm|mov|m4v)(?:[?#]|$)/i.test(value);
+}
+
+function videoTyped(value) {
+  return [value?.type, value?.mediaType, value?.media_type, value?.mimeType, value?.mime_type, value?.kind]
+    .some((item) => typeof item === 'string' && /(?:^|[\/_-])video(?:$|[\/_-])|^video\//i.test(item));
+}
+
+export function extractVideoUrl(value) {
+  if (typeof value === 'string') { const url = safeMediaUrl(value); return url && hasVideoExtension(url) ? url : ''; }
   if (!value || typeof value !== 'object') return '';
-  for (const [key, nested] of Object.entries(value)) {
-    if (typeof nested === 'string' && /(?:video|url)/i.test(key) && /^https:\/\/[^\s]+$/i.test(nested)) return nested;
-    const found = findVideoUrl(nested); if (found) return found;
+  for (const key of ['videoUrl', 'video_url']) {
+    const url = safeMediaUrl(value[key]); if (url) return url;
+  }
+  const direct = safeMediaUrl(value.url);
+  if (direct && (videoTyped(value) || hasVideoExtension(direct))) return direct;
+  for (const key of ['video', 'result', 'data']) {
+    const found = extractVideoUrl(value[key]); if (found) return found;
+  }
+  for (const key of ['videos', 'outputs']) {
+    if (!Array.isArray(value[key])) continue;
+    for (const output of value[key]) {
+      const found = extractVideoUrl(output); if (found) return found;
+    }
   }
   return '';
 }
@@ -101,7 +125,27 @@ export function workspaceTaskState(tasks = []) {
   const current = safeTasks[0] || null;
   let result = null;
   try { result = current?.resultJson ? JSON.parse(current.resultJson) : null; } catch {}
-  return { tasks: safeTasks, current, videoUrl: findVideoUrl(result) };
+  return { tasks: safeTasks, current, videoUrl: extractVideoUrl(result) };
+}
+
+export function clearVideoElement(video) {
+  if (!video) return;
+  video.pause?.(); video.removeAttribute?.('src'); video.load?.(); video.hidden = true;
+}
+
+export function isCurrentSubmission(activeProjectId, submittedProjectId, token, latestToken) {
+  return Boolean(submittedProjectId) && activeProjectId === submittedProjectId && token === latestToken;
+}
+
+export async function performGenerationSubmission({ submit, isCurrent, success, fail }) {
+  try {
+    const result = await submit();
+    if (!isCurrent()) return false;
+    success(result); return true;
+  } catch (error) {
+    if (!isCurrent()) return false;
+    fail(error); return true;
+  }
 }
 
 export function prependProjectTask(activeProjectId, submittedProjectId, tasks, task) {
@@ -164,7 +208,7 @@ function setup() {
   const duration = document.querySelector('#duration');
   const ratio = document.querySelector('#aspect-ratio');
   let mode = 'text', capabilities = {}, projects = [], imageCount = 1, projectTasks = [];
-  let drawerOpen = false, workspaceLoadSequence = 0, projectSwitchBusy = false;
+  let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false;
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
@@ -285,7 +329,7 @@ function setup() {
       item.append(id, status); item.onclick = () => renderSelectedTask(task); history.append(item);
     }
     if (!state.current) {
-      empty.hidden = false; progress.hidden = true; video.hidden = true; video.removeAttribute('src');
+      empty.hidden = false; progress.hidden = true; clearVideoElement(video);
       document.querySelector('#task-state').textContent = '等待提交'; document.querySelector('#task-id').textContent = '';
       return;
     }
@@ -298,7 +342,8 @@ function setup() {
     document.querySelector('#task-state').textContent = task.status || '未知状态';
     document.querySelector('#task-id').textContent = `任务 ${task.id || '—'}`;
     const video = document.querySelector('#result-video');
-    if (state.videoUrl) { video.src = state.videoUrl; video.hidden = false; } else { video.hidden = true; video.removeAttribute('src'); }
+    clearVideoElement(video);
+    if (state.videoUrl) { video.src = state.videoUrl; video.hidden = false; }
   }
 
   function showProjectLoadError(error) {
@@ -320,6 +365,7 @@ function setup() {
       });
       return;
     }
+    generationSequence += 1;
     const sequence = ++workspaceLoadSequence;
     projectError.textContent = '正在加载项目…';
     if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
@@ -426,7 +472,7 @@ function setup() {
       projects = renameProjectInList(projects, project); renameForm.hidden = true; renderProjects();
     } catch (error) { projectError.textContent = error.message; }
   };
-  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const submittedProjectId = currentProjectId; const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() }); renderTasks(); await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
+  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const submittedProjectId = currentProjectId; const submissionToken = ++generationSequence; const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; await performGenerationSubmission({ submit: () => request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }), isCurrent: () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence), success: (task) => { projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() }); renderTasks(); }, fail: (error) => { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } }); };
   document.querySelector('#refresh-status').onclick = refreshStatus;
   document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
 }
