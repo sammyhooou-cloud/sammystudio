@@ -3,9 +3,7 @@
   "static": {
     "directory": "dist/client"
   },
-  "worker": {
-    "entrypoint": "dist/server/worker.js"
-  },
+  "worker": "dist/server/worker.js",
   "d1": {
     "DB": {
       "migrations": "migrations"
