@@ -98,18 +98,18 @@ async function replayTask(task, env, projectId) {
   if (!object) return taskDto(task);
   let record;
   try { record = JSON.parse(await object.text()); } catch { throw new TaskError('任务恢复记录无效', 500); }
-  if (record.id !== task.id || record.projectId !== projectId || !record.remoteId || !record.settings) throw new TaskError('任务恢复记录无效', 500);
+  if (record.id !== task.id || record.projectId !== projectId || !record.remoteId || !record.settings || !Number.isFinite(record.createdAt)) throw new TaskError('任务恢复记录无效', 500);
+  let replayed = task;
   if (task.status === 'submitting' && !task.remote_id) {
     await finalizeTask(env.DB, task.id, record.remoteId, record.result);
-    await saveSettings(env.DB, projectId, record.settings);
-    await deleteRecovery(env.MEDIA, task.id);
-    return taskDto({ id: task.id, remote_id: record.remoteId, status: 'queued' });
+    replayed = { id: task.id, remote_id: record.remoteId, status: 'queued' };
   }
-  if (task.status === 'queued') {
-    await saveSettings(env.DB, projectId, record.settings);
+  if (replayed.status === 'queued') {
+    const current = await env.DB.prepare('SELECT settings_json, updated_at FROM project_settings WHERE project_id = ?').bind(projectId).first();
+    if (!current || Number(current.updated_at) < record.createdAt) await saveSettings(env.DB, projectId, record.settings);
     await deleteRecovery(env.MEDIA, task.id);
   }
-  return taskDto(task);
+  return taskDto(replayed);
 }
 
 export async function submitTask(input, env, idempotencyKey, capabilitiesSource, fetcher = fetch, toolCaller = callTool) {
@@ -163,7 +163,7 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
     throw new TaskError('视频生成服务返回无效', 502);
   }
   const settings = settingsSnapshot(valid);
-  await writeRecovery(env.MEDIA, { id, projectId, remoteId, result: { taskId: remoteId }, settings });
+  await writeRecovery(env.MEDIA, { id, projectId, remoteId, result: { taskId: remoteId }, settings, createdAt });
   await finalizeTask(env.DB, id, remoteId, result);
   await saveSettings(env.DB, projectId, settings);
   await deleteRecovery(env.MEDIA, id);

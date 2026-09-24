@@ -31,6 +31,7 @@ class RecoveryMedia {
     this.objects = new Map();
     this.putAttempts = 0;
     this.failPutsRemaining = 0;
+    this.failDeletesRemaining = 0;
     this.deleted = [];
   }
 
@@ -50,6 +51,10 @@ class RecoveryMedia {
   }
 
   async delete(key) {
+    if (this.failDeletesRemaining > 0) {
+      this.failDeletesRemaining -= 1;
+      throw new Error('r2 delete unavailable');
+    }
     this.deleted.push(key);
     this.objects.delete(key);
   }
@@ -278,6 +283,27 @@ test('replaying an older queued task does not roll back newer project settings',
   assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'prompt B');
 });
 
+test('stale recovery cleanup does not overwrite newer project settings', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  media.failDeletesRemaining = 1;
+  const taskAInput = { ...input, prompt: 'prompt A' };
+  const taskBInput = { ...input, prompt: 'prompt B' };
+
+  const taskA = await submitTask(taskAInput, taskEnv(db, media), 'stale-a', capabilities, fetch, async () => ({ taskId: 'remote-stale-a' }));
+  const staleRecord = JSON.parse([...media.objects.values()][0]);
+  await submitTask(taskBInput, taskEnv(db, media), 'stale-b', capabilities, fetch, async () => ({ taskId: 'remote-stale-b' }));
+  db.settings[0].updated_at = staleRecord.createdAt + 1;
+  const settingsBeforeReplay = db.settings[0].settings_json;
+
+  const replay = await submitTask(taskAInput, taskEnv(db, media), 'stale-a', capabilities, fetch, async () => { throw new Error('provider must not run'); });
+
+  assert.deepEqual(replay, taskA);
+  assert.equal(db.settings[0].settings_json, settingsBeforeReplay);
+  assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'prompt B');
+  assert.equal(media.objects.size, 0);
+});
+
 test('core finalization retries transient database failures without another provider call', async () => {
   const db = new TaskDb();
   db.finalizationFailuresRemaining = 2;
@@ -318,7 +344,8 @@ test('recovery record is minimal and excludes extra secrets or raw input data', 
   await assert.rejects(() => submitTask({ ...input, apiToken: 'secret-token', rawFile: [1, 2, 3] }, taskEnv(db, media), 'safe-recovery', capabilities, fetch, async () => ({ taskId: 'remote-safe', access_token: 'provider-secret' })));
   const record = JSON.parse([...media.objects.values()][0]);
 
-  assert.deepEqual(Object.keys(record).sort(), ['id', 'projectId', 'remoteId', 'result', 'settings']);
+  assert.deepEqual(Object.keys(record).sort(), ['createdAt', 'id', 'projectId', 'remoteId', 'result', 'settings']);
+  assert.equal(typeof record.createdAt, 'number');
   assert.equal(record.remoteId, 'remote-safe');
   assert.deepEqual(record.result, { taskId: 'remote-safe' });
   assert.equal(JSON.stringify(record).includes('secret'), false);
