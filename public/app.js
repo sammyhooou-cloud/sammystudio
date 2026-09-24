@@ -61,6 +61,27 @@ export function drawerModalState(open, mobile) {
   return { modal, backgroundInert: modal };
 }
 
+export function workspaceFormState(capabilities, mode, settings = {}) {
+  const group = mode === 'text' ? capabilities.text_to_video : capabilities.image_to_video;
+  const models = group?.models || [];
+  const model = models.some(({ model: id }) => id === settings.model) ? settings.model : (models[0]?.model || '');
+  const options = optionsForModel(capabilities, mode, model);
+  const choose = (value, values) => values.includes(String(value)) ? String(value) : (values[0] || '');
+  return {
+    prompt: typeof settings.prompt === 'string' ? settings.prompt : '',
+    model,
+    resolution: choose(settings.resolution, options.resolutions),
+    duration: choose(settings.duration, options.durations),
+    aspectRatio: choose(settings.aspectRatio, options.aspectRatios),
+  };
+}
+
+export async function performProjectSwitch({ load, setBusy, commit, fail }) {
+  setBusy(true);
+  try { await commit(await load()); return true; }
+  catch (error) { await fail(error); return false; }
+}
+
 export function optionsForModel(capabilities, mode, modelId) {
   const group = mode === 'text' ? capabilities.text_to_video : capabilities.image_to_video;
   const model = group?.models?.find((item) => item.model === modelId);
@@ -194,13 +215,19 @@ function setup() {
   }
 
   function applyWorkspace(workspaceState) {
-    const settings = workspaceState?.settings || {};
-    document.querySelector('#prompt').value = typeof settings.prompt === 'string' ? settings.prompt : '';
-    if (settings.model && [...modelSelect.options].some(({ value }) => value === settings.model)) modelSelect.value = settings.model;
+    fillModels();
+    const state = workspaceFormState(capabilities, mode, workspaceState?.settings || {});
+    document.querySelector('#prompt').value = state.prompt;
+    modelSelect.value = state.model;
     updateOptions();
-    for (const [select, value] of [[resolution, settings.resolution], [duration, settings.duration], [ratio, settings.aspectRatio]]) {
-      if (value != null && [...select.options].some((option) => option.value === String(value))) select.value = String(value);
-    }
+    resolution.value = state.resolution;
+    duration.value = state.duration;
+    ratio.value = state.aspectRatio;
+  }
+
+  function showProjectLoadError(error) {
+    projectError.textContent = `项目加载失败：${error.message}`;
+    if (isMobileDrawer()) { setDrawer(true); projectError.focus(); }
   }
 
   async function switchProject(project, closeReason) {
@@ -219,29 +246,31 @@ function setup() {
     }
     const sequence = ++workspaceLoadSequence;
     projectError.textContent = '正在加载项目…';
-    setProjectSwitchBusy(true);
     if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
       returnFocus: drawerShouldReturnFocus(closeReason),
       focusTarget: drawerWasOpen && closeReason === 'selection' ? document.querySelector('.workspace-main') : null,
     });
-    try {
-      const workspaceState = await request(`/api/projects/${encodeURIComponent(project.id)}/workspace`);
-      if (sequence !== workspaceLoadSequence) return;
-      setCurrentProjectId(project.id);
-      storeCurrentProjectId(projectStorage(), project.id);
-      applyWorkspace(workspaceState);
-      renderProjects();
-      projectError.textContent = '';
-      setProjectSwitchBusy(false);
-    } catch (error) {
-      if (sequence === workspaceLoadSequence) {
+    await performProjectSwitch({
+      setBusy: setProjectSwitchBusy,
+      load: () => request(`/api/projects/${encodeURIComponent(project.id)}/workspace`),
+      commit: (workspaceState) => {
+        if (sequence !== workspaceLoadSequence) return;
+        setCurrentProjectId(project.id);
+        storeCurrentProjectId(projectStorage(), project.id);
+        applyWorkspace(workspaceState);
+        renderProjects();
+        projectError.textContent = '';
+        setProjectSwitchBusy(false);
+      },
+      fail: (error) => {
+        if (sequence !== workspaceLoadSequence) return;
         const failure = switchFailureState(currentProjectId);
-        projectError.textContent = `项目加载失败：${error.message}`;
+        showProjectLoadError(error);
         renderProjects();
         if (!failure.submissionDisabled) setProjectSwitchBusy(false);
         else throw error;
-      }
-    }
+      },
+    });
   }
 
   async function loadProjects() {

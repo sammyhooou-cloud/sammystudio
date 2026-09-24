@@ -23,7 +23,7 @@
           <form id="create-project-form" class="project-inline-form" hidden><label for="new-project-name">项目名称</label><input id="new-project-name" maxlength="60" autocomplete="off" required><div><button class="project-save" type="submit">创建</button><button id="cancel-create-project" class="project-cancel" type="button">取消</button></div></form>
           <nav id="project-list" class="project-list" aria-label="项目列表"></nav>
           <button id="rename-project-mobile" class="project-item" type="button"><span>✎</span><strong>重命名当前项目</strong></button>
-          <p id="project-error" class="error" aria-live="polite"></p>
+          <p id="project-error" class="error" aria-live="assertive" tabindex="-1"></p>
           <button id="workspace-retry" class="project-item" type="button" hidden><span>↻</span><strong>重试加载</strong></button>
         </aside>
         <div class="workspace-main" tabindex="-1">

@@ -8,6 +8,7 @@ import {
   drawerShouldReturnFocus,
   nextDrawerFocusIndex,
   optionsForModel,
+  performProjectSwitch,
   readStoredProjectId,
   renameProjectInList,
   selectCurrentProject,
@@ -16,6 +17,7 @@ import {
   switchFailureState,
   upsertProject,
   validateWorkspace,
+  workspaceFormState,
 } from '../public/app.js';
 
 const capabilities = { text_to_video: { models: [{ model: 'turbo', arguments: [{ name: 'duration', allowedValues: ['5', '10'] }, { name: 'resolution', allowedValues: ['720p', '1080p'] }, { name: 'aspect_ratio', allowedValues: ['16:9', '9:16'] }] }] } };
@@ -113,4 +115,25 @@ test('drawer is modal only while open on mobile', () => {
   assert.deepEqual(drawerModalState(true, true), { modal: true, backgroundInert: true });
   assert.deepEqual(drawerModalState(true, false), { modal: false, backgroundInert: false });
   assert.deepEqual(drawerModalState(false, true), { modal: false, backgroundInert: false });
+});
+
+test('empty project workspace resets values inherited from a populated project', () => {
+  const populated = workspaceFormState(capabilities, 'text', {
+    prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16',
+  });
+  const empty = workspaceFormState(capabilities, 'text', {});
+  assert.deepEqual(populated, { prompt: 'ocean', model: 'turbo', resolution: '1080p', duration: '10', aspectRatio: '9:16' });
+  assert.deepEqual(empty, { prompt: '', model: 'turbo', resolution: '720p', duration: '5', aspectRatio: '16:9' });
+});
+
+test('project switch controller preserves selection and surfaces a visible failure', async () => {
+  const state = { busy: false, projectId: 'project-a', error: '', drawerOpen: false, focused: '' };
+  const switched = await performProjectSwitch({
+    load: async () => { throw new Error('network down'); },
+    setBusy: (busy) => { state.busy = busy; },
+    commit: () => { state.projectId = 'project-b'; },
+    fail: (error) => { state.busy = false; state.error = `项目加载失败：${error.message}`; state.drawerOpen = true; state.focused = 'project-error'; },
+  });
+  assert.equal(switched, false);
+  assert.deepEqual(state, { busy: false, projectId: 'project-a', error: '项目加载失败：network down', drawerOpen: true, focused: 'project-error' });
 });
