@@ -65,6 +65,44 @@ async function projectRequest(db, pathname, method = 'GET', body) {
   }), { DB: db }, {});
 }
 
+class UploadDb extends RouteDb {
+  constructor() {
+    super();
+    this.storedObjects = [];
+    this.projectAssets = [];
+  }
+
+  prepare(sql) {
+    const base = super.prepare(sql);
+    const db = this;
+    if (!sql.startsWith('INSERT INTO stored_objects') && !sql.startsWith('INSERT INTO project_assets')) return base;
+    return {
+      sql,
+      values: [],
+      bind(...values) { return { ...this, values }; },
+      async run() {
+        if (sql.startsWith('INSERT INTO stored_objects')) {
+          db.storedObjects.push({ id: this.values[0], object_key: this.values[1] });
+        } else {
+          db.projectAssets.push({ project_id: this.values[0], object_id: this.values[1], created_at: this.values[2] });
+        }
+        return { success: true };
+      },
+    };
+  }
+}
+
+function uploadRequest(projectId) {
+  const form = new FormData();
+  if (projectId !== undefined) form.append('projectId', projectId);
+  form.append('file', new Blob(['image'], { type: 'image/png' }), 'image.png');
+  return new Request('https://site.test/api/uploads', {
+    method: 'POST',
+    headers: { cookie: 'keling_session=test-token' },
+    body: form,
+  });
+}
+
 test('returns health JSON and security headers', async () => {
   const response = await worker.fetch(new Request('https://site.test/api/health'), env(), {});
   assert.equal(response.status, 200);
@@ -127,4 +165,48 @@ test('project routes map invalid input, missing projects, and malformed ids to J
     assert.equal(response.status, status, `${method} ${pathname}`);
     assert.equal(typeof (await response.json()).error, 'string');
   }
+});
+
+test('upload rejects a missing or invalid project before writing media', async () => {
+  for (const projectId of [undefined, 'missing']) {
+    const db = new UploadDb();
+    let mediaWrites = 0;
+    const response = await worker.fetch(uploadRequest(projectId), {
+      DB: db,
+      MEDIA: { put: async () => { mediaWrites += 1; } },
+    }, {});
+
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /(?:请选择项目|请选有效项目)/);
+    assert.equal(mediaWrites, 0);
+    assert.deepEqual(db.storedObjects, []);
+  }
+});
+
+test('upload links the stored object to the selected project', async () => {
+  const db = new UploadDb();
+  const mediaKeys = [];
+  const response = await worker.fetch(uploadRequest('project-1'), {
+    DB: db,
+    MEDIA: { put: async (key) => { mediaKeys.push(key); } },
+  }, {});
+
+  assert.equal(response.status, 200);
+  const { uploadId } = await response.json();
+  assert.deepEqual(db.projectAssets, [{ project_id: 'project-1', object_id: uploadId, created_at: db.projectAssets[0].created_at }]);
+  assert.equal(db.storedObjects[0].id, uploadId);
+  assert.equal(db.storedObjects[0].object_key, `references/${uploadId}`);
+  assert.deepEqual(mediaKeys, [`references/${uploadId}`]);
+});
+
+test('task route rejects an invalid project before checking Kling status', async () => {
+  const db = new RouteDb();
+  const response = await worker.fetch(new Request('https://site.test/api/video/tasks', {
+    method: 'POST',
+    headers: sessionHeaders,
+    body: JSON.stringify({ projectId: 'missing' }),
+  }), { DB: db }, {});
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: '请选有效项目' });
 });

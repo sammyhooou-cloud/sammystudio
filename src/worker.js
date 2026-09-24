@@ -37,10 +37,20 @@ async function upload(request, env) {
   const form = await request.formData();
   const file = form.get('file');
   if (!(file instanceof File) || !['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 15 * 1024 * 1024) return json({ error: '请上传 15MB 以内的 JPG、PNG 或 WebP 图片' }, 400);
+  const projectId = String(form.get('projectId') || '').trim();
+  if (!projectId) return json({ error: '请选择项目' }, 400);
+  const project = await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first();
+  if (!project) return json({ error: '请选有效项目' }, 400);
   const id = crypto.randomUUID();
   const key = `references/${id}`;
+  const createdAt = Date.now();
   await env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
-  await env.DB.prepare('INSERT INTO stored_objects (id, object_key, mime_type, size, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, key, file.type, file.size, Date.now()).run();
+  const statements = [
+    env.DB.prepare('INSERT INTO stored_objects (id, object_key, mime_type, size, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, key, file.type, file.size, createdAt),
+    env.DB.prepare('INSERT INTO project_assets (project_id, object_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
+  ];
+  if (typeof env.DB.batch === 'function') await env.DB.batch(statements);
+  else for (const statement of statements) await statement.run();
   return json({ uploadId: id });
 }
 
@@ -86,9 +96,15 @@ async function api(request, env) {
   if (url.pathname === '/api/kling/oauth/callback' && request.method === 'GET') { try { await finishAuthorization(request, env); return Response.redirect(`${url.origin}/?authorized=1`, 302); } catch (error) { return Response.redirect(`${url.origin}/?oauth_error=1`, 302); } }
   if (url.pathname === '/api/uploads' && request.method === 'POST') return upload(request, env);
   if (url.pathname === '/api/video/tasks' && request.method === 'POST') {
+    let input;
+    try { input = await request.json(); }
+    catch { return json({ error: '请提供有效的 JSON' }, 400); }
+    const projectId = String(input?.projectId || '').trim();
+    if (!projectId) return json({ error: '请选择项目' }, 400);
+    if (!await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first()) return json({ error: '请选有效项目' }, 400);
     const status = await getKlingStatus(env);
     if (status.connection !== 'online') return json({ error: '请先连接可灵 MCP' }, 409);
-    try { return json(await submitTask(await request.json(), env, request.headers.get('idempotency-key') || crypto.randomUUID(), status.models)); } catch (error) { return json({ error: error.message }, 400); }
+    try { return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID(), status.models)); } catch (error) { return json({ error: error.message }, 400); }
   }
   return json({ error: '接口不存在' }, 404);
 }
