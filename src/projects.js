@@ -6,28 +6,22 @@ export function normalizeProjectName(name) {
 }
 
 export async function ensureDefaultProject(db, idFactory = () => 'uncategorized', now = Date.now()) {
-  let project = await db
+  const existing = await db
     .prepare('SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at ASC, id ASC LIMIT 1')
     .first();
-  if (!project) {
-    const id = idFactory();
-    await db
-      .prepare('INSERT OR IGNORE INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)')
-      .bind(id, '未分类项目', now, now)
-      .run();
-    project = await db
-      .prepare('SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at ASC, id ASC LIMIT 1')
-      .first();
-  }
+  if (existing) return existing;
 
-  await db
-    .prepare('INSERT OR IGNORE INTO project_assets (project_id, object_id, created_at) SELECT ?, id, created_at FROM stored_objects')
-    .bind(project.id)
-    .run();
-  await db
-    .prepare('INSERT OR IGNORE INTO project_tasks (project_id, task_id, created_at) SELECT ?, id, created_at FROM video_tasks')
-    .bind(project.id)
-    .run();
+  const id = idFactory();
+  await db.batch([
+    db.prepare('INSERT OR IGNORE INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)')
+      .bind(id, '未分类项目', now, now),
+    db.prepare('INSERT OR IGNORE INTO project_assets (project_id, object_id, created_at) SELECT ?, id, created_at FROM stored_objects')
+      .bind(id),
+    db.prepare('INSERT OR IGNORE INTO project_tasks (project_id, task_id, created_at) SELECT ?, id, created_at FROM video_tasks')
+      .bind(id),
+  ]);
 
-  return project;
+  return db
+    .prepare('SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at ASC, id ASC LIMIT 1')
+    .first();
 }
