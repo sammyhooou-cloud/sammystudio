@@ -39,6 +39,28 @@ export function storeCurrentProjectId(storage, projectId) {
   try { storage?.setItem('currentProjectId', projectId); return Boolean(storage); } catch { return false; }
 }
 
+export function createRetryableLoader(load) {
+  let active = null;
+  return () => {
+    if (!active) active = Promise.resolve().then(load).catch((error) => { active = null; throw error; });
+    return active;
+  };
+}
+
+export function nextDrawerFocusIndex(index, count, backwards) {
+  if (!count) return -1;
+  return (index + (backwards ? -1 : 1) + count) % count;
+}
+
+export function switchFailureState(previousProjectId) {
+  return { keepProjectId: previousProjectId || '', submissionDisabled: !previousProjectId };
+}
+
+export function drawerModalState(open, mobile) {
+  const modal = Boolean(open && mobile);
+  return { modal, backgroundInert: modal };
+}
+
 export function optionsForModel(capabilities, mode, modelId) {
   const group = mode === 'text' ? capabilities.text_to_video : capabilities.image_to_video;
   const model = group?.models?.find((item) => item.model === modelId);
@@ -88,14 +110,14 @@ function setup() {
   const duration = document.querySelector('#duration');
   const ratio = document.querySelector('#aspect-ratio');
   let mode = 'text', capabilities = {}, projects = [];
-  let drawerOpen = false, workspaceLoadSequence = 0, enterPromise;
+  let drawerOpen = false, workspaceLoadSequence = 0, projectSwitchBusy = false;
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
   const uploadController = createImageUploadController({
     createObjectURL: (file) => URL.createObjectURL(file), revokeObjectURL: (url) => URL.revokeObjectURL(url), createFormData: () => new FormData(),
     request: (form) => request('/api/uploads', { method: 'POST', body: form }),
-    render: (state) => { if (state) renderImagePreview(previewView, state); else { previewView.preview.hidden = true; previewView.empty.hidden = false; } document.querySelector('#generate').disabled = mode === 'image' && !state?.canSubmit; },
+    render: (state) => { if (state) renderImagePreview(previewView, state); else { previewView.preview.hidden = true; previewView.empty.hidden = false; } updateSubmitDisabled(); },
   });
   function clearImage() { imageInput.value = ''; uploadController.remove(); }
   projectChangeHandler = () => { imageInput.value = ''; uploadController.projectSwitch(); };
@@ -108,17 +130,44 @@ function setup() {
   const backdrop = document.querySelector('#project-backdrop');
   const createForm = document.querySelector('#create-project-form');
   const renameForm = document.querySelector('#rename-project-form');
+  const workspaceMain = document.querySelector('.workspace-main');
+  const masthead = document.querySelector('.masthead');
+  const retryWorkspace = document.querySelector('#workspace-retry');
+
+  function updateSubmitDisabled() {
+    document.querySelector('#generate').disabled = projectSwitchBusy || (mode === 'image' && !uploadController.canSubmit);
+  }
+
+  function setProjectSwitchBusy(busy) {
+    projectSwitchBusy = busy;
+    generator.setAttribute('aria-busy', String(busy));
+    [...generator.elements].forEach((control) => { control.disabled = busy; });
+    updateSubmitDisabled();
+  }
 
   function projectStorage() {
     try { return window.localStorage; } catch { return null; }
   }
 
+  function isMobileDrawer() { return matchMedia('(max-width: 760px)').matches; }
+
+  function setModalState(active) {
+    if (active) { sidebar.setAttribute('role', 'dialog'); sidebar.setAttribute('aria-modal', 'true'); }
+    else { sidebar.removeAttribute('role'); sidebar.removeAttribute('aria-modal'); }
+    for (const element of [workspaceMain, masthead, drawerToggle]) {
+      element.inert = active;
+      if (active) element.setAttribute('aria-hidden', 'true'); else element.removeAttribute('aria-hidden');
+    }
+  }
+
   function setDrawer(open, { returnFocus = false, focusTarget = null } = {}) {
+    const { modal: modalOpen } = drawerModalState(open, isMobileDrawer());
     drawerOpen = open;
     sidebar.classList.toggle('open', open);
     backdrop.hidden = !open;
     drawerToggle.setAttribute('aria-expanded', String(open));
-    if (open && matchMedia('(max-width: 760px)').matches) document.querySelector('#new-project').focus();
+    setModalState(modalOpen);
+    if (modalOpen) document.querySelector('#new-project').focus();
     if (returnFocus) drawerToggle.focus();
     else if (!open && focusTarget) focusTarget.focus();
   }
@@ -158,6 +207,9 @@ function setup() {
     if (!project) return;
     const drawerWasOpen = drawerOpen;
     if (!shouldSwitchProject(currentProjectId, project)) {
+      ++workspaceLoadSequence;
+      setProjectSwitchBusy(false);
+      projectError.textContent = '';
       renderProjects();
       if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
         returnFocus: drawerShouldReturnFocus(closeReason),
@@ -166,19 +218,29 @@ function setup() {
       return;
     }
     const sequence = ++workspaceLoadSequence;
-    projectError.textContent = '';
-    setCurrentProjectId(project.id);
-    storeCurrentProjectId(projectStorage(), project.id);
-    renderProjects();
+    projectError.textContent = '正在加载项目…';
+    setProjectSwitchBusy(true);
     if (closeReason) setDrawer(closeProjectDrawer(drawerOpen, closeReason), {
       returnFocus: drawerShouldReturnFocus(closeReason),
       focusTarget: drawerWasOpen && closeReason === 'selection' ? document.querySelector('.workspace-main') : null,
     });
     try {
       const workspaceState = await request(`/api/projects/${encodeURIComponent(project.id)}/workspace`);
-      if (sequence === workspaceLoadSequence && currentProjectId === project.id) applyWorkspace(workspaceState);
+      if (sequence !== workspaceLoadSequence) return;
+      setCurrentProjectId(project.id);
+      storeCurrentProjectId(projectStorage(), project.id);
+      applyWorkspace(workspaceState);
+      renderProjects();
+      projectError.textContent = '';
+      setProjectSwitchBusy(false);
     } catch (error) {
-      if (sequence === workspaceLoadSequence) projectError.textContent = error.message;
+      if (sequence === workspaceLoadSequence) {
+        const failure = switchFailureState(currentProjectId);
+        projectError.textContent = `项目加载失败：${error.message}`;
+        renderProjects();
+        if (!failure.submissionDisabled) setProjectSwitchBusy(false);
+        else throw error;
+      }
     }
   }
 
@@ -202,16 +264,20 @@ function setup() {
     document.querySelector('#membership').textContent = status.membership ?? '—'; document.querySelector('#credits').textContent = status.credits ?? '暂不可用'; document.querySelector('#last-check').textContent = `最后检查 ${new Date(status.checkedAt).toLocaleTimeString()}`;
     fillModels(); if (!online) statusText.parentElement.onclick = () => { location.href = '/api/kling/oauth/start'; };
   }
+  const loadWorkspaceEntry = createRetryableLoader(async () => {
+    await refreshStatus();
+    await loadProjects();
+  });
   async function enterWorkspace() {
-    if (enterPromise) return enterPromise;
     loginView.hidden = true; workspace.hidden = false;
-    enterPromise = (async () => { await refreshStatus(); await loadProjects(); })();
-    try { await enterPromise; } catch (error) { projectError.textContent = error.message; throw error; }
+    retryWorkspace.hidden = true;
+    try { await loadWorkspaceEntry(); }
+    catch (error) { projectError.textContent = `工作台加载失败：${error.message}`; retryWorkspace.hidden = false; throw error; }
   }
   request('/api/session').then(enterWorkspace).catch(() => {});
   document.querySelector('#password-toggle').onclick = () => { const input = document.querySelector('#password'); input.type = input.type === 'password' ? 'text' : 'password'; };
   loginForm.onsubmit = async (event) => { event.preventDefault(); try { await request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password: document.querySelector('#password').value }) }); await enterWorkspace(); } catch (error) { document.querySelector('#login-error').textContent = error.message; } };
-  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelector('#upload-field').hidden = mode !== 'image'; if (mode !== 'image') clearImage(); document.querySelector('#generate').disabled = mode === 'image' && !uploadController.canSubmit; fillModels(); });
+  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelector('#upload-field').hidden = mode !== 'image'; if (mode !== 'image') clearImage(); updateSubmitDisabled(); fillModels(); });
   modelSelect.onchange = updateOptions;
   imageInput.onchange = async (event) => {
     const file = event.target.files[0]; if (!file) return;
@@ -222,7 +288,16 @@ function setup() {
   document.querySelector('#remove-image').onclick = clearImage;
   drawerToggle.onclick = () => setDrawer(!drawerOpen);
   backdrop.onclick = () => setDrawer(closeProjectDrawer(drawerOpen, 'backdrop'), { returnFocus: true });
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && drawerOpen) setDrawer(closeProjectDrawer(drawerOpen, 'escape'), { returnFocus: true }); });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && drawerOpen) { setDrawer(false, { returnFocus: true }); return; }
+    if (event.key !== 'Tab' || !drawerOpen || !isMobileDrawer()) return;
+    const focusable = [...sidebar.querySelectorAll('button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href],[tabindex]:not([tabindex="-1"])')].filter((element) => !element.hidden && element.offsetParent !== null);
+    const current = focusable.indexOf(document.activeElement);
+    const next = nextDrawerFocusIndex(current < 0 ? (event.shiftKey ? 0 : -1) : current, focusable.length, event.shiftKey);
+    if (next >= 0 && ((event.shiftKey && current <= 0) || (!event.shiftKey && current === focusable.length - 1) || current < 0)) { event.preventDefault(); focusable[next].focus(); }
+  });
+  addEventListener('resize', () => { if (drawerOpen && !isMobileDrawer()) setDrawer(false); });
+  retryWorkspace.onclick = () => { enterWorkspace().catch(() => {}); };
   document.querySelector('#new-project').onclick = () => { createForm.hidden = false; document.querySelector('#new-project-name').focus(); };
   document.querySelector('#cancel-create-project').onclick = () => { createForm.hidden = true; createForm.reset(); projectError.textContent = ''; };
   createForm.onsubmit = async (event) => {
@@ -246,7 +321,7 @@ function setup() {
       projects = renameProjectInList(projects, project); renameForm.hidden = true; renderProjects();
     } catch (error) { projectError.textContent = error.message; }
   };
-  generator.onsubmit = async (event) => { event.preventDefault(); const payload = buildGenerationPayload({ projectId: currentProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount: 1 }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); document.querySelector('#task-id').textContent = `任务 ${task.id}`; await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
+  generator.onsubmit = async (event) => { event.preventDefault(); if (projectSwitchBusy) return; const payload = buildGenerationPayload({ projectId: currentProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount: 1 }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); document.querySelector('#task-id').textContent = `任务 ${task.id}`; await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
   document.querySelector('#refresh-status').onclick = refreshStatus;
   document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
 }

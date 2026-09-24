@@ -3,13 +3,17 @@ import assert from 'node:assert/strict';
 import {
   buildGenerationPayload,
   closeProjectDrawer,
+  createRetryableLoader,
+  drawerModalState,
   drawerShouldReturnFocus,
+  nextDrawerFocusIndex,
   optionsForModel,
   readStoredProjectId,
   renameProjectInList,
   selectCurrentProject,
   shouldSwitchProject,
   storeCurrentProjectId,
+  switchFailureState,
   upsertProject,
   validateWorkspace,
 } from '../public/app.js';
@@ -76,4 +80,37 @@ test('drawer returns focus only for dismiss actions', () => {
   assert.equal(drawerShouldReturnFocus('backdrop'), true);
   assert.equal(drawerShouldReturnFocus('escape'), true);
   assert.equal(drawerShouldReturnFocus('selection'), false);
+});
+
+test('entry loader deduplicates active loads and retries after rejection', async () => {
+  let calls = 0;
+  const loader = createRetryableLoader(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error('offline');
+    return 'ready';
+  });
+  await assert.rejects(loader(), { message: 'offline' });
+  const first = loader();
+  const second = loader();
+  assert.equal(first, second);
+  assert.equal(await first, 'ready');
+  assert.equal(calls, 2);
+});
+
+test('drawer focus cycle wraps forward and backward', () => {
+  assert.equal(nextDrawerFocusIndex(2, 3, false), 0);
+  assert.equal(nextDrawerFocusIndex(0, 3, true), 2);
+  assert.equal(nextDrawerFocusIndex(1, 3, false), 2);
+  assert.equal(nextDrawerFocusIndex(0, 0, false), -1);
+});
+
+test('switch failure restores an existing project but blocks an uninitialized workspace', () => {
+  assert.deepEqual(switchFailureState('project-1'), { keepProjectId: 'project-1', submissionDisabled: false });
+  assert.deepEqual(switchFailureState(''), { keepProjectId: '', submissionDisabled: true });
+});
+
+test('drawer is modal only while open on mobile', () => {
+  assert.deepEqual(drawerModalState(true, true), { modal: true, backgroundInert: true });
+  assert.deepEqual(drawerModalState(true, false), { modal: false, backgroundInert: false });
+  assert.deepEqual(drawerModalState(false, true), { modal: false, backgroundInert: false });
 });
