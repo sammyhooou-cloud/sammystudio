@@ -4,10 +4,6 @@
     "directory": "dist/client"
   },
   "worker": "dist/server/worker.js",
-  "d1": {
-    "DB": "migrations"
-  },
-  "r2": {
-    "MEDIA": "media"
-  }
+  "d1": "DB",
+  "r2": "MEDIA"
 }
