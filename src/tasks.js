@@ -53,7 +53,7 @@ const recoveryKey = (id) => `task-recovery/${id}.json`;
 
 async function saveSettings(db, projectId, settings, settingsVersion) {
   try {
-    await db.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at').bind(projectId, JSON.stringify(settings), settingsVersion).run();
+    await db.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at WHERE project_settings.updated_at < excluded.updated_at').bind(projectId, JSON.stringify(settings), settingsVersion).run();
   } catch {
     throw new TaskError('项目设置保存失败', 500);
   }

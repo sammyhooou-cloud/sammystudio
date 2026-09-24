@@ -76,6 +76,7 @@ class TaskDb {
     this.finalizationFailuresRemaining = 0;
     this.finalizationAttempts = 0;
     this.failSettings = false;
+    this.afterSettingsRead = null;
     this.upload = null;
   }
 
@@ -99,7 +100,15 @@ class TaskDb {
           return db.tasks.find(({ id, idempotency_key }) => idempotency_key === idempotencyKey && taskIds.includes(id)) ?? null;
         }
         if (sql.includes('FROM video_tasks')) return db.tasks.find(({ idempotency_key }) => idempotency_key === this.values[0]) ?? null;
-        if (sql.includes('FROM project_settings')) return db.settings.find(({ project_id }) => project_id === this.values[0]) ?? null;
+        if (sql.includes('FROM project_settings')) {
+          const found = db.settings.find(({ project_id }) => project_id === this.values[0]) ?? null;
+          if (db.afterSettingsRead) {
+            const hook = db.afterSettingsRead;
+            db.afterSettingsRead = null;
+            hook();
+          }
+          return found;
+        }
         if (sql.includes('FROM projects')) return db.projects.find(({ id }) => id === this.values[0]) ?? null;
         if (sql.includes('FROM stored_objects')) return db.upload;
         throw new Error(`Unexpected first query: ${sql}`);
@@ -130,7 +139,8 @@ class TaskDb {
         }
         else if (sql.startsWith('INSERT INTO project_settings')) {
           if (db.failSettings) throw new Error('settings unavailable');
-          db.settings = [{ project_id: values[0], settings_json: values[1], updated_at: values[2] }];
+          const existing = db.settings.find(({ project_id }) => project_id === values[0]);
+          if (!existing || existing.updated_at < values[2]) db.settings = [{ project_id: values[0], settings_json: values[1], updated_at: values[2] }];
         }
         else throw new Error(`Unexpected run query: ${sql}`);
         return { success: true };
@@ -332,6 +342,44 @@ test('concurrent tasks atomically allocate distinct versions and higher recovery
   assert.equal(calls, 2);
   assert.equal(replayB.remote_id, 'remote-B');
   assert.equal(replayA.remote_id, 'remote-A');
+  assert.equal(db.settings[0].updated_at, 2);
+  assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'B');
+  assert.equal(media.objects.size, 0);
+});
+
+test('reverse completion keeps higher-version settings when version 2 saves before version 1', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  const releases = new Map();
+  const tool = async (_env, _name, args) => {
+    await new Promise((resolve) => releases.set(args.prompt, resolve));
+    return { taskId: `remote-${args.prompt}` };
+  };
+  const taskA = submitTask({ ...input, prompt: 'A' }, taskEnv(db, media), 'reverse-a', capabilities, fetch, tool);
+  const taskB = submitTask({ ...input, prompt: 'B' }, taskEnv(db, media), 'reverse-b', capabilities, fetch, tool);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  releases.get('B')();
+  await taskB;
+  releases.get('A')();
+  await taskA;
+
+  assert.equal(db.settings[0].updated_at, 2);
+  assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'B');
+});
+
+test('stale recovery write cannot overwrite newer settings inserted after its pre-check', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  db.failSettings = true;
+  await assert.rejects(() => submitTask({ ...input, prompt: 'A' }, taskEnv(db, media), 'toctou-a', capabilities, fetch, async () => ({ taskId: 'remote-a' })));
+  db.failSettings = false;
+  db.afterSettingsRead = () => {
+    db.settings = [{ project_id: 'project-1', settings_json: JSON.stringify({ prompt: 'B' }), updated_at: 2 }];
+  };
+
+  await submitTask({ ...input, prompt: 'A' }, taskEnv(db, media), 'toctou-a', capabilities, fetch, async () => { throw new Error('provider must not run'); });
+
   assert.equal(db.settings[0].updated_at, 2);
   assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'B');
   assert.equal(media.objects.size, 0);
