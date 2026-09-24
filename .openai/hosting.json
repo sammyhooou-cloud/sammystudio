@@ -5,11 +5,9 @@
   },
   "worker": "dist/server/worker.js",
   "d1": {
-    "DB": {
-      "migrations": "migrations"
-    }
+    "DB": "migrations"
   },
   "r2": {
-    "MEDIA": {}
+    "MEDIA": "media"
   }
 }
