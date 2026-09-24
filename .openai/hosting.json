@@ -1,6 +1,17 @@
 {
+  "project_id": "appgprj_6ab47eea36f88191a54f7310abe42c68",
   "static": {
-    "directory": "dist"
+    "directory": "dist/client"
   },
-  "project_id": "appgprj_6ab47eea36f88191a54f7310abe42c68"
+  "worker": {
+    "entrypoint": "dist/server/worker.js"
+  },
+  "d1": {
+    "DB": {
+      "migrations": "migrations"
+    }
+  },
+  "r2": {
+    "MEDIA": {}
+  }
 }

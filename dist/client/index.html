@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#070907"><meta name="description" content="可灵视频生成工作台">
+  <title>可灵工作台 · 视频生成</title><link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="stage">
+    <header class="masthead"><p><span>WORKSPACE</span>可灵工作台</p><b>K</b><p><span>MODULE 01</span>视频生成</p></header>
+    <section id="login-view" class="login-wrap">
+      <div class="login-card">
+        <p class="eyebrow">KELING WORKSPACE</p><h1>欢迎回来</h1><p class="intro">进入你的智能创作空间</p>
+        <form id="login-form"><label>用户名<input id="username" autocomplete="username" required></label><label>密码<span class="password"><input id="password" type="password" autocomplete="current-password" required><button id="password-toggle" type="button">显示</button></span></label><p id="login-error" class="error" aria-live="polite"></p><button class="primary" type="submit">登录工作台 <span>↗</span></button></form>
+      </div>
+    </section>
+    <section id="workspace-view" class="workspace" hidden>
+      <header class="workspace-head"><div><p class="eyebrow">VIDEO GENERATION</p><h1>生成动态想象</h1></div><div class="account-strip"><div class="status"><i id="status-light"></i><span id="status-text">正在检测</span></div><div><small>会员</small><strong id="membership">—</strong></div><div><small>点数余额</small><strong id="credits">—</strong></div><button id="refresh-status" class="icon-button" title="刷新状态">↻</button><button id="logout" class="text-button">退出</button></div></header>
+      <div class="workspace-grid">
+        <form id="generator-form" class="generator panel">
+          <div class="mode-tabs"><button type="button" class="active" data-mode="text">文生视频</button><button type="button" data-mode="image">图生视频</button></div>
+          <label class="wide">提示词<textarea id="prompt" rows="5" placeholder="描述镜头、主体、动作、光线与氛围"></textarea></label>
+          <label id="upload-field" class="upload wide" hidden><input id="reference-image" type="file" accept="image/jpeg,image/png,image/webp"><span id="upload-copy">＋ 上传首帧参考图<br><small>JPG / PNG / WebP，最大 15MB</small></span></label>
+          <label>模型<select id="model"></select></label><label>分辨率<select id="resolution"></select></label><label>视频时长<select id="duration"></select></label><label>画幅<select id="aspect-ratio"></select></label>
+          <p id="form-error" class="error wide" aria-live="polite"></p><button id="generate" class="primary wide" type="submit">开始生成 <span>↗</span></button>
+        </form>
+        <aside class="result panel"><div class="result-head"><div><p class="eyebrow">CURRENT TASK</p><h2>生成结果</h2></div><span id="task-state">等待提交</span></div><div id="result-empty" class="empty"><b>◌</b><p>设置参数并提交后，任务进度与视频将在这里出现。</p></div><div id="result-progress" hidden><div class="progress"><i></i></div><h3>可灵正在生成视频</h3><p id="task-id"></p></div><video id="result-video" controls hidden></video></aside>
+      </div>
+      <p id="last-check" class="last-check">尚未连接</p>
+    </section>
+  </main><script type="module" src="/app.js"></script>
+</body></html>
