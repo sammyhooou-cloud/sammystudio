@@ -16,10 +16,25 @@ export function optionsForModel(capabilities, mode, modelId) {
 
 export function validateWorkspace(value) {
   const errors = {};
+  if (!value.projectId) errors.projectId = '请先选择项目';
   if (!value.model) errors.model = '请选择模型';
   if (value.mode === 'text' && !value.prompt?.trim()) errors.prompt = '请输入视频提示词';
   if (value.mode === 'image' && !value.uploadId) errors.uploadId = '请上传首帧参考图';
   return errors;
+}
+
+export function buildGenerationPayload(value) {
+  return {
+    projectId: value.projectId,
+    mode: value.mode,
+    uploadId: value.uploadId || '',
+    model: value.model,
+    prompt: value.prompt || '',
+    resolution: value.resolution,
+    duration: value.duration,
+    aspectRatio: value.aspectRatio,
+    imageCount: value.imageCount ?? 1,
+  };
 }
 
 async function request(path, options = {}) {
@@ -72,14 +87,12 @@ function setup() {
   modelSelect.onchange = updateOptions;
   imageInput.onchange = async (event) => {
     const file = event.target.files[0]; if (!file) return;
-    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
-    if (!allowed.includes(file.type) || file.size > 15 * 1024 * 1024) { clearImage(); document.querySelector('#form-error').textContent = !allowed.includes(file.type) ? '仅支持 JPG、PNG 或 WebP 图片' : '图片不能超过 15MB'; return; }
     try { document.querySelector('#form-error').textContent = ''; await uploadController.select(file, currentProjectId); }
     catch (error) { document.querySelector('#form-error').textContent = error.message; }
   };
   document.querySelector('#replace-image').onclick = () => openImageReplacement(imageInput);
   document.querySelector('#remove-image').onclick = clearImage;
-  generator.onsubmit = async (event) => { event.preventDefault(); const payload = { mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount: 1 }; const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); document.querySelector('#task-id').textContent = `任务 ${task.id}`; await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
+  generator.onsubmit = async (event) => { event.preventDefault(); const payload = buildGenerationPayload({ projectId: currentProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount: 1 }); const errors = validateWorkspace(payload); if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; } try { document.querySelector('#form-error').textContent = ''; document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false; document.querySelector('#task-state').textContent = '已进入队列'; const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(payload) }); document.querySelector('#task-id').textContent = `任务 ${task.id}`; await refreshStatus(); } catch (error) { document.querySelector('#form-error').textContent = error.message; document.querySelector('#task-state').textContent = '提交失败'; } };
   document.querySelector('#refresh-status').onclick = refreshStatus;
   document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
 }

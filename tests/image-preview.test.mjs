@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { createImageUploadController, formatBytes, imagePreviewState, openImageReplacement, renderImagePreview } from '../public/image-preview.js';
 
 test('formatBytes formats bytes, kilobytes, and megabytes', () => {
@@ -101,4 +102,27 @@ test('replacement clears the input before opening the picker without clearing pr
   const input = { _value: 'C:/fakepath/frame.png', set value(value) { events.push(['value', value]); this._value = value; }, click() { events.push(['click']); } };
   openImageReplacement(input);
   assert.deepEqual(events, [['value', ''], ['click']]);
+});
+
+test('invalid files render failed metadata without making an upload request', async () => {
+  for (const [file, message] of [
+    [{ name: 'frame.gif', type: 'image/gif', size: 12 }, '仅支持 JPG、PNG 或 WebP 图片'],
+    [{ name: 'huge.png', type: 'image/png', size: 16 * 1024 * 1024 }, '图片不能超过 15MB'],
+  ]) {
+    const harness = uploadHarness();
+    await assert.rejects(harness.controller.select(file, 'project-1'), { message });
+    assert.equal(harness.created.length, 1);
+    assert.equal(harness.requests.length, 0);
+    assert.equal(harness.controller.uploadId, '');
+    assert.equal(harness.controller.canSubmit, false);
+    assert.deepEqual({ name: harness.renders.at(-1).name, status: harness.renders.at(-1).status }, { name: file.name, status: message });
+  }
+});
+
+test('upload surface uses a full-area label and visible focus proxy', async () => {
+  const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+  const css = await readFile(new URL('../public/image-preview.css', import.meta.url), 'utf8');
+  assert.match(html, /<label id="upload-copy" for="reference-image"/);
+  assert.match(css, /\.upload > label[\s\S]*min-height:\s*112px/);
+  assert.match(css, /\.upload:focus-within/);
 });

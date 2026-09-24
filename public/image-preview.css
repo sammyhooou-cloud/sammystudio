@@ -10,8 +10,17 @@
 }
 
 .upload > label {
+  display: grid;
+  place-content: center;
+  width: 100%;
+  min-height: 112px;
   margin: 0;
   cursor: pointer;
+}
+
+.upload:focus-within {
+  border-color: var(--acid);
+  box-shadow: 0 0 0 3px #c8ff7815;
 }
 
 .image-preview {

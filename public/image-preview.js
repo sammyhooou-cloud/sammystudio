@@ -49,6 +49,13 @@ export function createImageUploadController(adapters) {
       uploadId = ''; canSubmit = false; revokeCurrent();
       objectUrl = adapters.createObjectURL(file);
       adapters.render(imagePreviewState(file, objectUrl, 'uploading'));
+      const validationError = !['image/jpeg', 'image/png', 'image/webp'].includes(file.type)
+        ? '仅支持 JPG、PNG 或 WebP 图片'
+        : file.size > 15 * 1024 * 1024 ? '图片不能超过 15MB' : '';
+      if (validationError) {
+        adapters.render({ ...imagePreviewState(file, objectUrl, 'failed'), status: validationError });
+        throw new Error(validationError);
+      }
       if (!projectId) {
         adapters.render(imagePreviewState(file, objectUrl, 'failed'));
         throw new Error('请先选择项目');
