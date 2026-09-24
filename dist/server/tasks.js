@@ -1,5 +1,13 @@
 import { callTool } from './kling-mcp.js';
 
+export class TaskError extends Error {
+  constructor(message, status, task) {
+    super(message);
+    this.status = status;
+    if (task) this.task = task;
+  }
+}
+
 export function validateTask(input, capabilities) {
   const mode = input.mode;
   if (!['text', 'image'].includes(mode)) throw new Error('生成模式无效');
@@ -15,22 +23,157 @@ export function validateTask(input, capabilities) {
   return { ...input, duration: String(input.duration), imageCount: String(input.imageCount || 1) };
 }
 
-export async function submitTask(input, env, idempotencyKey, capabilities, fetcher = fetch) {
-  const existing = await env.DB.prepare('SELECT * FROM video_tasks WHERE idempotency_key = ?').bind(idempotencyKey).first();
-  if (existing) return existing;
-  const valid = validateTask(input, capabilities);
+function settingsSnapshot(valid) {
+  return {
+    mode: valid.mode,
+    model: valid.model,
+    prompt: valid.prompt || '',
+    uploadId: valid.uploadId || null,
+    duration: valid.duration,
+    resolution: valid.resolution,
+    aspectRatio: valid.aspectRatio,
+    imageCount: valid.imageCount,
+  };
+}
+
+async function loadCapabilities(source) {
+  if (typeof source !== 'function') return source;
+  const status = await source();
+  if (status.connection !== 'online') {
+    throw new TaskError('请先连接可灵 MCP', 409);
+  }
+  return status.models;
+}
+
+function taskDto(task) {
+  return { id: task.id, remote_id: task.remote_id || null, status: task.status };
+}
+
+const recoveryKey = (id) => `task-recovery/${id}.json`;
+
+async function saveSettings(db, projectId, settings, settingsVersion) {
+  try {
+    await db.prepare('INSERT INTO project_settings (project_id, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at WHERE project_settings.updated_at < excluded.updated_at').bind(projectId, JSON.stringify(settings), settingsVersion).run();
+  } catch {
+    throw new TaskError('项目设置保存失败', 500);
+  }
+}
+
+async function writeRecovery(media, record) {
+  const body = JSON.stringify(record);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await media.put(recoveryKey(record.id), body, { httpMetadata: { contentType: 'application/json' } });
+      return;
+    } catch {
+      if (attempt === 2) throw new TaskError('任务恢复记录保存失败', 503, { id: record.id, remote_id: record.remoteId, status: 'submitting' });
+    }
+  }
+}
+
+async function deleteRecovery(media, id) {
+  try { await media.delete(recoveryKey(id)); } catch {}
+}
+
+async function markFailed(db, id) {
+  try {
+    await db.prepare('UPDATE video_tasks SET status = ?, updated_at = ? WHERE id = ?').bind('failed', Date.now(), id).run();
+  } catch {}
+}
+
+async function finalizeTask(db, id, remoteId, result) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await db.prepare('UPDATE video_tasks SET remote_id = ?, status = ?, result_json = ?, updated_at = ? WHERE id = ?').bind(remoteId, 'queued', JSON.stringify(result), Date.now(), id).run();
+      return;
+    } catch {
+      if (attempt === 2) throw new TaskError('任务保存失败', 500);
+    }
+  }
+}
+
+async function replayTask(task, env, projectId) {
+  let object;
+  try { object = await env.MEDIA.get(recoveryKey(task.id)); } catch { return taskDto(task); }
+  if (!object) return taskDto(task);
+  let record;
+  try { record = JSON.parse(await object.text()); } catch { throw new TaskError('任务恢复记录无效', 500); }
+  if (record.id !== task.id || record.projectId !== projectId || !record.remoteId || !record.settings || !Number.isFinite(record.settingsVersion)) throw new TaskError('任务恢复记录无效', 500);
+  let replayed = task;
+  if (task.status === 'submitting' && !task.remote_id) {
+    await finalizeTask(env.DB, task.id, record.remoteId, record.result);
+    replayed = { id: task.id, remote_id: record.remoteId, status: 'queued' };
+  }
+  if (replayed.status === 'queued') {
+    const current = await env.DB.prepare('SELECT settings_json, updated_at FROM project_settings WHERE project_id = ?').bind(projectId).first();
+    if (!current || Number(current.updated_at) < record.settingsVersion) await saveSettings(env.DB, projectId, record.settings, record.settingsVersion);
+    await deleteRecovery(env.MEDIA, task.id);
+  }
+  return taskDto(replayed);
+}
+
+export async function submitTask(input, env, idempotencyKey, capabilitiesSource, fetcher = fetch, toolCaller = callTool) {
+  const projectId = String(input?.projectId || '').trim();
+  if (!projectId) throw new TaskError('请选择项目', 400);
+  const project = await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first();
+  if (!project) throw new TaskError('请选有效项目', 400);
+  const internalKey = JSON.stringify([projectId, idempotencyKey]);
+  const existing = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(internalKey, projectId).first();
+  if (existing) return replayTask(existing, env, projectId);
+  const legacy = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(idempotencyKey, projectId).first();
+  if (legacy) return replayTask(legacy, env, projectId);
+  if (typeof env.DB.batch !== 'function') throw new TaskError('任务保存失败', 500);
+  const capabilities = await loadCapabilities(capabilitiesSource);
+  let valid;
+  try { valid = validateTask(input, capabilities); }
+  catch (error) { throw new TaskError(error.message, 400); }
+  let versionRow;
+  try {
+    versionRow = await env.DB.prepare('INSERT INTO project_settings_versions (project_id, version) VALUES (?, 1) ON CONFLICT(project_id) DO UPDATE SET version = project_settings_versions.version + 1 RETURNING version').bind(projectId).first();
+  } catch {
+    throw new TaskError('任务保存失败', 500);
+  }
+  const settingsVersion = Number(versionRow?.version);
+  if (!Number.isFinite(settingsVersion)) throw new TaskError('任务保存失败', 500);
   const id = crypto.randomUUID();
+  const createdAt = Date.now();
+  const reservation = [
+    env.DB.prepare('INSERT INTO video_tasks (id, idempotency_key, remote_id, mode, status, request_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(id, internalKey, null, valid.mode, 'submitting', JSON.stringify({ ...valid, settingsVersion }), createdAt, createdAt),
+    env.DB.prepare('INSERT INTO project_tasks (project_id, task_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
+  ];
+  try {
+    await env.DB.batch(reservation);
+  } catch {
+    const reserved = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(internalKey, projectId).first();
+    if (reserved) return taskDto(reserved);
+    throw new TaskError('任务保存失败', 500);
+  }
   let result;
-  if (valid.mode === 'text') {
-    result = await callTool(env, 'text_to_video', { model: valid.model, prompt: valid.prompt, duration: valid.duration, aspect_ratio: valid.aspectRatio, resolution: valid.resolution, imageCount: valid.imageCount }, fetcher);
-  } else {
-    const upload = await env.DB.prepare('SELECT object_key FROM stored_objects WHERE id = ?').bind(valid.uploadId).first();
-    if (!upload) throw new Error('参考图不存在');
-    const file = await env.MEDIA.get(upload.object_key);
-    const uploaded = await callTool(env, 'file_upload', { file: await file.arrayBuffer(), filename: 'reference-image' }, fetcher);
-    result = await callTool(env, 'image_to_video', { model: valid.model, prompt: valid.prompt || '', first_image: uploaded.url || uploaded, duration: valid.duration, resolution: valid.resolution, imageCount: valid.imageCount }, fetcher);
+  try {
+    if (valid.mode === 'text') {
+      result = await toolCaller(env, 'text_to_video', { model: valid.model, prompt: valid.prompt, duration: valid.duration, aspect_ratio: valid.aspectRatio, resolution: valid.resolution, imageCount: valid.imageCount }, fetcher);
+    } else {
+      const upload = await env.DB.prepare('SELECT stored_objects.object_key FROM stored_objects JOIN project_assets ON project_assets.object_id = stored_objects.id WHERE stored_objects.id = ? AND project_assets.project_id = ?').bind(valid.uploadId, projectId).first();
+      if (!upload) throw new TaskError('参考图不存在', 404);
+      const file = await env.MEDIA.get(upload.object_key);
+      if (!file) throw new TaskError('参考图存储不可用', 500);
+      const uploaded = await toolCaller(env, 'file_upload', { file: await file.arrayBuffer(), filename: 'reference-image' }, fetcher);
+      result = await toolCaller(env, 'image_to_video', { model: valid.model, prompt: valid.prompt || '', first_image: uploaded.url || uploaded, duration: valid.duration, resolution: valid.resolution, imageCount: valid.imageCount }, fetcher);
+    }
+  } catch (error) {
+    await markFailed(env.DB, id);
+    if (error instanceof TaskError) throw error;
+    throw new TaskError('视频生成服务暂不可用', 502);
   }
   const remoteId = result.taskId || result.task_id || result.id || null;
-  await env.DB.prepare('INSERT INTO video_tasks (id, idempotency_key, remote_id, mode, status, request_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(id, idempotencyKey, remoteId, valid.mode, 'queued', JSON.stringify(valid), Date.now(), Date.now()).run();
-  return { id, remote_id: remoteId, status: 'queued' };
+  if (!remoteId) {
+    await markFailed(env.DB, id);
+    throw new TaskError('视频生成服务返回无效', 502);
+  }
+  const settings = settingsSnapshot(valid);
+  await writeRecovery(env.MEDIA, { id, projectId, remoteId, result: { taskId: remoteId }, settings, settingsVersion });
+  await finalizeTask(env.DB, id, remoteId, result);
+  await saveSettings(env.DB, projectId, settings, settingsVersion);
+  await deleteRecovery(env.MEDIA, id);
+  return taskDto({ id, remote_id: remoteId, status: 'queued' });
 }
