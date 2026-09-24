@@ -68,6 +68,7 @@ class TaskDb {
     this.tasks = [];
     this.projectTasks = [];
     this.settings = [];
+    this.settingsVersions = new Map();
     this.batchCount = 0;
     this.queries = [];
     this.failReservation = false;
@@ -86,6 +87,12 @@ class TaskDb {
       bind(...values) { return { ...statement, values }; },
       async first() {
         db.queries.push({ sql, values: this.values });
+        if (sql.startsWith('INSERT INTO project_settings_versions')) {
+          const projectId = this.values[0];
+          const version = (db.settingsVersions.get(projectId) || 0) + 1;
+          db.settingsVersions.set(projectId, version);
+          return { version };
+        }
         if (sql.includes('JOIN project_tasks')) {
           const [idempotencyKey, projectId] = this.values;
           const taskIds = db.projectTasks.filter(({ project_id }) => project_id === projectId).map(({ task_id }) => task_id);
@@ -272,23 +279,62 @@ test('same-timestamp newer task gets a monotonic settings version and repairs on
     const db = new TaskDb();
     const media = new RecoveryMedia();
     await submitTask({ ...input, prompt: 'prompt A' }, taskEnv(db, media), 'same-time-a', capabilities, fetch, async () => ({ taskId: 'remote-a' }));
-    assert.equal(db.settings[0].updated_at, 10_000);
+    assert.equal(db.settings[0].updated_at, 1);
     db.failSettings = true;
 
     await assert.rejects(() => submitTask({ ...input, prompt: 'prompt B' }, taskEnv(db, media), 'same-time-b', capabilities, fetch, async () => ({ taskId: 'remote-b' })));
     const record = JSON.parse([...media.objects.values()][0]);
-    assert.equal(record.settingsVersion, 10_001);
-    assert.equal(db.settings[0].updated_at, 10_000);
+    assert.equal(record.settingsVersion, 2);
+    assert.equal(db.settings[0].updated_at, 1);
     db.failSettings = false;
 
     const replay = await submitTask({ ...input, prompt: 'prompt B' }, taskEnv(db, media), 'same-time-b', capabilities, fetch, async () => { throw new Error('provider must not run'); });
     assert.equal(replay.remote_id, 'remote-b');
-    assert.equal(db.settings[0].updated_at, 10_001);
+    assert.equal(db.settings[0].updated_at, 2);
     assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'prompt B');
     assert.equal(media.objects.size, 0);
   } finally {
     Date.now = originalNow;
   }
+});
+
+test('concurrent tasks atomically allocate distinct versions and higher recovery wins', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  const releases = new Map();
+  let calls = 0;
+  const tool = async (_env, _name, args) => {
+    calls += 1;
+    await new Promise((resolve) => releases.set(args.prompt, resolve));
+    return { taskId: `remote-${args.prompt}` };
+  };
+
+  const taskAInput = { ...input, prompt: 'A' };
+  const taskBInput = { ...input, prompt: 'B' };
+  const taskA = submitTask(taskAInput, taskEnv(db, media), 'atomic-a', capabilities, fetch, tool);
+  const taskB = submitTask(taskBInput, taskEnv(db, media), 'atomic-b', capabilities, fetch, tool);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(db.settingsVersions.get('project-1'), 2);
+  const reservedVersions = db.tasks.map(({ request_json }) => JSON.parse(request_json).settingsVersion).sort();
+  assert.deepEqual(reservedVersions, [1, 2]);
+
+  media.failDeletesRemaining = 1;
+  releases.get('A')();
+  await taskA;
+  db.failSettings = true;
+  releases.get('B')();
+  await assert.rejects(taskB, /项目设置保存失败/);
+  db.failSettings = false;
+
+  const replayB = await submitTask(taskBInput, taskEnv(db, media), 'atomic-b', capabilities, fetch, async () => { throw new Error('provider must not run'); });
+  const replayA = await submitTask(taskAInput, taskEnv(db, media), 'atomic-a', capabilities, fetch, async () => { throw new Error('provider must not run'); });
+
+  assert.equal(calls, 2);
+  assert.equal(replayB.remote_id, 'remote-B');
+  assert.equal(replayA.remote_id, 'remote-A');
+  assert.equal(db.settings[0].updated_at, 2);
+  assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'B');
+  assert.equal(media.objects.size, 0);
 });
 
 test('replaying an older queued task does not roll back newer project settings', async () => {

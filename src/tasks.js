@@ -127,8 +127,14 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   let valid;
   try { valid = validateTask(input, capabilities); }
   catch (error) { throw new TaskError(error.message, 400); }
-  const currentSettings = await env.DB.prepare('SELECT updated_at FROM project_settings WHERE project_id = ?').bind(projectId).first();
-  const settingsVersion = Math.max(Date.now(), Number(currentSettings?.updated_at || 0) + 1);
+  let versionRow;
+  try {
+    versionRow = await env.DB.prepare('INSERT INTO project_settings_versions (project_id, version) VALUES (?, 1) ON CONFLICT(project_id) DO UPDATE SET version = project_settings_versions.version + 1 RETURNING version').bind(projectId).first();
+  } catch {
+    throw new TaskError('任务保存失败', 500);
+  }
+  const settingsVersion = Number(versionRow?.version);
+  if (!Number.isFinite(settingsVersion)) throw new TaskError('任务保存失败', 500);
   const id = crypto.randomUUID();
   const createdAt = Date.now();
   const reservation = [
