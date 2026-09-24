@@ -93,28 +93,22 @@ async function finalizeTask(db, id, remoteId, result) {
 }
 
 async function replayTask(task, env, projectId) {
+  let object;
+  try { object = await env.MEDIA.get(recoveryKey(task.id)); } catch { return taskDto(task); }
+  if (!object) return taskDto(task);
+  let record;
+  try { record = JSON.parse(await object.text()); } catch { throw new TaskError('任务恢复记录无效', 500); }
+  if (record.id !== task.id || record.projectId !== projectId || !record.remoteId || !record.settings) throw new TaskError('任务恢复记录无效', 500);
   if (task.status === 'submitting' && !task.remote_id) {
-    let object;
-    try { object = await env.MEDIA.get(recoveryKey(task.id)); } catch { return taskDto(task); }
-    if (!object) return taskDto(task);
-    let record;
-    try { record = JSON.parse(await object.text()); } catch { throw new TaskError('任务恢复记录无效', 500); }
-    if (record.id !== task.id || record.projectId !== projectId || !record.remoteId) throw new TaskError('任务恢复记录无效', 500);
     await finalizeTask(env.DB, task.id, record.remoteId, record.result);
     await saveSettings(env.DB, projectId, record.settings);
     await deleteRecovery(env.MEDIA, task.id);
     return taskDto({ id: task.id, remote_id: record.remoteId, status: 'queued' });
   }
-  if (task.request_json) {
-    let valid;
-    try { valid = JSON.parse(task.request_json); } catch {}
-    if (valid) {
-      const settings = settingsSnapshot(valid);
-      const saved = await env.DB.prepare('SELECT settings_json FROM project_settings WHERE project_id = ?').bind(projectId).first();
-      if (saved?.settings_json !== JSON.stringify(settings)) await saveSettings(env.DB, projectId, settings);
-    }
+  if (task.status === 'queued') {
+    await saveSettings(env.DB, projectId, record.settings);
+    await deleteRecovery(env.MEDIA, task.id);
   }
-  if (task.status === 'queued') await deleteRecovery(env.MEDIA, task.id);
   return taskDto(task);
 }
 

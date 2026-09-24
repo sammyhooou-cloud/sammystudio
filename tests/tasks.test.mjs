@@ -260,6 +260,24 @@ test('settings failure after core finalization replays the tracked remote task',
   assert.equal(media.deleted.length, 1);
 });
 
+test('replaying an older queued task does not roll back newer project settings', async () => {
+  const db = new TaskDb();
+  const media = new RecoveryMedia();
+  let calls = 0;
+  const taskAInput = { ...input, prompt: 'prompt A' };
+  const taskBInput = { ...input, prompt: 'prompt B', duration: 5 };
+
+  const taskA = await submitTask(taskAInput, taskEnv(db, media), 'key-a', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-a' }; });
+  await submitTask(taskBInput, taskEnv(db, media), 'key-b', capabilities, fetch, async () => { calls += 1; return { taskId: 'remote-b' }; });
+  const settingsBeforeReplay = db.settings[0].settings_json;
+  const replay = await submitTask(taskAInput, taskEnv(db, media), 'key-a', capabilities, fetch, async () => { calls += 1; });
+
+  assert.deepEqual(replay, taskA);
+  assert.equal(calls, 2);
+  assert.equal(db.settings[0].settings_json, settingsBeforeReplay);
+  assert.equal(JSON.parse(db.settings[0].settings_json).prompt, 'prompt B');
+});
+
 test('core finalization retries transient database failures without another provider call', async () => {
   const db = new TaskDb();
   db.finalizationFailuresRemaining = 2;
