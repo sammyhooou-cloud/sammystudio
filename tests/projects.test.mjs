@@ -29,6 +29,7 @@ class FakeD1 {
     this.projectAssets = [];
     this.projectTasks = [];
     this.projectSettings = [];
+    this.queries = [];
     this.runs = [];
     this.batchCount = 0;
     this.failAssetBackfillOnce = false;
@@ -56,6 +57,7 @@ class FakeD1 {
         throw new Error(`Unexpected first query: ${sql}`);
       },
       async all() {
+        db.queries.push(sql);
         const values = this.values;
         if (sql.includes('FROM projects')) {
           return { results: [...db.projects].sort((a, b) => b.updated_at - a.updated_at || a.id.localeCompare(b.id)) };
@@ -251,6 +253,7 @@ test('reads only assets and tasks linked to one project and parses settings', as
   assert.deepEqual(workspace.settings, { duration: 5 });
   assert.equal('objectKey' in workspace.assets[0], false);
   assert.equal('idempotencyKey' in workspace.tasks[0], false);
+  assert.equal(db.queries.filter((sql) => sql.includes('LIMIT 100')).length, 2);
 });
 
 test('falls back to empty settings and rejects missing projects', async () => {

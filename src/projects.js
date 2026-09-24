@@ -83,13 +83,15 @@ export async function readProjectWorkspace(db, id) {
       FROM project_assets
       JOIN stored_objects ON stored_objects.id = project_assets.object_id
       WHERE project_assets.project_id = ?
-      ORDER BY stored_objects.created_at DESC, stored_objects.id ASC`).bind(id).all(),
+      ORDER BY stored_objects.created_at DESC, stored_objects.id ASC
+      LIMIT 100`).bind(id).all(),
     db.prepare(`SELECT video_tasks.id, video_tasks.remote_id, video_tasks.mode, video_tasks.status,
         video_tasks.request_json, video_tasks.result_json, video_tasks.created_at, video_tasks.updated_at
       FROM project_tasks
       JOIN video_tasks ON video_tasks.id = project_tasks.task_id
       WHERE project_tasks.project_id = ?
-      ORDER BY video_tasks.updated_at DESC, video_tasks.id ASC`).bind(id).all(),
+      ORDER BY video_tasks.updated_at DESC, video_tasks.id ASC
+      LIMIT 100`).bind(id).all(),
     db.prepare('SELECT settings_json FROM project_settings WHERE project_id = ?').bind(id).first(),
   ]);
 

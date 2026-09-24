@@ -20,6 +20,11 @@ function projectInputError(error) {
   return error instanceof SyntaxError || ['项目名称不能为空', '项目名称不能超过60个字符'].includes(error?.message);
 }
 
+function decodeProjectId(value) {
+  try { return decodeURIComponent(value); }
+  catch { return null; }
+}
+
 function siteAsset(pathname) {
   const key = pathname === '/' ? '/index.html' : pathname;
   const asset = siteAssets.get(key);
@@ -57,7 +62,9 @@ async function api(request, env) {
   }
   const workspaceMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/workspace$/);
   if (workspaceMatch && request.method === 'GET') {
-    try { return json(await readProjectWorkspace(env.DB, decodeURIComponent(workspaceMatch[1]))); }
+    const projectId = decodeProjectId(workspaceMatch[1]);
+    if (projectId === null) return json({ error: '项目 ID 格式无效' }, 400);
+    try { return json(await readProjectWorkspace(env.DB, projectId)); }
     catch (error) {
       if (error.message === '项目不存在') return json({ error: error.message }, 404);
       throw error;
@@ -65,7 +72,9 @@ async function api(request, env) {
   }
   const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
   if (projectMatch && request.method === 'PATCH') {
-    try { return json(await renameProject(env.DB, decodeURIComponent(projectMatch[1]), await request.json())); }
+    const projectId = decodeProjectId(projectMatch[1]);
+    if (projectId === null) return json({ error: '项目 ID 格式无效' }, 400);
+    try { return json(await renameProject(env.DB, projectId, await request.json())); }
     catch (error) {
       if (error.message === '项目不存在') return json({ error: error.message }, 404);
       if (projectInputError(error)) return json({ error: error instanceof SyntaxError ? '请提供有效的 JSON' : error.message }, 400);
