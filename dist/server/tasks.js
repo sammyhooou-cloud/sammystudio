@@ -240,6 +240,10 @@ export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCal
     const recovered = await replayTask(task, env, projectId);
     return { ...recovered, resultJson: task.result_json || null };
   }
+  if (!task.remote_id && ['queued', 'generating'].includes(task.status)) {
+    await env.DB.prepare('UPDATE video_tasks SET status = ?, updated_at = ? WHERE id = ? AND remote_id IS NULL AND status IN (?, ?)').bind('unknown', Date.now(), id, 'queued', 'generating').run();
+    return { ...taskDto({ ...task, status: 'unknown' }), resultJson: task.result_json || null };
+  }
   if (!task.remote_id || !['queued', 'generating'].includes(task.status)) return { ...taskDto(task), resultJson: task.result_json || null };
   let result;
   try { result = toolData(await toolCaller(env, 'query_tasks', { generationId: task.remote_id }, fetcher)); }

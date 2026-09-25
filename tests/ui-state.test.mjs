@@ -296,12 +296,16 @@ test('video URL extraction accepts known video results and rejects unrelated or 
   assert.equal(extractVideoUrl({ outputs: [{ type: 'video', url: 'https://cdn.test/output?id=1' }] }), 'https://cdn.test/output?id=1');
   assert.equal(extractVideoUrl({ outputs: [{ url: 'https://cdn.test/output.mp4' }] }), 'https://cdn.test/output.mp4');
   assert.equal(extractVideoUrl({ works: [{ contentType: 'video', url: 'https://cdn.test/output' }] }), 'https://cdn.test/output');
+  assert.equal(extractVideoUrl({ works: [{ url: 'https://cdn.test/watermarked.mp4', urlWithoutWatermark: 'https://cdn.test/clean.mp4' }] }), 'https://cdn.test/clean.mp4');
+  assert.equal(extractVideoUrl({ works: [{ url_without_watermark: 'https://cdn.test/clean.webm' }] }), 'https://cdn.test/clean.webm');
   for (const result of [
     { thumbnail_url: 'https://cdn.test/thumb.jpg' },
     { statusUrl: 'https://cdn.test/status' },
     { outputs: [{ type: 'image', url: 'https://cdn.test/image.jpg' }] },
     { videoUrl: 'javascript:alert(1)' },
     { video_url: 'data:video/mp4;base64,AAAA' },
+    { works: [{ urlWithoutWatermark: 'javascript:alert(1)' }] },
+    { works: [{ url_without_watermark: 'data:video/mp4;base64,AAAA' }] },
   ]) assert.equal(extractVideoUrl(result), '');
 });
 

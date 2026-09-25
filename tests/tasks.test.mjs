@@ -139,8 +139,12 @@ class TaskDb {
         }
         else if (sql.startsWith('UPDATE video_tasks SET status')) {
           const task = db.tasks.find(({ id }) => id === (sql.includes('result_json') ? values[3] : values[2]));
-          task.status = values[0];
-          if (sql.includes('result_json')) task.result_json = values[1];
+          const guardedOrphanUpdate = sql.includes('remote_id IS NULL');
+          const allowedStatuses = guardedOrphanUpdate ? values.slice(3) : null;
+          if (!guardedOrphanUpdate || (task && task.remote_id == null && allowedStatuses.includes(task.status))) {
+            task.status = values[0];
+            if (sql.includes('result_json')) task.result_json = values[1];
+          }
         }
         else if (sql.startsWith('INSERT INTO project_tasks')) {
           if (db.failProjectTask) throw new Error('mapping unavailable');
@@ -184,6 +188,22 @@ test('same project idempotency replay returns its task without another Kling cal
   assert.deepEqual(result, { id: 'task-1', remote_id: 'remote-1', status: 'queued' });
   assert.equal(calls, 0);
   assert.equal(db.tasks.length, 1);
+});
+
+test('queued or generating legacy tasks without a remote id become unknown without a Kling call', async () => {
+  for (const status of ['queued', 'generating']) {
+    const db = new TaskDb();
+    const resultJson = status === 'queued' ? '{"legacy":true}' : null;
+    db.tasks.push({ id: `orphan-${status}`, remote_id: null, status, result_json: resultJson });
+    db.projectTasks.push({ project_id: 'project-1', task_id: `orphan-${status}`, created_at: 1 });
+    let calls = 0;
+
+    const result = await getTaskStatus(`orphan-${status}`, 'project-1', taskEnv(db), fetch, async () => { calls += 1; });
+
+    assert.deepEqual(result, { id: `orphan-${status}`, remote_id: null, status: 'unknown', resultJson });
+    assert.equal(db.tasks[0].status, 'unknown');
+    assert.equal(calls, 0);
+  }
 });
 
 test('writes paid-call intent before generation and uses a stable trace identifier', async () => {
