@@ -66,3 +66,11 @@ test('pending attempt guidance does not replace the visible stage status', () =>
 test('choosing a completed clip can replace the temporary submission stage', () => {
   assert.match(app, /item\.onclick\s*=\s*\(\)\s*=>\s*\{\s*selectedTaskId\s*=\s*task\.id;\s*stageOverride\s*=\s*null;\s*submittingWithoutTask\s*=\s*false;\s*renderTasks\(\)/);
 });
+
+test('submission entry rebuilds history with no completed clip selected', () => {
+  const entry = app.match(/const attempt = attempts\.begin\(payload\);([\s\S]*?)\n    try \{/)?.[1] || '';
+  assert.ok(entry);
+  assert.match(entry, /selectedTaskId\s*=\s*'';\s*stageOverride\s*=\s*null;\s*submittingWithoutTask\s*=\s*true;\s*renderTasks\(\);/);
+  assert.match(app, /const selectedHistoryId = selectedCompletedTaskId\(visibleStage\)/);
+  assert.match(app, /if \(submittingWithoutTask\) showSubmittingStage\(\)/);
+});

@@ -804,7 +804,7 @@ function setup() {
     selectedTaskId = '';
     stageOverride = null;
     submittingWithoutTask = true;
-    showSubmittingStage();
+    renderTasks();
     try {
       const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': attempt.key }, body: JSON.stringify(payload) });
       attempts.settle(attempt, Boolean(task.remote_id || task.status === 'succeeded' || task.status === 'failed'));
