@@ -298,6 +298,8 @@ test('video URL extraction accepts known video results and rejects unrelated or 
   assert.equal(extractVideoUrl({ works: [{ contentType: 'video', url: 'https://cdn.test/output' }] }), 'https://cdn.test/output');
   assert.equal(extractVideoUrl({ works: [{ url: 'https://cdn.test/watermarked.mp4', urlWithoutWatermark: 'https://cdn.test/clean.mp4' }] }), 'https://cdn.test/clean.mp4');
   assert.equal(extractVideoUrl({ works: [{ url_without_watermark: 'https://cdn.test/clean.webm' }] }), 'https://cdn.test/clean.webm');
+  assert.equal(extractVideoUrl({ works: [{ type: 'image', urlWithoutWatermark: 'https://cdn.test/poster.jpg' }] }), '');
+  assert.equal(extractVideoUrl({ works: [{ contentType: 'image', url_without_watermark: 'https://cdn.test/poster.jpg' }] }), '');
   for (const result of [
     { thumbnail_url: 'https://cdn.test/thumb.jpg' },
     { statusUrl: 'https://cdn.test/status' },

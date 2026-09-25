@@ -202,7 +202,8 @@ export function extractVideoUrl(value) {
   if (typeof value === 'string') { const url = safeMediaUrl(value); return url && hasVideoExtension(url) ? url : ''; }
   if (!value || typeof value !== 'object') return '';
   for (const key of ['videoUrl', 'video_url', 'urlWithoutWatermark', 'url_without_watermark']) {
-    const url = safeMediaUrl(value[key]); if (url) return url;
+    const url = safeMediaUrl(value[key]);
+    if (url && (key === 'videoUrl' || key === 'video_url' || videoTyped(value) || hasVideoExtension(url))) return url;
   }
   const direct = safeMediaUrl(value.url);
   if (direct && (videoTyped(value) || hasVideoExtension(direct))) return direct;

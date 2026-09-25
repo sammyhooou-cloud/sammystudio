@@ -242,7 +242,9 @@ export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCal
   }
   if (!task.remote_id && ['queued', 'generating'].includes(task.status)) {
     await env.DB.prepare('UPDATE video_tasks SET status = ?, updated_at = ? WHERE id = ? AND remote_id IS NULL AND status IN (?, ?)').bind('unknown', Date.now(), id, 'queued', 'generating').run();
-    return { ...taskDto({ ...task, status: 'unknown' }), resultJson: task.result_json || null };
+    const current = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.id = ? AND project_tasks.project_id = ?').bind(id, projectId).first();
+    if (!current) throw new TaskError('任务不存在', 404);
+    return { ...taskDto(current), resultJson: current.result_json || null };
   }
   if (!task.remote_id || !['queued', 'generating'].includes(task.status)) return { ...taskDto(task), resultJson: task.result_json || null };
   let result;

@@ -80,6 +80,7 @@ class TaskDb {
     this.failSettings = false;
     this.afterSettingsRead = null;
     this.upload = null;
+    this.beforeOrphanUpdate = null;
   }
 
   prepare(sql) {
@@ -140,6 +141,11 @@ class TaskDb {
         else if (sql.startsWith('UPDATE video_tasks SET status')) {
           const task = db.tasks.find(({ id }) => id === (sql.includes('result_json') ? values[3] : values[2]));
           const guardedOrphanUpdate = sql.includes('remote_id IS NULL');
+          if (guardedOrphanUpdate && db.beforeOrphanUpdate) {
+            const hook = db.beforeOrphanUpdate;
+            db.beforeOrphanUpdate = null;
+            hook(task);
+          }
           const allowedStatuses = guardedOrphanUpdate ? values.slice(3) : null;
           if (!guardedOrphanUpdate || (task && task.remote_id == null && allowedStatuses.includes(task.status))) {
             task.status = values[0];
@@ -204,6 +210,23 @@ test('queued or generating legacy tasks without a remote id become unknown witho
     assert.equal(db.tasks[0].status, 'unknown');
     assert.equal(calls, 0);
   }
+});
+
+test('orphan transition returns the current task if finalization attaches a remote id concurrently', async () => {
+  const db = new TaskDb();
+  db.tasks.push({ id: 'orphan-race', remote_id: null, status: 'queued', result_json: null });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'orphan-race', created_at: 1 });
+  db.beforeOrphanUpdate = (task) => {
+    task.remote_id = 'remote-finalized';
+    task.status = 'queued';
+    task.result_json = '{"generationId":"remote-finalized"}';
+  };
+  let calls = 0;
+
+  const result = await getTaskStatus('orphan-race', 'project-1', taskEnv(db), fetch, async () => { calls += 1; });
+
+  assert.deepEqual(result, { id: 'orphan-race', remote_id: 'remote-finalized', status: 'queued', resultJson: '{"generationId":"remote-finalized"}' });
+  assert.equal(calls, 0);
 });
 
 test('writes paid-call intent before generation and uses a stable trace identifier', async () => {
