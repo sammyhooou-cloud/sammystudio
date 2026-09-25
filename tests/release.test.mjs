@@ -24,6 +24,16 @@ test('production build fingerprints the complete client module graph', async () 
   const assets = await readFile(new URL('../dist/server/site-assets.js', import.meta.url), 'utf8');
   assert.match(assets, new RegExp(appRoute.replaceAll('.', '\\.')));
   assert.match(assets, new RegExp(previewRoute.slice(1).replaceAll('.', '\\.')));
+  const { default: builtWorker } = await import(new URL(`../dist/server/worker.js?cache-test=${Date.now()}`, import.meta.url));
+
+  const appResponse = await builtWorker.fetch(new Request(`https://site.test${appRoute}`), {}, {});
+  assert.equal(appResponse.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+
+  const cssResponse = await builtWorker.fetch(new Request('https://site.test/styles.css'), {}, {});
+  assert.equal(cssResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
+
+  const imageResponse = await builtWorker.fetch(new Request('https://site.test/assets/alpine-runner.jpg'), {}, {});
+  assert.deepEqual(Buffer.from(await imageResponse.arrayBuffer()), await readFile(new URL('../public/assets/alpine-runner.jpg', import.meta.url)));
 });
 
 test('unversioned script and style responses require revalidation', async () => {

@@ -30,7 +30,7 @@ function siteAsset(pathname) {
   const asset = siteAssets.get(key);
   if (!asset) return null;
   const body = asset.base64 ? Uint8Array.from(atob(asset.body), (char) => char.charCodeAt(0)) : asset.body;
-  return new Response(body, { headers: { 'content-type': asset.type, 'cache-control': asset.base64 ? 'public, max-age=31536000, immutable' : 'no-cache, must-revalidate' } });
+  return new Response(body, { headers: { 'content-type': asset.type, 'cache-control': asset.immutable ? 'public, max-age=31536000, immutable' : 'no-cache, must-revalidate' } });
 }
 
 export function mutationRequestError(request) {

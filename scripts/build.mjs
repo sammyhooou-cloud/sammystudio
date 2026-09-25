@@ -21,18 +21,18 @@ await writeFile(`dist/client${appRoute}`, generatedApp);
 await writeFile(`dist/client${previewRoute}`, previewSource);
 
 const assets = [
-  ['/index.html', 'dist/client/index.html', 'text/html; charset=utf-8', false],
-  ['/styles.css', 'public/styles.css', 'text/css; charset=utf-8', false],
-  ['/project-navigation.css', 'public/project-navigation.css', 'text/css; charset=utf-8', false],
-  ['/image-preview.css', 'public/image-preview.css', 'text/css; charset=utf-8', false],
-  ['/task-history.css', 'public/task-history.css', 'text/css; charset=utf-8', false],
-  [appRoute, `dist/client${appRoute}`, 'text/javascript; charset=utf-8', false],
-  [previewRoute, `dist/client${previewRoute}`, 'text/javascript; charset=utf-8', false],
-  ['/assets/alpine-runner.jpg', 'public/assets/alpine-runner.jpg', 'image/jpeg', true],
+  ['/index.html', 'dist/client/index.html', 'text/html; charset=utf-8', false, false],
+  ['/styles.css', 'public/styles.css', 'text/css; charset=utf-8', false, false],
+  ['/project-navigation.css', 'public/project-navigation.css', 'text/css; charset=utf-8', false, false],
+  ['/image-preview.css', 'public/image-preview.css', 'text/css; charset=utf-8', false, false],
+  ['/task-history.css', 'public/task-history.css', 'text/css; charset=utf-8', false, false],
+  [appRoute, `dist/client${appRoute}`, 'text/javascript; charset=utf-8', false, true],
+  [previewRoute, `dist/client${previewRoute}`, 'text/javascript; charset=utf-8', false, true],
+  ['/assets/alpine-runner.jpg', 'public/assets/alpine-runner.jpg', 'image/jpeg', true, false],
 ];
 const rows = [];
-for (const [route, path, type, binary] of assets) {
+for (const [route, path, type, binary, immutable] of assets) {
   const value = await readFile(path);
-  rows.push([route, { type, base64: binary, body: binary ? value.toString('base64') : value.toString('utf8') }]);
+  rows.push([route, { type, base64: binary, immutable, body: binary ? value.toString('base64') : value.toString('utf8') }]);
 }
 await writeFile('dist/server/site-assets.js', `export const siteAssets = new Map(${JSON.stringify(rows)});\n`);
