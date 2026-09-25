@@ -1,7 +1,7 @@
 import { createSession, deleteSession, requireSession, unauthorized } from './auth.js';
 import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
-import { submitTask, getTaskStatus, TaskError } from './tasks.js';
+import { submitTask, getTaskStatus, getTaskByAttempt, TaskError } from './tasks.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
 import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
@@ -155,6 +155,13 @@ async function api(request, env) {
     } catch (error) {
       if (error instanceof TaskError) return json({ error: error.message, ...(error.task ? { task: error.task } : {}) }, error.status);
       return json({ error: '任务处理失败' }, 500);
+    }
+  }
+  if (url.pathname === '/api/video/tasks/attempt' && request.method === 'GET') {
+    try { return json(await getTaskByAttempt(url.searchParams.get('projectId'), request.headers.get('idempotency-key'), env)); }
+    catch (error) {
+      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      return json({ error: '任务状态暂不可用' }, 503);
     }
   }
   const taskMatch = url.pathname.match(/^\/api\/video\/tasks\/([^/]+)$/);

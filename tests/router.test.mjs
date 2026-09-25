@@ -175,6 +175,24 @@ test('task status route requires authentication and project ownership', async ()
   assert.equal(anonymous.status, 401);
 });
 
+test('attempt lookup finds only the owned task by stable key without a paid tool call', async () => {
+  const db = new TaskRouteDb();
+  db.tasks.push({ id: 'task-1', idempotency_key: JSON.stringify(['project-1', 'stable-key']), remote_id: 'remote-1', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
+  const runtime = { DB: db, MEDIA: { get: async () => null } };
+  const url = 'https://site.test/api/video/tasks/attempt?projectId=project-1';
+  const found = await worker.fetch(new Request(url, { headers: { ...sessionHeaders, 'idempotency-key': 'stable-key' } }), runtime, {});
+  assert.equal(found.status, 200);
+  assert.equal((await found.json()).id, 'task-1');
+  assert.equal(db.statusQueries, 0);
+  const missing = await worker.fetch(new Request(url, { headers: { ...sessionHeaders, 'idempotency-key': 'other-key' } }), runtime, {});
+  assert.equal(missing.status, 404);
+  const foreign = await worker.fetch(new Request('https://site.test/api/video/tasks/attempt?projectId=project-2', { headers: { ...sessionHeaders, 'idempotency-key': 'stable-key' } }), runtime, {});
+  assert.equal(foreign.status, 404);
+  const anonymous = await worker.fetch(new Request(url, { headers: { 'idempotency-key': 'stable-key' } }), runtime, {});
+  assert.equal(anonymous.status, 401);
+});
+
 function taskRequest(projectId, idempotencyKey = 'shared-key') {
   return new Request('https://site.test/api/video/tasks', {
     method: 'POST',

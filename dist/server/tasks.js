@@ -250,3 +250,12 @@ export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCal
   await env.DB.prepare('UPDATE video_tasks SET status = ?, result_json = ?, updated_at = ? WHERE id = ? AND status IN (?, ?)').bind(status, resultJson, Date.now(), id, 'queued', 'generating').run();
   return { id, remote_id: task.remote_id, status, resultJson };
 }
+
+export async function getTaskByAttempt(projectId, key, env) {
+  if (!projectId || !key) throw new TaskError('任务参数无效', 400);
+  const internalKey = JSON.stringify([projectId, key]);
+  const sql = 'SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?';
+  const task = await env.DB.prepare(sql).bind(internalKey, projectId).first() || await env.DB.prepare(sql).bind(key, projectId).first();
+  if (!task) throw new TaskError('任务不存在', 404);
+  return replayTask(task, env, projectId);
+}

@@ -28,6 +28,8 @@ import {
   commitProjectWorkspace,
   refreshAccountSnapshot,
   createSubmissionAttemptController,
+  createActiveTaskPoller,
+  pendingWorkspaceSettings,
   createProjectDrafts,
   nextPollDelay,
   shouldSaveStaleUpload,
@@ -43,20 +45,79 @@ test('double submit is locked immediately and ambiguous retry reuses the same ke
   attempts.settle(first, false);
   assert.equal(attempts.begin({ projectId: 'a', prompt: 'ocean' }).key, first.key);
   attempts.settle(first, false);
-  const changed = attempts.begin({ projectId: 'a', prompt: 'forest' });
-  assert.notEqual(changed.key, first.key);
-  attempts.settle(changed, true);
-  assert.equal(attempts.begin({ projectId: 'a', prompt: 'forest' }).key, 'key-3');
+  assert.equal(attempts.begin({ projectId: 'a', prompt: 'forest' }), null);
+  assert.equal(next, 1);
+  attempts.settle(first, true);
+  assert.equal(attempts.begin({ projectId: 'a', prompt: 'forest' }).key, 'key-2');
 });
 
 test('an unresolved attempt keeps its key across a tab reload', () => {
   const values = new Map();
   const storage = { getItem: (key) => values.get(key) || null, setItem: (key, value) => values.set(key, value) };
   const first = createSubmissionAttemptController(() => 'original-key', storage);
-  const attempt = first.begin({ projectId: 'p', prompt: 'scene' });
+  const payload = { projectId: 'p', mode: 'image', model: 'image-pro', prompt: 'scene', resolution: '1080p', duration: '5', aspectRatio: '16:9', imageCount: 1, uploadId: 'asset-1', token: 'never-persist' };
+  const attempt = first.begin(payload);
   first.settle(attempt, false);
   const reloaded = createSubmissionAttemptController(() => 'new-key', storage);
-  assert.equal(reloaded.begin({ projectId: 'p', prompt: 'scene' }).key, 'original-key');
+  assert.deepEqual(pendingWorkspaceSettings(reloaded, 'p', [{ id: 'asset-1' }], capabilities), { mode: 'image', model: 'image-pro', prompt: 'scene', resolution: '1080p', duration: '5', aspectRatio: '16:9', imageCount: 1, uploadId: 'asset-1' });
+  assert.equal(reloaded.begin(payload).key, 'original-key');
+  assert.equal(reloaded.begin({ ...payload, prompt: 'different' }), null);
+  assert.equal(values.get('klingPendingAttempts').includes('never-persist'), false);
+  reloaded.resolve(reloaded.pendingForProject('p'));
+  assert.equal(reloaded.pendingForProject('p'), null);
+});
+
+test('unresolved image submission requires the same project asset on reload', () => {
+  const attempts = createSubmissionAttemptController(() => 'key');
+  attempts.settle(attempts.begin({ projectId: 'p', mode: 'image', uploadId: 'asset-1' }), false);
+  assert.equal(pendingWorkspaceSettings(attempts, 'p', [], capabilities).uploadId, '');
+});
+
+test('poller continues older active task after newer task completes', async () => {
+  const timers = new Map(); let nextTimer = 0;
+  const schedule = (fn, ms) => { assert.ok(ms >= 3000 && ms <= 30000); const id = ++nextTimer; timers.set(id, fn); return id; };
+  const cancel = (id) => timers.delete(id);
+  const runNext = async () => { const [id, fn] = timers.entries().next().value; timers.delete(id); await fn(); };
+  let tasks = [{ id: 'b', status: 'queued' }, { id: 'a', status: 'queued' }];
+  const calls = [];
+  const poller = createActiveTaskPoller({
+    load: async (_projectId, id) => { calls.push(id); return { id, status: 'succeeded' }; },
+    onUpdate: (task) => { tasks = tasks.map((row) => row.id === task.id ? task : row); poller.sync('p', tasks); },
+    schedule, cancel,
+  });
+  poller.sync('p', tasks);
+  await runNext();
+  assert.deepEqual(calls, ['b']);
+  assert.equal(timers.size, 1);
+  await runNext();
+  assert.deepEqual(calls, ['b', 'a']);
+  assert.equal(timers.size, 0);
+});
+
+test('poller discards stale project responses and prioritizes a selected active task', async () => {
+  const timers = new Map(); let nextTimer = 0; let release;
+  const schedule = (fn) => { const id = ++nextTimer; timers.set(id, fn); return id; };
+  const cancel = (id) => timers.delete(id);
+  const calls = [], updates = [];
+  const poller = createActiveTaskPoller({
+    load: async (projectId, id) => {
+      calls.push([projectId, id]);
+      if (projectId === 'old') await new Promise((resolve) => { release = resolve; });
+      return { id, status: 'succeeded' };
+    },
+    onUpdate: (task) => { updates.push(task.id); poller.sync('new', [{ id: 'a', status: 'succeeded' }, { id: 'b', status: 'succeeded' }]); },
+    schedule, cancel,
+  });
+  poller.sync('old', [{ id: 'old-task', status: 'queued' }]);
+  const oldTimer = timers.entries().next().value; timers.delete(oldTimer[0]);
+  const inflight = oldTimer[1]();
+  poller.sync('new', [{ id: 'a', status: 'queued' }, { id: 'b', status: 'queued' }]);
+  poller.prioritize('b');
+  release(); await inflight;
+  assert.deepEqual(updates, []);
+  const newTimer = timers.entries().next().value; timers.delete(newTimer[0]); await newTimer[1]();
+  assert.deepEqual(calls, [['old', 'old-task'], ['new', 'b']]);
+  assert.deepEqual(updates, ['b']);
 });
 
 test('session drafts restore per-project controls including upload removal', () => {

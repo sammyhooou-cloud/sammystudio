@@ -29,7 +29,7 @@ export async function getKlingStatus(env, fetcher = fetch) {
     const identity = toolData(await callTool(env, 'who_am_i', {}, fetcher));
     const credits = toolData(await callTool(env, 'query_membership_and_credits', {}, fetcher));
     const models = Object.fromEntries(Object.entries(identity.availableModels || {}).map(([key, value]) => [key, Array.isArray(value) ? { models: value } : value]));
-    return { connection: 'online', membership: credits.membership ?? credits.member ?? null, credits: credits.credits ?? credits.balance ?? null, models, checkedAt: new Date().toISOString() };
+    return { connection: 'online', membership: credits.membershipType ?? credits.membership ?? credits.member ?? null, credits: credits.availableRemainCredits ?? credits.credits ?? credits.balance ?? null, models, checkedAt: new Date().toISOString() };
   } catch (error) {
     return { connection: 'offline', membership: null, credits: null, models: {}, checkedAt: new Date().toISOString(), message: error.message === 'not_authorized' ? '请连接可灵 MCP' : '可灵 MCP 暂不可用' };
   }

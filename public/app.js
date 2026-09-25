@@ -51,28 +51,89 @@ export function createSubmissionAttemptController(keyFactory = () => crypto.rand
   const storageKey = 'klingPendingAttempts';
   let saved = [];
   try { const value = JSON.parse(storage?.getItem(storageKey) || '[]'); if (Array.isArray(value)) saved = value; } catch {}
-  const pending = new Map(saved.filter((entry) => Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'string'));
+  const cleanPayload = (value) => buildGenerationPayload(value);
+  const pending = new Map();
+  for (const entry of saved) {
+    // Accept the previous signature/key format without persisting arbitrary fields.
+    const payload = Array.isArray(entry) ? (() => { try { return JSON.parse(entry[0]); } catch { return null; } })() : entry?.payload;
+    const key = Array.isArray(entry) ? entry[1] : entry?.key;
+    if (payload && typeof payload.projectId === 'string' && payload.projectId && typeof key === 'string' && key) {
+      const safe = cleanPayload(payload);
+      pending.set(safe.projectId, { key, payload: safe, signature: JSON.stringify(safe) });
+    }
+  }
   let inFlight = false;
-  const persist = () => { try { storage?.setItem(storageKey, JSON.stringify([...pending])); } catch {} };
+  const persist = () => { try { storage?.setItem(storageKey, JSON.stringify([...pending.values()].map(({ key, payload }) => ({ key, payload })))); } catch {} };
   return {
     get inFlight() { return inFlight; },
+    pendingForProject(projectId) { const attempt = pending.get(projectId); return attempt ? { ...attempt, payload: { ...attempt.payload } } : null; },
     begin(payload) {
       if (inFlight) return null;
-      const signature = JSON.stringify(payload);
-      const key = pending.get(signature) || keyFactory();
-      pending.set(signature, key);
+      const safe = cleanPayload(payload);
+      const signature = JSON.stringify(safe);
+      const existing = pending.get(safe.projectId);
+      if (existing && existing.signature !== signature) return null;
+      const key = existing?.key || keyFactory();
+      pending.set(safe.projectId, { key, signature, payload: safe });
       persist();
       inFlight = true;
-      return { key, signature, payload };
+      return { key, signature, payload: safe };
     },
     settle(attempt, definitiveSuccess) {
       inFlight = false;
-      if (definitiveSuccess && pending.get(attempt.signature) === attempt.key) { pending.delete(attempt.signature); persist(); }
+      if (definitiveSuccess && pending.get(attempt.payload.projectId)?.key === attempt.key) { pending.delete(attempt.payload.projectId); persist(); }
+    },
+    resolve(attempt) {
+      if (attempt && pending.get(attempt.payload.projectId)?.key === attempt.key) { pending.delete(attempt.payload.projectId); persist(); }
     },
   };
 }
 
+export function pendingWorkspaceSettings(attempts, projectId, assets = [], capabilities = {}) {
+  const pending = attempts.pendingForProject(projectId);
+  if (!pending) return null;
+  const settings = workspaceFormState(capabilities, 'text', pending.payload);
+  return { ...settings, uploadId: workspaceImageState(projectId, pending.payload, assets)?.asset.id || '' };
+}
+
 export function nextPollDelay(current, success) { return success ? 3000 : Math.min(Math.max(current, 3000) * 2, 30000); }
+export function createActiveTaskPoller({ load, onUpdate, schedule = setTimeout, cancel = clearTimeout }) {
+  let projectId = '', activeIds = [], timer = null, inFlight = false, generation = 0, nextIndex = 0, delay = 3000;
+  const active = (task) => ['queued', 'generating', 'submitting'].includes(task.status);
+  const scheduleNext = () => {
+    if (!timer && !inFlight && activeIds.length) timer = schedule(tick, delay);
+  };
+  const tick = async () => {
+    timer = null;
+    if (!activeIds.length || inFlight) return;
+    inFlight = true;
+    const selectedId = activeIds[nextIndex % activeIds.length];
+    const selectedIndex = nextIndex % activeIds.length;
+    const selectedProject = projectId;
+    const selectedGeneration = generation;
+    try {
+      const task = await load(selectedProject, selectedId);
+      if (selectedGeneration === generation && selectedProject === projectId) {
+        onUpdate(task);
+        delay = nextPollDelay(delay, true);
+        nextIndex = activeIds.includes(selectedId) ? (activeIds.indexOf(selectedId) + 1) % activeIds.length : Math.min(selectedIndex, Math.max(activeIds.length - 1, 0));
+      }
+    } catch {
+      if (selectedGeneration === generation) delay = nextPollDelay(delay, false);
+      if (activeIds.length) nextIndex = (selectedIndex + 1) % activeIds.length;
+    } finally { inFlight = false; scheduleNext(); }
+  };
+  return {
+    sync(nextProjectId, tasks) {
+      if (nextProjectId !== projectId) { generation += 1; if (timer) cancel(timer); timer = null; projectId = nextProjectId; delay = 3000; nextIndex = 0; }
+      activeIds = nextProjectId ? tasks.filter(active).map(({ id }) => id).filter(Boolean) : [];
+      if (!activeIds.length && timer) { cancel(timer); timer = null; }
+      scheduleNext();
+    },
+    prioritize(taskId) { const index = activeIds.indexOf(taskId); if (index >= 0) nextIndex = index; },
+    stop() { generation += 1; if (timer) cancel(timer); timer = null; projectId = ''; activeIds = []; nextIndex = 0; delay = 3000; },
+  };
+}
 export function shouldSaveStaleUpload(startProjectEpoch, currentProjectEpoch) { return startProjectEpoch !== currentProjectEpoch; }
 export function sidebarShouldBeInert(open, mobile) { return mobile && !open; }
 
@@ -258,7 +319,7 @@ function setup() {
   let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, projectEpoch = 0;
   const drafts = createProjectDrafts();
   const attempts = createSubmissionAttemptController(undefined, attemptStorage());
-  let pollTimer = null, pollSequence = 0, polledTaskKey = '';
+  let selectedTaskId = '';
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
@@ -293,26 +354,36 @@ function setup() {
   }
   function saveDraft() { drafts.save(currentProjectId, draftSnapshot()); }
 
-  function stopPolling() { if (pollTimer) clearTimeout(pollTimer); pollTimer = null; polledTaskKey = ''; pollSequence += 1; }
-  function pollActiveTask() {
-    const task = projectTasks[0];
-    if (!task || !['queued', 'generating', 'submitting'].includes(task.status)) { stopPolling(); return; }
-    const key = `${currentProjectId}:${task.id}`;
-    if (polledTaskKey === key) return;
-    stopPolling(); polledTaskKey = key;
-    const sequence = pollSequence; const projectId = currentProjectId;
-    let delay = 3000;
-    const tick = async () => {
-      if (sequence !== pollSequence || currentProjectId !== projectId) return;
-      try {
-        const updated = await request(`/api/video/tasks/${encodeURIComponent(task.id)}?projectId=${encodeURIComponent(projectId)}`);
-        if (sequence !== pollSequence || currentProjectId !== projectId) return;
-        projectTasks = projectTasks.map((item) => item.id === task.id ? { ...item, remoteId: updated.remote_id, status: updated.status, resultJson: updated.resultJson ?? item.resultJson, updatedAt: Date.now() } : item);
-        delay = nextPollDelay(delay, true); renderTasks();
-      } catch { delay = nextPollDelay(delay, false); }
-      if (sequence === pollSequence && polledTaskKey === key) pollTimer = setTimeout(tick, delay);
-    };
-    pollTimer = setTimeout(tick, delay);
+  const poller = createActiveTaskPoller({
+    load: (projectId, id) => request(`/api/video/tasks/${encodeURIComponent(id)}?projectId=${encodeURIComponent(projectId)}`),
+    onUpdate: (updated) => {
+      projectTasks = projectTasks.map((item) => item.id === updated.id ? { ...item, remoteId: updated.remote_id, status: updated.status, resultJson: updated.resultJson ?? item.resultJson, updatedAt: Date.now() } : item);
+      renderTasks();
+    },
+  });
+
+  function renderPendingAttemptState() {
+    if (!attempts.pendingForProject(currentProjectId)) return;
+    document.querySelector('#task-state').textContent = '待确认提交';
+    document.querySelector('#form-error').textContent = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对可灵任务；不要更改设置后重复提交。';
+  }
+
+  async function reconcilePendingAttempt(projectId, sequence) {
+    const pending = attempts.pendingForProject(projectId);
+    if (!pending) return;
+    try {
+      const task = await request(`/api/video/tasks/attempt?projectId=${encodeURIComponent(projectId)}`, { headers: { 'idempotency-key': pending.key } });
+      if (sequence !== workspaceLoadSequence || projectId !== currentProjectId) return;
+      if (task.remote_id || ['succeeded', 'failed'].includes(task.status)) {
+        attempts.resolve(pending);
+        document.querySelector('#form-error').textContent = '';
+        const row = { id: task.id, remoteId: task.remote_id, status: task.status, mode: pending.payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() };
+        projectTasks = projectTasks.some(({ id }) => id === task.id)
+          ? projectTasks.map((item) => item.id === task.id ? { ...item, remoteId: task.remote_id, status: task.status } : item)
+          : prependProjectTask(projectId, projectId, projectTasks, row);
+        renderTasks();
+      }
+    } catch { /* Absence or temporary lookup failure keeps the stable key for explicit retry. */ }
   }
 
   function setProjectSwitchBusy(busy) {
@@ -384,7 +455,8 @@ function setup() {
   }
 
   function applyWorkspace(workspaceState) {
-    const settings = drafts.load(currentProjectId, workspaceState?.settings || {});
+    const pendingSettings = pendingWorkspaceSettings(attempts, currentProjectId, workspaceState?.assets, capabilities);
+    const settings = pendingSettings || drafts.load(currentProjectId, workspaceState?.settings || {});
     const state = workspaceFormState(capabilities, mode, settings);
     mode = state.mode;
     document.querySelectorAll('[data-mode]').forEach((button) => {
@@ -405,7 +477,9 @@ function setup() {
     if (restoredImage && mode === 'image') uploadController.restore(restoredImage.asset, restoredImage.url);
     else clearImage();
     projectTasks = Array.isArray(workspaceState?.tasks) ? workspaceState.tasks : [];
+    selectedTaskId = '';
     renderTasks();
+    renderPendingAttemptState();
   }
 
   function renderTasks() {
@@ -419,15 +493,16 @@ function setup() {
       const item = document.createElement('button'); item.type = 'button'; item.className = 'task-history-item';
       const id = document.createElement('strong'); id.textContent = task.id || '未知任务';
       const status = document.createElement('span'); status.textContent = task.status || '未知状态';
-      item.append(id, status); item.onclick = () => renderSelectedTask(task); history.append(item);
+      item.append(id, status); item.onclick = () => { selectedTaskId = task.id; renderSelectedTask(task); renderPendingAttemptState(); poller.prioritize(task.id); }; history.append(item);
     }
     if (!state.current) {
       empty.hidden = false; progress.hidden = true; clearVideoElement(video);
       document.querySelector('#task-state').textContent = '等待提交'; document.querySelector('#task-id').textContent = '';
-      pollActiveTask(); return;
+      poller.sync(currentProjectId, projectTasks); renderPendingAttemptState(); return;
     }
-    renderSelectedTask(state.current);
-    pollActiveTask();
+    renderSelectedTask(state.tasks.find(({ id }) => id === selectedTaskId) || state.current);
+    poller.sync(currentProjectId, projectTasks);
+    renderPendingAttemptState();
   }
 
   function renderSelectedTask(task) {
@@ -472,11 +547,12 @@ function setup() {
       commit: (workspaceState) => {
         if (sequence !== workspaceLoadSequence) return;
         commitProjectWorkspace(
-          () => { generationSequence += 1; stopPolling(); },
+          () => { generationSequence += 1; poller.stop(); },
           () => {
             setCurrentProjectId(project.id);
             storeCurrentProjectId(projectStorage(), project.id);
             applyWorkspace(workspaceState);
+            void reconcilePendingAttempt(project.id, sequence);
             renderProjects();
             projectError.textContent = '';
             setProjectSwitchBusy(false);
@@ -600,6 +676,12 @@ function setup() {
     if (projectSwitchBusy || attempts.inFlight) return;
     const submittedProjectId = currentProjectId;
     const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount });
+    const pending = attempts.pendingForProject(submittedProjectId);
+    if (pending && JSON.stringify(pending.payload) !== JSON.stringify(payload)) {
+      document.querySelector('#form-error').textContent = '上次提交待确认；请恢复原设置并使用原请求重试，不能以新设置再次提交。';
+      document.querySelector('#task-state').textContent = '待确认提交';
+      return;
+    }
     const errors = validateWorkspace(payload);
     if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; }
     const attempt = attempts.begin(payload);
@@ -614,20 +696,22 @@ function setup() {
     document.querySelector('#task-state').textContent = '正在提交';
     try {
       const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': attempt.key }, body: JSON.stringify(payload) });
-      attempts.settle(attempt, Boolean(task.remote_id));
+      attempts.settle(attempt, Boolean(task.remote_id || task.status === 'succeeded' || task.status === 'failed'));
       if (submissionIsCurrent()) {
         projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
         renderTasks();
+        renderPendingAttemptState();
         void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {});
       }
     } catch (error) {
-      attempts.settle(attempt, false);
+      attempts.settle(attempt, error.task?.status === 'failed' || [400, 403, 404, 422].includes(error.status));
       if (submissionIsCurrent()) {
         document.querySelector('#form-error').textContent = error.message;
         if (error.task?.id) {
           projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: error.task.id, remoteId: error.task.remote_id, status: error.task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
           renderTasks();
-        } else document.querySelector('#task-state').textContent = '提交结果待确认';
+        } else document.querySelector('#task-state').textContent = attempts.pendingForProject(submittedProjectId) ? '提交结果待确认' : '提交失败';
+        renderPendingAttemptState();
       }
     } finally { updateSubmitDisabled(); }
   };
