@@ -50,6 +50,40 @@ test('new active task owns the stage while older playable success remains comple
   assert.deepEqual(state.completed, [{ task: tasks[1], videoUrl: 'https://cdn.example/old.mp4' }]);
 });
 
+test('selecting an older playable success keeps the newer task out of the video stage', () => {
+  const tasks = [
+    { id: 'new', status: 'queued', resultJson: '{"progress":20}' },
+    { id: 'old', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/old.mp4"}' },
+  ];
+  const state = taskPresentationState(tasks, 'old');
+  assert.equal(state.current, tasks[1]);
+  assert.equal(state.kind, 'video');
+  assert.equal(state.videoUrl, 'https://cdn.example/old.mp4');
+  assert.equal(state.progress, null);
+  assert.deepEqual(state.completed.map(({ task }) => task.id), ['old']);
+});
+
+test('unknown selection falls back to the first task and empty tasks are safe', () => {
+  const first = { id: 'first', status: 'queued', resultJson: null };
+  const state = taskPresentationState([first], 'missing');
+  assert.equal(state.current, first);
+  assert.equal(state.kind, 'active');
+  assert.deepEqual(taskPresentationState([], 'missing'), {
+    tasks: [], current: null, kind: 'empty', videoUrl: '', progress: null, completed: [],
+  });
+  assert.equal(taskPresentationState(null).kind, 'empty');
+});
+
+test('malformed task results do not crash active or terminal presentation', () => {
+  const active = taskPresentationState([{ id: 'a', status: 'generating', resultJson: '{broken' }]);
+  assert.equal(active.kind, 'active');
+  assert.equal(active.progress, null);
+  const terminal = taskPresentationState([{ id: 'b', status: 'succeeded', resultJson: '{broken' }]);
+  assert.equal(terminal.kind, 'terminal');
+  assert.equal(terminal.videoUrl, '');
+  assert.deepEqual(terminal.completed, []);
+});
+
 test('presentation state exposes explicit provider progress and a successful video URL', () => {
   const active = { id: 'new', status: 'generating', resultJson: '{"data":{"progress":42}}' };
   assert.equal(taskPresentationState([active]).progress, 42);

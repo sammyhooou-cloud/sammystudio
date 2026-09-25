@@ -367,7 +367,7 @@ function setup() {
   let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, projectEpoch = 0;
   const drafts = createProjectDrafts();
   const attempts = createSubmissionAttemptController(undefined, attemptStorage());
-  let selectedTaskId = '';
+  let selectedTaskId = '', submittingWithoutTask = false;
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
@@ -412,7 +412,6 @@ function setup() {
 
   function renderPendingAttemptState() {
     if (!attempts.pendingForProject(currentProjectId)) return;
-    document.querySelector('#task-state').textContent = '待确认提交';
     document.querySelector('#form-error').textContent = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对可灵任务；不要更改设置后重复提交。';
   }
 
@@ -526,41 +525,82 @@ function setup() {
     else clearImage();
     projectTasks = Array.isArray(workspaceState?.tasks) ? workspaceState.tasks : [];
     selectedTaskId = '';
+    submittingWithoutTask = false;
     renderTasks();
     renderPendingAttemptState();
   }
 
   function renderTasks() {
-    const state = workspaceTaskState(projectTasks);
-    const empty = document.querySelector('#result-empty');
-    const progress = document.querySelector('#result-progress');
-    const video = document.querySelector('#result-video');
+    const state = taskPresentationState(projectTasks, selectedTaskId);
     const history = document.querySelector('#task-history');
+    const historyWrap = document.querySelector('#task-history-wrap');
     history.replaceChildren();
-    for (const task of state.tasks) {
+    state.completed.forEach(({ task }, index) => {
       const item = document.createElement('button'); item.type = 'button'; item.className = 'task-history-item';
-      const id = document.createElement('strong'); id.textContent = task.id || '未知任务';
-      const status = document.createElement('span'); status.textContent = task.status || '未知状态';
-      item.append(id, status); item.onclick = () => { selectedTaskId = task.id; renderSelectedTask(task); renderPendingAttemptState(); poller.prioritize(task.id); }; history.append(item);
-    }
-    if (!state.current) {
-      empty.hidden = false; progress.hidden = true; clearVideoElement(video);
-      document.querySelector('#task-state').textContent = '等待提交'; document.querySelector('#task-id').textContent = '';
-      poller.sync(currentProjectId, projectTasks); renderPendingAttemptState(); return;
-    }
-    renderSelectedTask(state.tasks.find(({ id }) => id === selectedTaskId) || state.current);
+      const label = document.createElement('strong'); label.textContent = `完成片段 ${String(index + 1).padStart(2, '0')}`;
+      const action = document.createElement('span'); action.textContent = '播放';
+      item.title = task.id || '';
+      item.classList.toggle('active', state.current === task);
+      item.append(label, action);
+      item.onclick = () => { selectedTaskId = task.id; submittingWithoutTask = false; renderTasks(); };
+      history.append(item);
+    });
+    historyWrap.hidden = state.completed.length === 0;
+    if (submittingWithoutTask) showSubmittingStage();
+    else renderSelectedTask(state);
     poller.sync(currentProjectId, projectTasks);
     renderPendingAttemptState();
   }
 
-  function renderSelectedTask(task) {
-    const state = workspaceTaskState([task]);
-    document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false;
-    document.querySelector('#task-state').textContent = task.status === 'unknown' ? '状态待核对' : task.status || '未知状态';
-    document.querySelector('#task-id').textContent = task.status === 'unknown' ? `任务 ${task.id || '—'}：提交结果未知，请勿重复创建。` : `任务 ${task.id || '—'}`;
+  function clearResultStage() {
+    document.querySelector('#result-empty').hidden = true;
+    document.querySelector('#result-progress').hidden = true;
+    document.querySelector('#result-terminal').hidden = true;
+    document.querySelector('#task-progress').hidden = true;
+    document.querySelector('#task-progress').textContent = '';
+    document.querySelector('#task-id').textContent = '';
     const video = document.querySelector('#result-video');
     clearVideoElement(video);
-    if (state.videoUrl) { video.src = state.videoUrl; video.hidden = false; }
+    return video;
+  }
+
+  function showSubmittingStage() {
+    clearResultStage();
+    document.querySelector('#result-progress').hidden = false;
+    document.querySelector('#generation-title').textContent = '正在提交';
+    document.querySelector('#task-state').textContent = '正在提交';
+  }
+
+  function renderSelectedTask(state) {
+    const video = clearResultStage();
+    const status = document.querySelector('#task-state');
+    if (state.kind === 'empty') {
+      document.querySelector('#result-empty').hidden = false;
+      status.textContent = '等待提交';
+    } else if (state.kind === 'active') {
+      document.querySelector('#result-progress').hidden = false;
+      document.querySelector('#generation-title').textContent = '生成中';
+      document.querySelector('#task-id').textContent = `任务 ${state.current.id || '—'}`;
+      if (state.progress !== null) {
+        const progress = document.querySelector('#task-progress');
+        progress.textContent = `${state.progress}%`;
+        progress.hidden = false;
+      }
+      status.textContent = '生成中';
+    } else if (state.kind === 'video') {
+      video.src = state.videoUrl;
+      video.hidden = false;
+      status.textContent = '已完成';
+    } else {
+      const failed = taskStatus(state.current) === 'failed';
+      const title = failed ? '生成失败' : '状态待核对';
+      document.querySelector('#terminal-title').textContent = title;
+      document.querySelector('#terminal-copy').textContent = failed
+        ? '任务未能完成，请检查任务后重试。'
+        : '任务暂无可播放视频，请核对任务状态后再提交。';
+      document.querySelector('#result-terminal').hidden = false;
+      status.textContent = title;
+    }
   }
 
   function showProjectLoadError(error) {
@@ -727,7 +767,6 @@ function setup() {
     const pending = attempts.pendingForProject(submittedProjectId);
     if (pending && JSON.stringify(pending.payload) !== JSON.stringify(payload)) {
       document.querySelector('#form-error').textContent = '上次提交待确认；请恢复原设置并使用原请求重试，不能以新设置再次提交。';
-      document.querySelector('#task-state').textContent = '待确认提交';
       return;
     }
     const errors = validateWorkspace(payload);
@@ -739,14 +778,16 @@ function setup() {
     const submissionToken = ++generationSequence;
     const submissionIsCurrent = () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence);
     document.querySelector('#form-error').textContent = '';
-    document.querySelector('#result-empty').hidden = true;
-    document.querySelector('#result-progress').hidden = false;
-    document.querySelector('#task-state').textContent = '正在提交';
+    selectedTaskId = '';
+    submittingWithoutTask = true;
+    showSubmittingStage();
     try {
       const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': attempt.key }, body: JSON.stringify(payload) });
       attempts.settle(attempt, Boolean(task.remote_id || task.status === 'succeeded' || task.status === 'failed'));
       if (submissionIsCurrent()) {
         projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+        selectedTaskId = task.id || '';
+        submittingWithoutTask = false;
         renderTasks();
         renderPendingAttemptState();
         void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {});
@@ -754,11 +795,22 @@ function setup() {
     } catch (error) {
       attempts.settle(attempt, error.task?.status === 'failed' || [400, 403, 404, 422].includes(error.status));
       if (submissionIsCurrent()) {
+        submittingWithoutTask = false;
         document.querySelector('#form-error').textContent = error.message;
         if (error.task?.id) {
           projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: error.task.id, remoteId: error.task.remote_id, status: error.task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+          selectedTaskId = error.task.id;
           renderTasks();
-        } else document.querySelector('#task-state').textContent = attempts.pendingForProject(submittedProjectId) ? '提交结果待确认' : '提交失败';
+        } else {
+          clearResultStage();
+          document.querySelector('#result-terminal').hidden = false;
+          const pendingAttempt = attempts.pendingForProject(submittedProjectId);
+          document.querySelector('#terminal-title').textContent = pendingAttempt ? '状态待核对' : '提交失败';
+          document.querySelector('#terminal-copy').textContent = pendingAttempt
+            ? '提交结果尚未确认，请核对任务后再试。'
+            : '提交未能完成，请检查输入后重试。';
+          document.querySelector('#task-state').textContent = pendingAttempt ? '状态待核对' : '提交失败';
+        }
         renderPendingAttemptState();
       }
     } finally { updateSubmitDisabled(); }
