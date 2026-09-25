@@ -291,6 +291,10 @@ export function resolveResultStage(baseState, stageOverride = null) {
   return stageOverride ?? baseState;
 }
 
+export function selectedCompletedTaskId(stageState) {
+  return stageState?.kind === 'video' ? stageState.current?.id || '' : '';
+}
+
 export function isCurrentSubmission(activeProjectId, submittedProjectId, token, latestToken) {
   return Boolean(submittedProjectId) && activeProjectId === submittedProjectId && token === latestToken;
 }
@@ -547,6 +551,8 @@ function setup() {
 
   function renderTasks() {
     const state = taskPresentationState(projectTasks, selectedTaskId);
+    const visibleStage = submittingWithoutTask ? { kind: 'submitting' } : resolveResultStage(state, stageOverride);
+    const selectedHistoryId = selectedCompletedTaskId(visibleStage);
     const history = document.querySelector('#task-history');
     const historyWrap = document.querySelector('#task-history-wrap');
     const focusedTaskId = history.contains(document.activeElement) ? document.activeElement.dataset.taskId : '';
@@ -557,8 +563,9 @@ function setup() {
       const action = document.createElement('span'); action.textContent = '播放';
       item.title = task.id || '';
       item.dataset.taskId = task.id || '';
-      item.classList.toggle('active', state.current === task);
-      item.setAttribute('aria-pressed', String(selectedTaskId === task.id));
+      const selected = Boolean(selectedHistoryId) && selectedHistoryId === task.id;
+      item.classList.toggle('active', selected);
+      item.setAttribute('aria-pressed', String(selected));
       item.append(label, action);
       item.onclick = () => { selectedTaskId = task.id; stageOverride = null; submittingWithoutTask = false; renderTasks(); };
       history.append(item);
@@ -566,7 +573,7 @@ function setup() {
     historyWrap.hidden = state.completed.length === 0;
     if (focusedTaskId) [...history.children].find((item) => item.dataset.taskId === focusedTaskId)?.focus();
     if (submittingWithoutTask) showSubmittingStage();
-    else renderSelectedTask(resolveResultStage(state, stageOverride));
+    else renderSelectedTask(visibleStage);
     poller.sync(currentProjectId, projectTasks);
     renderPendingAttemptState();
   }

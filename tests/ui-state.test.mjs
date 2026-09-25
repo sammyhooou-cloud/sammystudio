@@ -64,6 +64,17 @@ test('selecting an older playable success keeps the newer task out of the video 
   assert.deepEqual(state.completed.map(({ task }) => task.id), ['old']);
 });
 
+test('completed history selection follows the video actually shown in the stage', () => {
+  assert.equal(typeof stageHelpers.selectedCompletedTaskId, 'function');
+  const clip = { id: 'clip', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/clip.mp4"}' };
+  const defaultVideo = taskPresentationState([clip], '');
+  assert.equal(stageHelpers.selectedCompletedTaskId(defaultVideo), 'clip');
+  assert.equal(stageHelpers.selectedCompletedTaskId(stageHelpers.resolveResultStage(defaultVideo, { kind: 'terminal' })), '');
+  assert.equal(stageHelpers.selectedCompletedTaskId({ kind: 'submitting' }), '');
+  assert.equal(stageHelpers.selectedCompletedTaskId(taskPresentationState([{ id: 'new', status: 'queued' }, clip])), '');
+  assert.equal(stageHelpers.selectedCompletedTaskId(taskPresentationState([{ id: 'new', status: 'queued' }, clip], 'clip')), 'clip');
+});
+
 test('unknown selection falls back to the first task and empty tasks are safe', () => {
   const first = { id: 'first', status: 'queued', resultJson: null };
   const state = taskPresentationState([first], 'missing');
