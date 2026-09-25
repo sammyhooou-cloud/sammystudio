@@ -1,8 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import worker, { sanitizeFilename } from '../src/worker.js';
 import { siteAssets } from '../src/site-assets.js';
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
+const projectRoot = new URL('..', import.meta.url);
+
+test('production build fingerprints the complete client module graph', async () => {
+  await execFileAsync(process.execPath, ['scripts/build.mjs'], { cwd: projectRoot });
+  const html = await readFile(new URL('../dist/client/index.html', import.meta.url), 'utf8');
+  const appRoute = html.match(/src="(\/app\.[a-f0-9]{12}\.js)"/)?.[1];
+  assert.ok(appRoute, 'generated HTML must reference a fingerprinted app module');
+  assert.doesNotMatch(html, /src="\/app\.js"/);
+
+  const app = await readFile(new URL(`../dist/client${appRoute}`, import.meta.url), 'utf8');
+  const previewRoute = app.match(/from ['"](\.\/image-preview\.[a-f0-9]{12}\.js)['"]/)?.[1];
+  assert.ok(previewRoute, 'generated app must reference a fingerprinted preview module');
+  await access(new URL(`../dist/client/${previewRoute.slice(2)}`, import.meta.url));
+
+  const assets = await readFile(new URL('../dist/server/site-assets.js', import.meta.url), 'utf8');
+  assert.match(assets, new RegExp(appRoute.replaceAll('.', '\\.')));
+  assert.match(assets, new RegExp(previewRoute.slice(1).replaceAll('.', '\\.')));
+});
 
 test('unversioned script and style responses require revalidation', async () => {
   for (const path of ['/app.js', '/styles.css', '/image-preview.js']) {

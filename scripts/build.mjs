@@ -1,17 +1,33 @@
 import { cp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 await rm('dist', { recursive: true, force: true });
 await mkdir('dist/client', { recursive: true });
 await mkdir('dist/server', { recursive: true });
 await cp('public', 'dist/client', { recursive: true });
 await cp('src', 'dist/server', { recursive: true });
+
+const digest = (value) => createHash('sha256').update(value).digest('hex').slice(0, 12);
+const previewSource = await readFile('public/image-preview.js', 'utf8');
+const previewHash = digest(previewSource);
+const previewRoute = `/image-preview.${previewHash}.js`;
+const appSource = await readFile('public/app.js', 'utf8');
+const appHash = digest(`${appSource}\n${previewHash}`);
+const appRoute = `/app.${appHash}.js`;
+const generatedApp = appSource.replace("'./image-preview.js'", `'./image-preview.${previewHash}.js'`);
+const generatedIndex = (await readFile('public/index.html', 'utf8')).replace('src="/app.js"', `src="${appRoute}"`);
+
+await writeFile('dist/client/index.html', generatedIndex);
+await writeFile(`dist/client${appRoute}`, generatedApp);
+await writeFile(`dist/client${previewRoute}`, previewSource);
+
 const assets = [
-  ['/index.html', 'public/index.html', 'text/html; charset=utf-8', false],
+  ['/index.html', 'dist/client/index.html', 'text/html; charset=utf-8', false],
   ['/styles.css', 'public/styles.css', 'text/css; charset=utf-8', false],
   ['/project-navigation.css', 'public/project-navigation.css', 'text/css; charset=utf-8', false],
   ['/image-preview.css', 'public/image-preview.css', 'text/css; charset=utf-8', false],
   ['/task-history.css', 'public/task-history.css', 'text/css; charset=utf-8', false],
-  ['/app.js', 'public/app.js', 'text/javascript; charset=utf-8', false],
-  ['/image-preview.js', 'public/image-preview.js', 'text/javascript; charset=utf-8', false],
+  [appRoute, `dist/client${appRoute}`, 'text/javascript; charset=utf-8', false],
+  [previewRoute, `dist/client${previewRoute}`, 'text/javascript; charset=utf-8', false],
   ['/assets/alpine-runner.jpg', 'public/assets/alpine-runner.jpg', 'image/jpeg', true],
 ];
 const rows = [];
