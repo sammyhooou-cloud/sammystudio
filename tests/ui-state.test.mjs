@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as stageHelpers from '../public/app.js';
 import {
   buildGenerationPayload,
   closeProjectDrawer,
@@ -398,6 +399,43 @@ test('video cleanup stops playback, detaches the resource, reloads, and hides th
   clearVideoElement(video);
   assert.deepEqual(events, ['pause', 'remove:src', 'load']);
   assert.equal(video.hidden, true);
+});
+
+test('video sync preserves a playing clip at the same URL and clears changed or non-video media', () => {
+  assert.equal(typeof stageHelpers.syncResultVideo, 'function');
+  const events = [];
+  let source = 'https://cdn.test/old.mp4';
+  const video = {
+    hidden: false,
+    getAttribute(name) { return name === 'src' ? source : null; },
+    set src(value) { source = value; events.push(`set:${value}`); },
+    pause() { events.push('pause'); },
+    removeAttribute(name) { events.push(`remove:${name}`); source = ''; },
+    load() { events.push('load'); },
+  };
+  stageHelpers.syncResultVideo(video, 'https://cdn.test/old.mp4');
+  assert.deepEqual(events, []);
+  assert.equal(source, 'https://cdn.test/old.mp4');
+  assert.equal(video.hidden, false);
+
+  stageHelpers.syncResultVideo(video, 'https://cdn.test/new.mp4');
+  assert.deepEqual(events, ['pause', 'remove:src', 'load', 'set:https://cdn.test/new.mp4']);
+  assert.equal(video.hidden, false);
+
+  stageHelpers.syncResultVideo(video, '');
+  assert.deepEqual(events.slice(-3), ['pause', 'remove:src', 'load']);
+  assert.equal(source, '');
+  assert.equal(video.hidden, true);
+});
+
+test('terminal stage override survives older task updates until deliberately cleared', () => {
+  assert.equal(typeof stageHelpers.resolveResultStage, 'function');
+  const terminal = { kind: 'terminal', title: '提交失败', copy: '请重试。' };
+  const initial = taskPresentationState([{ id: 'old', status: 'queued' }]);
+  const updated = taskPresentationState([{ id: 'old', status: 'generating', resultJson: '{"progress":28}' }]);
+  assert.equal(stageHelpers.resolveResultStage(initial, terminal), terminal);
+  assert.equal(stageHelpers.resolveResultStage(updated, terminal), terminal);
+  assert.equal(stageHelpers.resolveResultStage(updated, null), updated);
 });
 
 test('submission responses mutate UI only for the latest token in the submitted project', () => {

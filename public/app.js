@@ -279,6 +279,18 @@ export function clearVideoElement(video) {
   video.pause?.(); video.removeAttribute?.('src'); video.load?.(); video.hidden = true;
 }
 
+export function syncResultVideo(video, videoUrl = '') {
+  if (!video) return;
+  const currentUrl = video.getAttribute?.('src') || '';
+  if (videoUrl && currentUrl === videoUrl && !video.hidden) return;
+  if (currentUrl || !video.hidden) clearVideoElement(video);
+  if (videoUrl) { video.src = videoUrl; video.hidden = false; }
+}
+
+export function resolveResultStage(baseState, stageOverride = null) {
+  return stageOverride ?? baseState;
+}
+
 export function isCurrentSubmission(activeProjectId, submittedProjectId, token, latestToken) {
   return Boolean(submittedProjectId) && activeProjectId === submittedProjectId && token === latestToken;
 }
@@ -367,7 +379,7 @@ function setup() {
   let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, projectEpoch = 0;
   const drafts = createProjectDrafts();
   const attempts = createSubmissionAttemptController(undefined, attemptStorage());
-  let selectedTaskId = '', submittingWithoutTask = false;
+  let selectedTaskId = '', submittingWithoutTask = false, stageOverride = null;
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
@@ -428,6 +440,8 @@ function setup() {
         projectTasks = projectTasks.some(({ id }) => id === task.id)
           ? projectTasks.map((item) => item.id === task.id ? { ...item, remoteId: task.remote_id, status: task.status } : item)
           : prependProjectTask(projectId, projectId, projectTasks, row);
+        selectedTaskId = task.id || '';
+        stageOverride = null;
         renderTasks();
       }
     } catch { /* Absence or temporary lookup failure keeps the stable key for explicit retry. */ }
@@ -526,6 +540,7 @@ function setup() {
     projectTasks = Array.isArray(workspaceState?.tasks) ? workspaceState.tasks : [];
     selectedTaskId = '';
     submittingWithoutTask = false;
+    stageOverride = null;
     renderTasks();
     renderPendingAttemptState();
   }
@@ -534,25 +549,29 @@ function setup() {
     const state = taskPresentationState(projectTasks, selectedTaskId);
     const history = document.querySelector('#task-history');
     const historyWrap = document.querySelector('#task-history-wrap');
+    const focusedTaskId = history.contains(document.activeElement) ? document.activeElement.dataset.taskId : '';
     history.replaceChildren();
     state.completed.forEach(({ task }, index) => {
       const item = document.createElement('button'); item.type = 'button'; item.className = 'task-history-item';
       const label = document.createElement('strong'); label.textContent = `完成片段 ${String(index + 1).padStart(2, '0')}`;
       const action = document.createElement('span'); action.textContent = '播放';
       item.title = task.id || '';
+      item.dataset.taskId = task.id || '';
       item.classList.toggle('active', state.current === task);
+      item.setAttribute('aria-pressed', String(selectedTaskId === task.id));
       item.append(label, action);
-      item.onclick = () => { selectedTaskId = task.id; submittingWithoutTask = false; renderTasks(); };
+      item.onclick = () => { selectedTaskId = task.id; stageOverride = null; submittingWithoutTask = false; renderTasks(); };
       history.append(item);
     });
     historyWrap.hidden = state.completed.length === 0;
+    if (focusedTaskId) [...history.children].find((item) => item.dataset.taskId === focusedTaskId)?.focus();
     if (submittingWithoutTask) showSubmittingStage();
-    else renderSelectedTask(state);
+    else renderSelectedTask(resolveResultStage(state, stageOverride));
     poller.sync(currentProjectId, projectTasks);
     renderPendingAttemptState();
   }
 
-  function clearResultStage() {
+  function clearResultStage(videoUrl = '') {
     document.querySelector('#result-empty').hidden = true;
     document.querySelector('#result-progress').hidden = true;
     document.querySelector('#result-terminal').hidden = true;
@@ -560,8 +579,7 @@ function setup() {
     document.querySelector('#task-progress').textContent = '';
     document.querySelector('#task-id').textContent = '';
     const video = document.querySelector('#result-video');
-    clearVideoElement(video);
-    return video;
+    syncResultVideo(video, videoUrl);
   }
 
   function showSubmittingStage() {
@@ -572,7 +590,7 @@ function setup() {
   }
 
   function renderSelectedTask(state) {
-    const video = clearResultStage();
+    clearResultStage(state.kind === 'video' ? state.videoUrl : '');
     const status = document.querySelector('#task-state');
     if (state.kind === 'empty') {
       document.querySelector('#result-empty').hidden = false;
@@ -588,16 +606,14 @@ function setup() {
       }
       status.textContent = '生成中';
     } else if (state.kind === 'video') {
-      video.src = state.videoUrl;
-      video.hidden = false;
       status.textContent = '已完成';
     } else {
       const failed = taskStatus(state.current) === 'failed';
-      const title = failed ? '生成失败' : '状态待核对';
+      const title = state.title || (failed ? '生成失败' : '状态待核对');
       document.querySelector('#terminal-title').textContent = title;
-      document.querySelector('#terminal-copy').textContent = failed
+      document.querySelector('#terminal-copy').textContent = state.copy || (failed
         ? '任务未能完成，请检查任务后重试。'
-        : '任务暂无可播放视频，请核对任务状态后再提交。';
+        : '任务暂无可播放视频，请核对任务状态后再提交。');
       document.querySelector('#result-terminal').hidden = false;
       status.textContent = title;
     }
@@ -779,6 +795,7 @@ function setup() {
     const submissionIsCurrent = () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence);
     document.querySelector('#form-error').textContent = '';
     selectedTaskId = '';
+    stageOverride = null;
     submittingWithoutTask = true;
     showSubmittingStage();
     try {
@@ -788,6 +805,7 @@ function setup() {
         projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
         selectedTaskId = task.id || '';
         submittingWithoutTask = false;
+        stageOverride = null;
         renderTasks();
         renderPendingAttemptState();
         void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {});
@@ -800,16 +818,16 @@ function setup() {
         if (error.task?.id) {
           projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: error.task.id, remoteId: error.task.remote_id, status: error.task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
           selectedTaskId = error.task.id;
+          stageOverride = null;
           renderTasks();
         } else {
-          clearResultStage();
-          document.querySelector('#result-terminal').hidden = false;
           const pendingAttempt = attempts.pendingForProject(submittedProjectId);
-          document.querySelector('#terminal-title').textContent = pendingAttempt ? '状态待核对' : '提交失败';
-          document.querySelector('#terminal-copy').textContent = pendingAttempt
-            ? '提交结果尚未确认，请核对任务后再试。'
-            : '提交未能完成，请检查输入后重试。';
-          document.querySelector('#task-state').textContent = pendingAttempt ? '状态待核对' : '提交失败';
+          stageOverride = {
+            kind: 'terminal',
+            title: pendingAttempt ? '状态待核对' : '提交失败',
+            copy: pendingAttempt ? '提交结果尚未确认，请核对任务后再试。' : '提交未能完成，请检查输入后重试。',
+          };
+          renderTasks();
         }
         renderPendingAttemptState();
       }

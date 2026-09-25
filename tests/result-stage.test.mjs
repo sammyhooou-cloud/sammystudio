@@ -64,5 +64,5 @@ test('pending attempt guidance does not replace the visible stage status', () =>
 });
 
 test('choosing a completed clip can replace the temporary submission stage', () => {
-  assert.match(app, /item\.onclick\s*=\s*\(\)\s*=>\s*\{\s*selectedTaskId\s*=\s*task\.id;\s*submittingWithoutTask\s*=\s*false;\s*renderTasks\(\)/);
+  assert.match(app, /item\.onclick\s*=\s*\(\)\s*=>\s*\{\s*selectedTaskId\s*=\s*task\.id;\s*stageOverride\s*=\s*null;\s*submittingWithoutTask\s*=\s*false;\s*renderTasks\(\)/);
 });
