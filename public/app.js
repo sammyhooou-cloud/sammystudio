@@ -227,6 +227,53 @@ export function workspaceTaskState(tasks = []) {
   return { tasks: safeTasks, current, videoUrl: extractVideoUrl(result) };
 }
 
+const activeTaskStatuses = new Set(['submitting', 'queued', 'generating']);
+const successfulTaskStatuses = new Set(['succeeded', 'success', 'done', 'completed']);
+
+function taskStatus(task) {
+  return typeof task?.status === 'string' ? task.status.toLowerCase() : '';
+}
+
+function taskResult(task) {
+  const value = task?.resultJson;
+  if (typeof value !== 'string') return value && typeof value === 'object' ? value : null;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+export function extractTaskProgress(result) {
+  for (const source of [result, result?.data]) {
+    if (!source || typeof source !== 'object') continue;
+    for (const key of ['progress', 'percentage', 'percent']) {
+      const value = source[key];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100) return Math.round(value);
+    }
+  }
+  return null;
+}
+
+export function taskPresentationState(tasks = [], selectedTaskId = '') {
+  const safeTasks = Array.isArray(tasks) ? tasks : [];
+  const current = safeTasks.find((task) => task?.id === selectedTaskId) || safeTasks[0] || null;
+  const completed = safeTasks
+    .filter((task) => successfulTaskStatuses.has(taskStatus(task)))
+    .map((task) => ({ task, videoUrl: extractVideoUrl(taskResult(task)) }))
+    .filter(({ videoUrl }) => Boolean(videoUrl));
+  const status = taskStatus(current);
+  const active = activeTaskStatuses.has(status);
+  const videoUrl = successfulTaskStatuses.has(status)
+    ? (completed.find(({ task }) => task === current)?.videoUrl || '')
+    : '';
+  const kind = !current ? 'empty' : active ? 'active' : videoUrl ? 'video' : 'terminal';
+  return {
+    tasks: safeTasks,
+    current,
+    kind,
+    videoUrl,
+    progress: active ? extractTaskProgress(taskResult(current)) : null,
+    completed,
+  };
+}
+
 export function clearVideoElement(video) {
   if (!video) return;
   video.pause?.(); video.removeAttribute?.('src'); video.load?.(); video.hidden = true;

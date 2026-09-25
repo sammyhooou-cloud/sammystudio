@@ -23,6 +23,8 @@ import {
   prependProjectTask,
   clearVideoElement,
   extractVideoUrl,
+  extractTaskProgress,
+  taskPresentationState,
   isCurrentSubmission,
   performGenerationSubmission,
   commitProjectWorkspace,
@@ -35,6 +37,46 @@ import {
   shouldSaveStaleUpload,
   sidebarShouldBeInert,
 } from '../public/app.js';
+
+test('new active task owns the stage while older playable success remains completed', () => {
+  const tasks = [
+    { id: 'new', status: 'generating', resultJson: '{"status":"PROCESSING"}' },
+    { id: 'old', status: 'succeeded', resultJson: '{"works":[{"contentType":"video/mp4","url":"https://cdn.example/old.mp4"}]}' },
+  ];
+  const state = taskPresentationState(tasks);
+  assert.equal(state.current, tasks[0]);
+  assert.equal(state.kind, 'active');
+  assert.equal(state.progress, null);
+  assert.deepEqual(state.completed, [{ task: tasks[1], videoUrl: 'https://cdn.example/old.mp4' }]);
+});
+
+test('presentation state exposes explicit provider progress and a successful video URL', () => {
+  const active = { id: 'new', status: 'generating', resultJson: '{"data":{"progress":42}}' };
+  assert.equal(taskPresentationState([active]).progress, 42);
+  const succeeded = { id: 'done', status: 'success', resultJson: '{"works":[{"contentType":"video/mp4","url":"https://cdn.example/done.mp4"}]}' };
+  const state = taskPresentationState([succeeded]);
+  assert.equal(state.kind, 'video');
+  assert.equal(state.videoUrl, 'https://cdn.example/done.mp4');
+});
+
+test('task progress accepts only explicit numeric values from zero through one hundred', () => {
+  for (const value of [-1, 101, '42', NaN, Infinity]) {
+    assert.equal(extractTaskProgress({ progress: value }), null);
+  }
+  assert.equal(extractTaskProgress({ data: { percentage: 42.6 } }), 43);
+  assert.equal(extractTaskProgress({ data: { percent: 0 } }), 0);
+});
+
+test('completed presentation excludes failed, unsafe, and nonplayable tasks', () => {
+  const tasks = [
+    { id: 'failed', status: 'failed', resultJson: '{"videoUrl":"https://cdn.example/fail.mp4"}' },
+    { id: 'unsafe', status: 'completed', resultJson: '{"videoUrl":"javascript:alert(1)"}' },
+    { id: 'not-video', status: 'done', resultJson: '{"url":"https://cdn.example/readme.txt"}' },
+  ];
+  const state = taskPresentationState(tasks);
+  assert.deepEqual(state.completed, []);
+  assert.equal(state.kind, 'terminal');
+});
 
 test('double submit is locked immediately and ambiguous retry reuses the same key', () => {
   let next = 0;
