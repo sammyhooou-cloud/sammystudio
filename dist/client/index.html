@@ -39,11 +39,20 @@
               <label>模型<select id="model"></select></label><label>分辨率<select id="resolution"></select></label><label>视频时长<select id="duration"></select></label><label>画幅<select id="aspect-ratio"></select></label>
               <p id="form-error" class="error wide" aria-live="polite"></p><button id="generate" class="primary wide" type="submit">开始生成 <span>↗</span></button>
             </form>
-            <aside class="result panel"><div class="result-head"><div><p class="eyebrow">CURRENT TASK</p><h2>生成结果</h2></div><span id="task-state">等待提交</span></div><div id="result-empty" class="empty"><b>◌</b><p>设置参数并提交后，任务进度与视频将在这里出现。</p></div><div id="result-progress" hidden><div class="progress"><i></i></div><h3>可灵视频任务</h3><p id="task-id"></p></div><video id="result-video" controls hidden></video><div class="task-history-wrap"><p class="eyebrow">RECENT TASKS</p><div id="task-history" class="task-history"></div></div></aside>
+            <aside class="result panel">
+              <div class="result-head"><div><p class="eyebrow">CURRENT TASK</p><h2 id="result-heading" tabindex="-1">生成结果</h2></div><div class="result-head-actions"><span id="task-state" aria-live="polite">等待提交</span><button id="return-current-task" type="button" aria-controls="result-stage" hidden>返回当前任务</button></div></div>
+              <div id="result-stage" class="result-stage">
+                <div id="result-empty" class="result-layer empty"><b>◌</b><p>设置参数并提交后，任务进度与视频将在这里出现。</p></div>
+                <div id="result-progress" class="result-layer generation-state" hidden><div class="generation-visual" aria-hidden="true"></div><h3 id="generation-title">生成中</h3><p id="task-progress" class="task-progress" hidden></p><p id="task-id" class="task-id"></p></div>
+                <div id="result-terminal" class="result-layer terminal-state" hidden><h3 id="terminal-title"></h3><p id="terminal-copy"></p></div>
+                <video id="result-video" controls hidden></video>
+              </div>
+              <div id="task-history-wrap" class="task-history-wrap" hidden><p class="eyebrow">已完成片段</p><div id="task-history" class="task-history"></div></div>
+            </aside>
           </div>
           <p id="last-check" class="last-check">尚未连接</p>
         </div>
       </div>
     </section>
-  </main><script type="module" src="/app.be947dcaebc7.js"></script>
+  </main><script type="module" src="/app.33bc1589042b.js"></script>
 </body></html>

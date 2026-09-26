@@ -89,6 +89,18 @@ export function createSubmissionAttemptController(keyFactory = () => crypto.rand
   };
 }
 
+const unresolvedAttemptGuidance = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对可灵任务；不要更改设置后重复提交。';
+
+export function shouldShowPendingAttemptGuidance(attempts, projectId) {
+  return Boolean(projectId && !attempts.inFlight && attempts.pendingForProject(projectId));
+}
+
+export function pendingAttemptMessage(currentText, shouldShow) {
+  const text = typeof currentText === 'string' ? currentText : '';
+  if (shouldShow) return text && text !== unresolvedAttemptGuidance ? text : unresolvedAttemptGuidance;
+  return text === unresolvedAttemptGuidance ? '' : text;
+}
+
 export function pendingWorkspaceSettings(attempts, projectId, assets = [], capabilities = {}) {
   const pending = attempts.pendingForProject(projectId);
   if (!pending) return null;
@@ -227,9 +239,112 @@ export function workspaceTaskState(tasks = []) {
   return { tasks: safeTasks, current, videoUrl: extractVideoUrl(result) };
 }
 
+const activeTaskStatuses = new Set(['submitting', 'queued', 'generating']);
+const successfulTaskStatuses = new Set(['succeeded', 'success', 'done', 'completed']);
+
+function taskStatus(task) {
+  return typeof task?.status === 'string' ? task.status.toLowerCase() : '';
+}
+
+function taskResult(task) {
+  const value = task?.resultJson;
+  if (typeof value !== 'string') return value && typeof value === 'object' ? value : null;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+export function extractTaskProgress(result) {
+  for (const source of [result, result?.data]) {
+    if (!source || typeof source !== 'object') continue;
+    for (const key of ['progress', 'percentage', 'percent']) {
+      const value = source[key];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100) return Math.round(value);
+    }
+  }
+  return null;
+}
+
+export function taskPresentationState(tasks = [], selectedTaskId = '') {
+  const safeTasks = Array.isArray(tasks) ? tasks : [];
+  const current = safeTasks.find((task) => task?.id === selectedTaskId) || safeTasks[0] || null;
+  const completed = safeTasks
+    .filter((task) => successfulTaskStatuses.has(taskStatus(task)))
+    .map((task) => ({ task, videoUrl: extractVideoUrl(taskResult(task)) }))
+    .filter(({ videoUrl }) => Boolean(videoUrl));
+  const status = taskStatus(current);
+  const active = activeTaskStatuses.has(status);
+  const videoUrl = successfulTaskStatuses.has(status)
+    ? (completed.find(({ task }) => task === current)?.videoUrl || '')
+    : '';
+  const kind = !current ? 'empty' : active ? 'active' : videoUrl ? 'video' : 'terminal';
+  return {
+    tasks: safeTasks,
+    current,
+    kind,
+    videoUrl,
+    progress: active ? extractTaskProgress(taskResult(current)) : null,
+    completed,
+  };
+}
+
 export function clearVideoElement(video) {
   if (!video) return;
   video.pause?.(); video.removeAttribute?.('src'); video.load?.(); video.hidden = true;
+}
+
+export function syncResultVideo(video, videoUrl = '') {
+  if (!video) return;
+  const currentUrl = video.getAttribute?.('src') || '';
+  if (videoUrl && currentUrl === videoUrl && !video.hidden) return;
+  if (currentUrl || !video.hidden) clearVideoElement(video);
+  if (videoUrl) { video.src = videoUrl; video.hidden = false; }
+}
+
+export function resolveResultStage(baseState, stageOverride = null) {
+  return stageOverride ?? baseState;
+}
+
+export function selectedCompletedTaskId(stageState) {
+  return stageState?.kind === 'video' ? stageState.current?.id || '' : '';
+}
+
+export function returnCurrentTaskId(tasks, selectedTaskId, stageOverride = null, submittingWithoutTask = false) {
+  if (!selectedTaskId || stageOverride || submittingWithoutTask) return '';
+  const state = taskPresentationState(tasks, selectedTaskId);
+  const headId = state.tasks[0]?.id || '';
+  return headId && headId !== selectedTaskId && state.current?.id === selectedTaskId && state.kind === 'video' ? headId : '';
+}
+
+export function reconciliationMayClaimStage(startGeneration, currentGeneration, startKey, currentKey) {
+  return startGeneration === currentGeneration && Boolean(startKey) && startKey === currentKey;
+}
+
+function reconciliationStatusRank(status) {
+  const normalized = taskStatus({ status });
+  if (!normalized) return -1;
+  return { submitting: 0, queued: 1, generating: 2 }[normalized] ?? 3;
+}
+
+export function mergeReconciledTask(tasks, row, canClaimStage) {
+  if (!row?.id) return tasks;
+  if (tasks.some(({ id }) => id === row.id)) {
+    return tasks.map((item) => {
+      if (item.id !== row.id) return item;
+      const promoteStatus = reconciliationStatusRank(row.status) > reconciliationStatusRank(item.status);
+      return {
+        ...item,
+        remoteId: canClaimStage ? (row.remoteId || item.remoteId) : (item.remoteId || row.remoteId),
+        status: promoteStatus && row.status ? row.status : item.status,
+        resultJson: canClaimStage ? (row.resultJson ?? item.resultJson) : (item.resultJson ?? row.resultJson),
+      };
+    });
+  }
+  return canClaimStage ? [row, ...tasks].slice(0, 100) : [...tasks.slice(0, 99), row];
+}
+
+export function reconciledStageSelection(selectedTaskId, stageOverride, recoveredTaskId, canClaimStage) {
+  return canClaimStage
+    ? { selectedTaskId: recoveredTaskId || '', stageOverride: null }
+    : { selectedTaskId, stageOverride };
 }
 
 export function isCurrentSubmission(activeProjectId, submittedProjectId, token, latestToken) {
@@ -320,7 +435,9 @@ function setup() {
   let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, projectEpoch = 0;
   const drafts = createProjectDrafts();
   const attempts = createSubmissionAttemptController(undefined, attemptStorage());
-  let selectedTaskId = '';
+  let selectedTaskId = '', submittingWithoutTask = false, stageOverride = null;
+  const returnCurrentTask = document.querySelector('#return-current-task');
+  const resultHeading = document.querySelector('#result-heading');
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
@@ -364,24 +481,25 @@ function setup() {
   });
 
   function renderPendingAttemptState() {
-    if (!attempts.pendingForProject(currentProjectId)) return;
-    document.querySelector('#task-state').textContent = '待确认提交';
-    document.querySelector('#form-error').textContent = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对可灵任务；不要更改设置后重复提交。';
+    const error = document.querySelector('#form-error');
+    error.textContent = pendingAttemptMessage(error.textContent, shouldShowPendingAttemptGuidance(attempts, currentProjectId));
   }
 
   async function reconcilePendingAttempt(projectId, sequence) {
     const pending = attempts.pendingForProject(projectId);
     if (!pending) return;
+    const generationAtStart = generationSequence;
+    const pendingKeyAtStart = pending.key;
     try {
       const task = await request(`/api/video/tasks/attempt?projectId=${encodeURIComponent(projectId)}`, { headers: { 'idempotency-key': pending.key } });
       if (sequence !== workspaceLoadSequence || projectId !== currentProjectId) return;
       if (task.remote_id || ['succeeded', 'failed'].includes(task.status)) {
+        const canClaimStage = reconciliationMayClaimStage(generationAtStart, generationSequence, pendingKeyAtStart, attempts.pendingForProject(projectId)?.key);
         attempts.resolve(pending);
-        document.querySelector('#form-error').textContent = '';
+        renderPendingAttemptState();
         const row = { id: task.id, remoteId: task.remote_id, status: task.status, mode: pending.payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() };
-        projectTasks = projectTasks.some(({ id }) => id === task.id)
-          ? projectTasks.map((item) => item.id === task.id ? { ...item, remoteId: task.remote_id, status: task.status } : item)
-          : prependProjectTask(projectId, projectId, projectTasks, row);
+        projectTasks = mergeReconciledTask(projectTasks, row, canClaimStage);
+        ({ selectedTaskId, stageOverride } = reconciledStageSelection(selectedTaskId, stageOverride, task.id, canClaimStage));
         renderTasks();
       }
     } catch { /* Absence or temporary lookup failure keeps the stable key for explicit retry. */ }
@@ -479,41 +597,99 @@ function setup() {
     else clearImage();
     projectTasks = Array.isArray(workspaceState?.tasks) ? workspaceState.tasks : [];
     selectedTaskId = '';
+    submittingWithoutTask = false;
+    stageOverride = null;
     renderTasks();
     renderPendingAttemptState();
   }
 
   function renderTasks() {
-    const state = workspaceTaskState(projectTasks);
-    const empty = document.querySelector('#result-empty');
-    const progress = document.querySelector('#result-progress');
-    const video = document.querySelector('#result-video');
+    const state = taskPresentationState(projectTasks, selectedTaskId);
+    const visibleStage = submittingWithoutTask ? { kind: 'submitting' } : resolveResultStage(state, stageOverride);
+    const selectedHistoryId = selectedCompletedTaskId(visibleStage);
+    returnCurrentTask.hidden = !returnCurrentTaskId(projectTasks, selectedTaskId, stageOverride, submittingWithoutTask);
     const history = document.querySelector('#task-history');
+    const historyWrap = document.querySelector('#task-history-wrap');
+    const focusedTaskId = history.contains(document.activeElement) ? document.activeElement.dataset.taskId : '';
     history.replaceChildren();
-    for (const task of state.tasks) {
+    state.completed.forEach(({ task }, index) => {
       const item = document.createElement('button'); item.type = 'button'; item.className = 'task-history-item';
-      const id = document.createElement('strong'); id.textContent = task.id || '未知任务';
-      const status = document.createElement('span'); status.textContent = task.status || '未知状态';
-      item.append(id, status); item.onclick = () => { selectedTaskId = task.id; renderSelectedTask(task); renderPendingAttemptState(); poller.prioritize(task.id); }; history.append(item);
-    }
-    if (!state.current) {
-      empty.hidden = false; progress.hidden = true; clearVideoElement(video);
-      document.querySelector('#task-state').textContent = '等待提交'; document.querySelector('#task-id').textContent = '';
-      poller.sync(currentProjectId, projectTasks); renderPendingAttemptState(); return;
-    }
-    renderSelectedTask(state.tasks.find(({ id }) => id === selectedTaskId) || state.current);
+      const label = document.createElement('strong'); label.textContent = `完成片段 ${String(index + 1).padStart(2, '0')}`;
+      const action = document.createElement('span'); action.textContent = '播放';
+      item.title = task.id || '';
+      item.dataset.taskId = task.id || '';
+      const selected = Boolean(selectedHistoryId) && selectedHistoryId === task.id;
+      item.classList.toggle('active', selected);
+      item.setAttribute('aria-pressed', String(selected));
+      item.append(label, action);
+      item.onclick = () => { selectedTaskId = task.id; stageOverride = null; submittingWithoutTask = false; renderTasks(); };
+      history.append(item);
+    });
+    historyWrap.hidden = state.completed.length === 0;
+    if (focusedTaskId) [...history.children].find((item) => item.dataset.taskId === focusedTaskId)?.focus();
+    if (submittingWithoutTask) showSubmittingStage();
+    else renderSelectedTask(visibleStage);
     poller.sync(currentProjectId, projectTasks);
     renderPendingAttemptState();
   }
 
-  function renderSelectedTask(task) {
-    const state = workspaceTaskState([task]);
-    document.querySelector('#result-empty').hidden = true; document.querySelector('#result-progress').hidden = false;
-    document.querySelector('#task-state').textContent = task.status === 'unknown' ? '状态待核对' : task.status || '未知状态';
-    document.querySelector('#task-id').textContent = task.status === 'unknown' ? `任务 ${task.id || '—'}：提交结果未知，请勿重复创建。` : `任务 ${task.id || '—'}`;
+  returnCurrentTask.onclick = () => {
+    const currentTaskId = returnCurrentTaskId(projectTasks, selectedTaskId, stageOverride, submittingWithoutTask);
+    if (!currentTaskId) return;
+    selectedTaskId = '';
+    stageOverride = null;
+    submittingWithoutTask = false;
+    renderTasks();
+    poller.prioritize(currentTaskId);
+    resultHeading.focus();
+  };
+
+  function clearResultStage(videoUrl = '') {
+    document.querySelector('#result-empty').hidden = true;
+    document.querySelector('#result-progress').hidden = true;
+    document.querySelector('#result-terminal').hidden = true;
+    document.querySelector('#task-progress').hidden = true;
+    document.querySelector('#task-progress').textContent = '';
+    document.querySelector('#task-id').textContent = '';
     const video = document.querySelector('#result-video');
-    clearVideoElement(video);
-    if (state.videoUrl) { video.src = state.videoUrl; video.hidden = false; }
+    syncResultVideo(video, videoUrl);
+  }
+
+  function showSubmittingStage() {
+    clearResultStage();
+    document.querySelector('#result-progress').hidden = false;
+    document.querySelector('#generation-title').textContent = '正在提交';
+    document.querySelector('#task-state').textContent = '正在提交';
+  }
+
+  function renderSelectedTask(state) {
+    clearResultStage(state.kind === 'video' ? state.videoUrl : '');
+    const status = document.querySelector('#task-state');
+    if (state.kind === 'empty') {
+      document.querySelector('#result-empty').hidden = false;
+      status.textContent = '等待提交';
+    } else if (state.kind === 'active') {
+      document.querySelector('#result-progress').hidden = false;
+      document.querySelector('#generation-title').textContent = '生成中';
+      document.querySelector('#task-id').textContent = `任务 ${state.current.id || '—'}`;
+      if (state.progress !== null) {
+        const progress = document.querySelector('#task-progress');
+        progress.textContent = `${state.progress}%`;
+        progress.hidden = false;
+      }
+      status.textContent = '生成中';
+    } else if (state.kind === 'video') {
+      status.textContent = '已完成';
+    } else {
+      const failed = taskStatus(state.current) === 'failed';
+      const title = state.title || (failed ? '生成失败' : '状态待核对');
+      document.querySelector('#terminal-title').textContent = title;
+      document.querySelector('#terminal-copy').textContent = state.copy || (failed
+        ? '任务未能完成，请检查任务后重试。'
+        : '任务暂无可播放视频，请核对任务状态后再提交。');
+      document.querySelector('#result-terminal').hidden = false;
+      status.textContent = title;
+    }
   }
 
   function showProjectLoadError(error) {
@@ -680,7 +856,6 @@ function setup() {
     const pending = attempts.pendingForProject(submittedProjectId);
     if (pending && JSON.stringify(pending.payload) !== JSON.stringify(payload)) {
       document.querySelector('#form-error').textContent = '上次提交待确认；请恢复原设置并使用原请求重试，不能以新设置再次提交。';
-      document.querySelector('#task-state').textContent = '待确认提交';
       return;
     }
     const errors = validateWorkspace(payload);
@@ -692,14 +867,18 @@ function setup() {
     const submissionToken = ++generationSequence;
     const submissionIsCurrent = () => isCurrentSubmission(currentProjectId, submittedProjectId, submissionToken, generationSequence);
     document.querySelector('#form-error').textContent = '';
-    document.querySelector('#result-empty').hidden = true;
-    document.querySelector('#result-progress').hidden = false;
-    document.querySelector('#task-state').textContent = '正在提交';
+    selectedTaskId = '';
+    stageOverride = null;
+    submittingWithoutTask = true;
+    renderTasks();
     try {
       const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': attempt.key }, body: JSON.stringify(payload) });
       attempts.settle(attempt, Boolean(task.remote_id || task.status === 'succeeded' || task.status === 'failed'));
       if (submissionIsCurrent()) {
         projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+        selectedTaskId = task.id || '';
+        submittingWithoutTask = false;
+        stageOverride = null;
         renderTasks();
         renderPendingAttemptState();
         void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {});
@@ -707,11 +886,22 @@ function setup() {
     } catch (error) {
       attempts.settle(attempt, error.task?.status === 'failed' || [400, 403, 404, 422].includes(error.status));
       if (submissionIsCurrent()) {
+        submittingWithoutTask = false;
         document.querySelector('#form-error').textContent = error.message;
         if (error.task?.id) {
           projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: error.task.id, remoteId: error.task.remote_id, status: error.task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+          selectedTaskId = error.task.id;
+          stageOverride = null;
           renderTasks();
-        } else document.querySelector('#task-state').textContent = attempts.pendingForProject(submittedProjectId) ? '提交结果待确认' : '提交失败';
+        } else {
+          const pendingAttempt = attempts.pendingForProject(submittedProjectId);
+          stageOverride = {
+            kind: 'terminal',
+            title: pendingAttempt ? '状态待核对' : '提交失败',
+            copy: pendingAttempt ? '提交结果尚未确认，请核对任务后再试。' : '提交未能完成，请检查输入后重试。',
+          };
+          renderTasks();
+        }
         renderPendingAttemptState();
       }
     } finally { updateSubmitDisabled(); }
