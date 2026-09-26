@@ -39,3 +39,28 @@ test('background fallback, layering, and frosted login styles are defined', asyn
   assert.ok(css.includes('@media(max-width:760px){.stage-video{object-position:58%50%}.login-card{backdrop-filter:blur(20px)saturate(120%)'), 'mobile video focal point and reduced card blur are set');
   assert.match(css, /\.stage\{[^}]*background:[^}]*alpine-runner\.jpg/);
 });
+
+test('login uses deep black glass without a device shell or floating motion', async () => {
+  const [rawCss, html] = await Promise.all([
+    readFile(cssUrl, 'utf8'),
+    readFile(htmlUrl, 'utf8'),
+  ]);
+  const css = rawCss.replace(/\s+/g, '');
+  const cardRules = [...css.matchAll(/\.login-card\{([^}]*)\}/g)].map((match) => match[1]);
+  const card = cardRules.find((rule) => rule.includes('linear-gradient(')) || '';
+  const wrapRules = [...css.matchAll(/\.login-wrap\{([^}]*)\}/g)].map((match) => match[1]);
+  const input = css.match(/\.login-cardinput\{([^}]*)\}/)?.[1] || '';
+  const focusedInput = css.match(/\.login-cardinput:focus\{([^}]*)\}/)?.[1] || '';
+
+  assert.match(card, /background:linear-gradient\(145deg,rgba\(10,13,10,\.90\),rgba\(2,4,3,\.82\)\)/);
+  assert.match(card, /border:1pxsolidrgba\(255,255,255,\.16\)/);
+  assert.match(card, /box-shadow:inset01px0rgba\(255,255,255,\.13\),038px100pxrgba\(0,0,0,\.66\)/);
+  assert.match(card, /(?:^|;)backdrop-filter:blur\((?:2[89]|[3-9]\d)px\)saturate\(\d+%\)/);
+  assert.match(card, /(?:^|;)-webkit-backdrop-filter:blur\((?:2[89]|[3-9]\d)px\)saturate\(\d+%\)/);
+  assert.match(input, /background:rgba\(255,255,255,\.075\)/);
+  assert.match(input, /box-shadow:inset01px0rgba\(255,255,255,\.055\)/);
+  assert.match(focusedInput, /border-color:var\(--acid\)/);
+  assert.match(focusedInput, /box-shadow:0{1,2}0{1,2}0{1,2}3px#c8ff7815/);
+  assert.doesNotMatch([...cardRules, ...wrapRules].join(';'), /(?:animation(?:-name)?|transform):/);
+  assert.doesNotMatch(`${css}${html}`, /(?:phone-frame|mock-phone|device-shell)/);
+});
