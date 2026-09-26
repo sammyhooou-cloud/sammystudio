@@ -159,6 +159,22 @@ test('current reconciliation keeps existing result data when recovered row has n
   assert.equal(taskPresentationState(merged).videoUrl, 'https://cdn.example/task.mp4');
 });
 
+test('current reconciliation cannot downgrade a task completed by polling during its lookup', () => {
+  const canClaimStage = stageHelpers.reconciliationMayClaimStage(4, 4, 'same-key', 'same-key');
+  assert.equal(canClaimStage, true);
+  const resultJson = '{"videoUrl":"https://cdn.example/task.mp4"}';
+  const polled = [{ id: 'task', status: 'succeeded', resultJson, remoteId: '' }];
+  const merged = stageHelpers.mergeReconciledTask(polled, { id: 'task', status: 'queued', resultJson: null, remoteId: 'remote-task' }, canClaimStage);
+  const selection = stageHelpers.reconciledStageSelection('', { kind: 'terminal' }, 'task', canClaimStage);
+  const visibleStage = stageHelpers.resolveResultStage(taskPresentationState(merged, selection.selectedTaskId), selection.stageOverride);
+  assert.equal(merged[0].status, 'succeeded');
+  assert.equal(merged[0].resultJson, resultJson);
+  assert.equal(merged[0].remoteId, 'remote-task');
+  assert.equal(visibleStage.kind, 'video');
+  assert.equal(visibleStage.videoUrl, 'https://cdn.example/task.mp4');
+  assert.equal(stageHelpers.selectedCompletedTaskId(visibleStage), 'task');
+});
+
 test('completed history selection follows the video actually shown in the stage', () => {
   assert.equal(typeof stageHelpers.selectedCompletedTaskId, 'function');
   const clip = { id: 'clip', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/clip.mp4"}' };

@@ -329,7 +329,7 @@ export function mergeReconciledTask(tasks, row, canClaimStage) {
   if (tasks.some(({ id }) => id === row.id)) {
     return tasks.map((item) => {
       if (item.id !== row.id) return item;
-      const promoteStatus = canClaimStage || reconciliationStatusRank(row.status) > reconciliationStatusRank(item.status);
+      const promoteStatus = reconciliationStatusRank(row.status) > reconciliationStatusRank(item.status);
       return {
         ...item,
         remoteId: canClaimStage ? (row.remoteId || item.remoteId) : (item.remoteId || row.remoteId),
