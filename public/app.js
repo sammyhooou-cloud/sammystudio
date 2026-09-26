@@ -318,10 +318,25 @@ export function reconciliationMayClaimStage(startGeneration, currentGeneration, 
   return startGeneration === currentGeneration && Boolean(startKey) && startKey === currentKey;
 }
 
+function reconciliationStatusRank(status) {
+  const normalized = taskStatus({ status });
+  if (!normalized) return -1;
+  return { submitting: 0, queued: 1, generating: 2 }[normalized] ?? 3;
+}
+
 export function mergeReconciledTask(tasks, row, canClaimStage) {
   if (!row?.id) return tasks;
   if (tasks.some(({ id }) => id === row.id)) {
-    return tasks.map((item) => item.id === row.id ? { ...item, remoteId: row.remoteId, status: row.status } : item);
+    return tasks.map((item) => {
+      if (item.id !== row.id) return item;
+      const promoteStatus = canClaimStage || reconciliationStatusRank(row.status) > reconciliationStatusRank(item.status);
+      return {
+        ...item,
+        remoteId: canClaimStage ? (row.remoteId || item.remoteId) : (item.remoteId || row.remoteId),
+        status: promoteStatus && row.status ? row.status : item.status,
+        resultJson: canClaimStage ? (row.resultJson ?? item.resultJson) : (item.resultJson ?? row.resultJson),
+      };
+    });
   }
   return canClaimStage ? [row, ...tasks].slice(0, 100) : [...tasks.slice(0, 99), row];
 }

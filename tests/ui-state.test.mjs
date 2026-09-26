@@ -106,6 +106,59 @@ test('current reconciliation may claim the stage and prepend its recovered task'
   assert.deepEqual(stageHelpers.mergeReconciledTask([{ id: 'newer' }, { id: 'recovered', status: 'submitting' }], recovered, false).map(({ id }) => id), ['newer', 'recovered']);
 });
 
+test('stale queued reconciliation keeps a completed clip playable and in its original position', () => {
+  const video = '{"videoUrl":"https://cdn.example/clip.mp4"}';
+  const tasks = [{ id: 'newer', status: 'queued' }, { id: 'clip', status: 'succeeded', resultJson: video, remoteId: '' }];
+  const merged = stageHelpers.mergeReconciledTask(tasks, { id: 'clip', status: 'queued', resultJson: null, remoteId: 'remote-clip' }, false);
+  assert.deepEqual(merged.map(({ id }) => id), ['newer', 'clip']);
+  assert.equal(merged[1].status, 'succeeded');
+  assert.equal(merged[1].resultJson, video);
+  assert.equal(merged[1].remoteId, 'remote-clip');
+  const selected = taskPresentationState(merged, 'clip');
+  assert.equal(selected.kind, 'video');
+  assert.equal(selected.videoUrl, 'https://cdn.example/clip.mp4');
+  assert.equal(stageHelpers.selectedCompletedTaskId(selected), 'clip');
+  assert.equal(stageHelpers.returnCurrentTaskId(merged, 'clip'), 'newer');
+});
+
+test('stale active reconciliation preserves failed and unknown terminal states', () => {
+  for (const status of ['failed', 'unknown']) {
+    const existing = { id: 'task', status, resultJson: '{"detail":"final"}', remoteId: 'current-remote' };
+    const merged = stageHelpers.mergeReconciledTask([existing], { id: 'task', status: 'queued', remoteId: 'stale-remote', resultJson: null }, false);
+    assert.equal(merged[0].status, status);
+    assert.equal(merged[0].resultJson, existing.resultJson);
+    assert.equal(merged[0].remoteId, 'current-remote');
+    assert.equal(taskPresentationState(merged, 'task').kind, 'terminal');
+  }
+});
+
+test('stale submitting or queued reconciliation cannot move generating backwards', () => {
+  for (const status of ['queued', 'submitting']) {
+    const existing = { id: 'task', status: 'generating', resultJson: '{"progress":47}' };
+    const merged = stageHelpers.mergeReconciledTask([existing], { id: 'task', status, resultJson: null }, false);
+    assert.equal(merged[0].status, 'generating');
+    assert.equal(taskPresentationState(merged).progress, 47);
+  }
+});
+
+test('stale terminal reconciliation can promote an active row without taking stage selection', () => {
+  const tasks = [{ id: 'newer', status: 'queued' }, { id: 'old', status: 'generating', resultJson: null }];
+  const merged = stageHelpers.mergeReconciledTask(tasks, { id: 'old', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/old.mp4"}' }, false);
+  assert.deepEqual(merged.map(({ id }) => id), ['newer', 'old']);
+  assert.equal(merged[1].status, 'succeeded');
+  assert.equal(taskPresentationState(merged).current.id, 'newer');
+  assert.equal(taskPresentationState(merged, 'old').kind, 'video');
+  assert.deepEqual(stageHelpers.reconciledStageSelection('newer', { kind: 'terminal' }, 'old', false), { selectedTaskId: 'newer', stageOverride: { kind: 'terminal' } });
+});
+
+test('current reconciliation keeps existing result data when recovered row has none', () => {
+  const resultJson = '{"videoUrl":"https://cdn.example/task.mp4"}';
+  const merged = stageHelpers.mergeReconciledTask([{ id: 'task', status: 'generating', resultJson }], { id: 'task', status: 'succeeded', resultJson: null }, true);
+  assert.equal(merged[0].status, 'succeeded');
+  assert.equal(merged[0].resultJson, resultJson);
+  assert.equal(taskPresentationState(merged).videoUrl, 'https://cdn.example/task.mp4');
+});
+
 test('completed history selection follows the video actually shown in the stage', () => {
   assert.equal(typeof stageHelpers.selectedCompletedTaskId, 'function');
   const clip = { id: 'clip', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/clip.mp4"}' };
