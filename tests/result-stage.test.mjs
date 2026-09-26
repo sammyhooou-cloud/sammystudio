@@ -28,6 +28,23 @@ test('result markup defines distinct layers and a completed clips list', () => {
   assert.match(html, /<p class="eyebrow">已完成片段<\/p>/);
 });
 
+test('result header exposes a hidden accessible return control and focuses the current task after activation', () => {
+  assert.match(html, /<button[^>]*id="return-current-task"[^>]*type="button"[^>]*aria-controls="result-stage"[^>]*hidden[^>]*>返回当前任务<\/button>/);
+  assert.match(html, /id="result-heading"[^>]*tabindex="-1"/);
+  assert.match(app, /returnCurrentTask\.hidden\s*=\s*!returnCurrentTaskId\(/);
+  assert.match(app, /returnCurrentTask\.onclick\s*=\s*\(\)\s*=>\s*\{[\s\S]*?selectedTaskId\s*=\s*'';[\s\S]*?renderTasks\(\);[\s\S]*?resultHeading\.focus\(\)/);
+  assert.match(rule('.result-head-actions'), /grid-template-rows\s*:/);
+});
+
+test('reconciliation captures generation and pending key before lookup and gates stage ownership after it', () => {
+  const body = app.match(/async function reconcilePendingAttempt\(projectId, sequence\)\s*\{([\s\S]*?)\n  \}/)?.[1] || '';
+  assert.match(body, /const generationAtStart = generationSequence/);
+  assert.match(body, /const pendingKeyAtStart = pending\.key/);
+  assert.match(body, /reconciliationMayClaimStage\(generationAtStart, generationSequence, pendingKeyAtStart, attempts\.pendingForProject\(projectId\)\?\.key\)/);
+  assert.match(body, /mergeReconciledTask\(projectTasks, row, canClaimStage\)/);
+  assert.match(body, /reconciledStageSelection\(selectedTaskId, stageOverride, task\.id, canClaimStage\)/);
+});
+
 test('result stage keeps all display states in one fixed region', () => {
   assert.match(rule('.result-stage'), /position\s*:\s*relative/);
   assert.match(rule('.result-stage'), /min-height\s*:\s*(?:3[6-9]\d|4\d\d)px/);

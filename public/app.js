@@ -307,6 +307,31 @@ export function selectedCompletedTaskId(stageState) {
   return stageState?.kind === 'video' ? stageState.current?.id || '' : '';
 }
 
+export function returnCurrentTaskId(tasks, selectedTaskId, stageOverride = null, submittingWithoutTask = false) {
+  if (!selectedTaskId || stageOverride || submittingWithoutTask) return '';
+  const state = taskPresentationState(tasks, selectedTaskId);
+  const headId = state.tasks[0]?.id || '';
+  return headId && headId !== selectedTaskId && state.current?.id === selectedTaskId && state.kind === 'video' ? headId : '';
+}
+
+export function reconciliationMayClaimStage(startGeneration, currentGeneration, startKey, currentKey) {
+  return startGeneration === currentGeneration && Boolean(startKey) && startKey === currentKey;
+}
+
+export function mergeReconciledTask(tasks, row, canClaimStage) {
+  if (!row?.id) return tasks;
+  if (tasks.some(({ id }) => id === row.id)) {
+    return tasks.map((item) => item.id === row.id ? { ...item, remoteId: row.remoteId, status: row.status } : item);
+  }
+  return canClaimStage ? [row, ...tasks].slice(0, 100) : [...tasks.slice(0, 99), row];
+}
+
+export function reconciledStageSelection(selectedTaskId, stageOverride, recoveredTaskId, canClaimStage) {
+  return canClaimStage
+    ? { selectedTaskId: recoveredTaskId || '', stageOverride: null }
+    : { selectedTaskId, stageOverride };
+}
+
 export function isCurrentSubmission(activeProjectId, submittedProjectId, token, latestToken) {
   return Boolean(submittedProjectId) && activeProjectId === submittedProjectId && token === latestToken;
 }
@@ -396,6 +421,8 @@ function setup() {
   const drafts = createProjectDrafts();
   const attempts = createSubmissionAttemptController(undefined, attemptStorage());
   let selectedTaskId = '', submittingWithoutTask = false, stageOverride = null;
+  const returnCurrentTask = document.querySelector('#return-current-task');
+  const resultHeading = document.querySelector('#result-heading');
   const imageInput = document.querySelector('#reference-image');
   const previewView = { empty: document.querySelector('#upload-copy'), preview: document.querySelector('#image-preview'), image: document.querySelector('#image-preview-img'), name: document.querySelector('#image-preview-name'), details: document.querySelector('#image-preview-details'), status: document.querySelector('#image-preview-status') };
 
@@ -446,18 +473,18 @@ function setup() {
   async function reconcilePendingAttempt(projectId, sequence) {
     const pending = attempts.pendingForProject(projectId);
     if (!pending) return;
+    const generationAtStart = generationSequence;
+    const pendingKeyAtStart = pending.key;
     try {
       const task = await request(`/api/video/tasks/attempt?projectId=${encodeURIComponent(projectId)}`, { headers: { 'idempotency-key': pending.key } });
       if (sequence !== workspaceLoadSequence || projectId !== currentProjectId) return;
       if (task.remote_id || ['succeeded', 'failed'].includes(task.status)) {
+        const canClaimStage = reconciliationMayClaimStage(generationAtStart, generationSequence, pendingKeyAtStart, attempts.pendingForProject(projectId)?.key);
         attempts.resolve(pending);
         renderPendingAttemptState();
         const row = { id: task.id, remoteId: task.remote_id, status: task.status, mode: pending.payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() };
-        projectTasks = projectTasks.some(({ id }) => id === task.id)
-          ? projectTasks.map((item) => item.id === task.id ? { ...item, remoteId: task.remote_id, status: task.status } : item)
-          : prependProjectTask(projectId, projectId, projectTasks, row);
-        selectedTaskId = task.id || '';
-        stageOverride = null;
+        projectTasks = mergeReconciledTask(projectTasks, row, canClaimStage);
+        ({ selectedTaskId, stageOverride } = reconciledStageSelection(selectedTaskId, stageOverride, task.id, canClaimStage));
         renderTasks();
       }
     } catch { /* Absence or temporary lookup failure keeps the stable key for explicit retry. */ }
@@ -565,6 +592,7 @@ function setup() {
     const state = taskPresentationState(projectTasks, selectedTaskId);
     const visibleStage = submittingWithoutTask ? { kind: 'submitting' } : resolveResultStage(state, stageOverride);
     const selectedHistoryId = selectedCompletedTaskId(visibleStage);
+    returnCurrentTask.hidden = !returnCurrentTaskId(projectTasks, selectedTaskId, stageOverride, submittingWithoutTask);
     const history = document.querySelector('#task-history');
     const historyWrap = document.querySelector('#task-history-wrap');
     const focusedTaskId = history.contains(document.activeElement) ? document.activeElement.dataset.taskId : '';
@@ -589,6 +617,17 @@ function setup() {
     poller.sync(currentProjectId, projectTasks);
     renderPendingAttemptState();
   }
+
+  returnCurrentTask.onclick = () => {
+    const currentTaskId = returnCurrentTaskId(projectTasks, selectedTaskId, stageOverride, submittingWithoutTask);
+    if (!currentTaskId) return;
+    selectedTaskId = '';
+    stageOverride = null;
+    submittingWithoutTask = false;
+    renderTasks();
+    poller.prioritize(currentTaskId);
+    resultHeading.focus();
+  };
 
   function clearResultStage(videoUrl = '') {
     document.querySelector('#result-empty').hidden = true;

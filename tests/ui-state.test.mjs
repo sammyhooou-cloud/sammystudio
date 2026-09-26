@@ -64,6 +64,48 @@ test('selecting an older playable success keeps the newer task out of the video 
   assert.deepEqual(state.completed.map(({ task }) => task.id), ['old']);
 });
 
+test('return target is the newest task when an older completed clip owns the visible stage', () => {
+  const old = { id: 'old', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/old.mp4"}' };
+  for (const status of ['queued', 'failed', 'unknown', 'succeeded']) {
+    const head = { id: 'head', status, resultJson: status === 'succeeded' ? '{"videoUrl":"https://cdn.example/head.mp4"}' : null };
+    assert.equal(stageHelpers.returnCurrentTaskId([head, old], 'old'), 'head');
+  }
+});
+
+test('return target is absent for the head, default stage, overrides, and empty tasks', () => {
+  const tasks = [
+    { id: 'head', status: 'queued' },
+    { id: 'old', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/old.mp4"}' },
+  ];
+  assert.equal(stageHelpers.returnCurrentTaskId(tasks, 'head'), '');
+  assert.equal(stageHelpers.returnCurrentTaskId(tasks, ''), '');
+  assert.equal(stageHelpers.returnCurrentTaskId(tasks, 'old', { kind: 'terminal' }), '');
+  assert.equal(stageHelpers.returnCurrentTaskId(tasks, 'old', null, true), '');
+  assert.equal(stageHelpers.returnCurrentTaskId([], 'old'), '');
+});
+
+test('stale reconciliation preserves the new task and its override while merging the old row behind it', () => {
+  const old = { id: 'old', status: 'succeeded' };
+  const newer = { id: 'new', status: 'queued' };
+  const override = { kind: 'terminal', title: '状态待核对' };
+  const canClaim = stageHelpers.reconciliationMayClaimStage(1, 2, 'old-key', 'new-key');
+  assert.equal(canClaim, false);
+  const tasks = stageHelpers.mergeReconciledTask([newer], old, canClaim);
+  assert.deepEqual(tasks.map(({ id }) => id), ['new', 'old']);
+  assert.equal(taskPresentationState(tasks).current.id, 'new');
+  assert.deepEqual(stageHelpers.reconciledStageSelection('new', override, old.id, canClaim), { selectedTaskId: 'new', stageOverride: override });
+  assert.equal(stageHelpers.reconciliationMayClaimStage(1, 1, 'old-key', 'new-key'), false);
+});
+
+test('current reconciliation may claim the stage and prepend its recovered task', () => {
+  const recovered = { id: 'recovered', status: 'queued' };
+  const canClaim = stageHelpers.reconciliationMayClaimStage(1, 1, 'same-key', 'same-key');
+  assert.equal(canClaim, true);
+  assert.deepEqual(stageHelpers.mergeReconciledTask([{ id: 'older' }], recovered, canClaim).map(({ id }) => id), ['recovered', 'older']);
+  assert.deepEqual(stageHelpers.reconciledStageSelection('older', { kind: 'terminal' }, recovered.id, canClaim), { selectedTaskId: 'recovered', stageOverride: null });
+  assert.deepEqual(stageHelpers.mergeReconciledTask([{ id: 'newer' }, { id: 'recovered', status: 'submitting' }], recovered, false).map(({ id }) => id), ['newer', 'recovered']);
+});
+
 test('completed history selection follows the video actually shown in the stage', () => {
   assert.equal(typeof stageHelpers.selectedCompletedTaskId, 'function');
   const clip = { id: 'clip', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.example/clip.mp4"}' };

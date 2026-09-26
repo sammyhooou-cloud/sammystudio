@@ -40,7 +40,7 @@
               <p id="form-error" class="error wide" aria-live="polite"></p><button id="generate" class="primary wide" type="submit">开始生成 <span>↗</span></button>
             </form>
             <aside class="result panel">
-              <div class="result-head"><div><p class="eyebrow">CURRENT TASK</p><h2>生成结果</h2></div><span id="task-state">等待提交</span></div>
+              <div class="result-head"><div><p class="eyebrow">CURRENT TASK</p><h2 id="result-heading" tabindex="-1">生成结果</h2></div><div class="result-head-actions"><span id="task-state" aria-live="polite">等待提交</span><button id="return-current-task" type="button" aria-controls="result-stage" hidden>返回当前任务</button></div></div>
               <div id="result-stage" class="result-stage">
                 <div id="result-empty" class="result-layer empty"><b>◌</b><p>设置参数并提交后，任务进度与视频将在这里出现。</p></div>
                 <div id="result-progress" class="result-layer generation-state" hidden><div class="generation-visual" aria-hidden="true"></div><h3 id="generation-title">生成中</h3><p id="task-progress" class="task-progress" hidden></p><p id="task-id" class="task-id"></p></div>

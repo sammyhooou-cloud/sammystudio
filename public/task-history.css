@@ -4,6 +4,30 @@
   margin-top: 20px;
 }
 
+.result-head-actions {
+  display: grid;
+  grid-template-rows: 16px 22px;
+  gap: 4px;
+  justify-items: end;
+  align-content: end;
+}
+
+.result-head-actions #task-state { color: var(--muted); font-size: 10px; }
+
+#return-current-task {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 7px;
+  background: transparent;
+  color: var(--acid);
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#return-current-task:focus-visible { outline: 2px solid var(--acid); outline-offset: 2px; }
+
 .result-layer {
   position: absolute;
   inset: 0;
