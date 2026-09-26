@@ -155,6 +155,32 @@ test('an unresolved attempt keeps its key across a tab reload', () => {
   assert.equal(reloaded.pendingForProject('p'), null);
 });
 
+test('pending guidance appears for settled unresolved attempts, not an in-flight submission', () => {
+  assert.equal(typeof stageHelpers.shouldShowPendingAttemptGuidance, 'function');
+  const values = new Map();
+  const storage = { getItem: (key) => values.get(key) || null, setItem: (key, value) => values.set(key, value) };
+  const attempts = createSubmissionAttemptController(() => 'key', storage);
+  const first = attempts.begin({ projectId: 'p', mode: 'text', prompt: 'scene' });
+  assert.equal(stageHelpers.shouldShowPendingAttemptGuidance(attempts, 'p'), false);
+  attempts.settle(first, true);
+  assert.equal(stageHelpers.shouldShowPendingAttemptGuidance(attempts, 'p'), false);
+  const unresolved = attempts.begin({ projectId: 'p', mode: 'text', prompt: 'scene' });
+  assert.equal(stageHelpers.shouldShowPendingAttemptGuidance(attempts, 'p'), false);
+  attempts.settle(unresolved, false);
+  assert.equal(stageHelpers.shouldShowPendingAttemptGuidance(attempts, 'p'), true);
+  const reloaded = createSubmissionAttemptController(() => 'other', storage);
+  assert.equal(stageHelpers.shouldShowPendingAttemptGuidance(reloaded, 'p'), true);
+});
+
+test('pending guidance clears only its own text after resolution', () => {
+  assert.equal(typeof stageHelpers.pendingAttemptMessage, 'function');
+  const warning = stageHelpers.pendingAttemptMessage('', true);
+  assert.match(warning, /上次提交结果尚未确认/);
+  assert.equal(stageHelpers.pendingAttemptMessage(warning, false), '');
+  assert.equal(stageHelpers.pendingAttemptMessage('请输入视频提示词', false), '请输入视频提示词');
+  assert.equal(stageHelpers.pendingAttemptMessage('请求失败', true), '请求失败');
+});
+
 test('unresolved image submission requires the same project asset on reload', () => {
   const attempts = createSubmissionAttemptController(() => 'key');
   attempts.settle(attempts.begin({ projectId: 'p', mode: 'image', uploadId: 'asset-1' }), false);

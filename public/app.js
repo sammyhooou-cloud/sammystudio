@@ -89,6 +89,18 @@ export function createSubmissionAttemptController(keyFactory = () => crypto.rand
   };
 }
 
+const unresolvedAttemptGuidance = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对可灵任务；不要更改设置后重复提交。';
+
+export function shouldShowPendingAttemptGuidance(attempts, projectId) {
+  return Boolean(projectId && !attempts.inFlight && attempts.pendingForProject(projectId));
+}
+
+export function pendingAttemptMessage(currentText, shouldShow) {
+  const text = typeof currentText === 'string' ? currentText : '';
+  if (shouldShow) return text && text !== unresolvedAttemptGuidance ? text : unresolvedAttemptGuidance;
+  return text === unresolvedAttemptGuidance ? '' : text;
+}
+
 export function pendingWorkspaceSettings(attempts, projectId, assets = [], capabilities = {}) {
   const pending = attempts.pendingForProject(projectId);
   if (!pending) return null;
@@ -427,8 +439,8 @@ function setup() {
   });
 
   function renderPendingAttemptState() {
-    if (!attempts.pendingForProject(currentProjectId)) return;
-    document.querySelector('#form-error').textContent = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对可灵任务；不要更改设置后重复提交。';
+    const error = document.querySelector('#form-error');
+    error.textContent = pendingAttemptMessage(error.textContent, shouldShowPendingAttemptGuidance(attempts, currentProjectId));
   }
 
   async function reconcilePendingAttempt(projectId, sequence) {
@@ -439,7 +451,7 @@ function setup() {
       if (sequence !== workspaceLoadSequence || projectId !== currentProjectId) return;
       if (task.remote_id || ['succeeded', 'failed'].includes(task.status)) {
         attempts.resolve(pending);
-        document.querySelector('#form-error').textContent = '';
+        renderPendingAttemptState();
         const row = { id: task.id, remoteId: task.remote_id, status: task.status, mode: pending.payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() };
         projectTasks = projectTasks.some(({ id }) => id === task.id)
           ? projectTasks.map((item) => item.id === task.id ? { ...item, remoteId: task.remote_id, status: task.status } : item)
