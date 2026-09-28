@@ -378,9 +378,6 @@ async function request(path, options = {}) {
 }
 
 function setup() {
-  const loginView = document.querySelector('#login-view');
-  const workspace = document.querySelector('#workspace-view');
-  const loginForm = document.querySelector('#login-form');
   const generator = document.querySelector('#generator-form');
   const statusLight = document.querySelector('#status-light');
   const statusText = document.querySelector('#status-text');
@@ -741,15 +738,11 @@ function setup() {
     await refreshStatus();
     await loadProjects();
   });
-  async function enterWorkspace() {
-    loginView.hidden = true; workspace.hidden = false;
+  async function loadWorkspace() {
     retryWorkspace.hidden = true;
     try { await loadWorkspaceEntry(); }
     catch (error) { projectError.textContent = `工作台加载失败：${error.message}`; retryWorkspace.hidden = false; throw error; }
   }
-  request('/api/session').then(enterWorkspace).catch(() => {});
-  document.querySelector('#password-toggle').onclick = () => { const input = document.querySelector('#password'); input.type = input.type === 'password' ? 'text' : 'password'; };
-  loginForm.onsubmit = async (event) => { event.preventDefault(); try { await request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password: document.querySelector('#password').value }) }); await enterWorkspace(); } catch (error) { document.querySelector('#login-error').textContent = error.message; } };
   document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); document.querySelector('#upload-field').hidden = mode !== 'image'; updateSubmitDisabled(); fillModels(); saveDraft(); });
   modelSelect.onchange = () => { updateOptions(); saveDraft(); };
   generator.addEventListener('input', saveDraft);
@@ -781,7 +774,7 @@ function setup() {
     if (next >= 0 && ((event.shiftKey && current <= 0) || (!event.shiftKey && current === focusable.length - 1) || current < 0)) { event.preventDefault(); focusable[next].focus(); }
   });
   addEventListener('resize', () => { if (drawerOpen && !isMobileDrawer()) setDrawer(false); else sidebar.inert = sidebarShouldBeInert(drawerOpen, isMobileDrawer()); setSidebarCollapsed(sidebarCollapsed); });
-  retryWorkspace.onclick = () => { enterWorkspace().catch(() => {}); };
+  retryWorkspace.onclick = () => { loadWorkspace().catch(() => {}); };
   document.querySelector('#new-project').onclick = () => { createForm.hidden = false; document.querySelector('#new-project-name').focus(); };
   document.querySelector('#cancel-create-project').onclick = () => { createForm.hidden = true; createForm.reset(); projectError.textContent = ''; };
   createForm.onsubmit = async (event) => {
@@ -864,6 +857,7 @@ function setup() {
     } finally { updateSubmitDisabled(); }
   };
   document.querySelector('#refresh-status').onclick = refreshStatus;
-  document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
+  document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.replace('/login'); };
+  loadWorkspace().catch(() => {});
 }
 if (typeof document !== 'undefined') setup();

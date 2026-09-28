@@ -134,7 +134,7 @@ test('invalid files render failed metadata without making an upload request', as
 });
 
 test('upload surface uses a full-area label and visible focus proxy', async () => {
-  const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+  const html = await readFile(new URL('../public/workspace.html', import.meta.url), 'utf8');
   const css = await readFile(new URL('../public/image-preview.css', import.meta.url), 'utf8');
   assert.match(html, /<label id="upload-copy" for="reference-image"/);
   assert.match(css, /\.upload > label[\s\S]*min-height:\s*112px/);

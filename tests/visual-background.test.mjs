@@ -2,12 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-const htmlUrl = new URL('../public/index.html', import.meta.url);
+const htmlUrl = new URL('../public/login.html', import.meta.url);
 const cssUrl = new URL('../public/styles.css', import.meta.url);
 const videoUrl = 'https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260521_014404_fadafdb1-4df6-4699-be9c-77d25f39a3d0.mp4';
 
-test('decorative MotionSites background is safe and non-interactive', async () => {
-  const html = await readFile(htmlUrl, 'utf8');
+for (const page of ['login', 'workspace']) test(`${page} decorative MotionSites background is safe and non-interactive`, async () => {
+  const html = await readFile(new URL(`../public/${page}.html`, import.meta.url), 'utf8');
   const tag = html.match(/<video\b[^>]*class="stage-video"[^>]*>/)?.[0] || '';
   assert.ok(tag, 'stage video exists');
   assert.match(tag, /\bautoplay\b/);

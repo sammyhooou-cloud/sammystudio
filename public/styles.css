@@ -3,7 +3,8 @@
 
 /* Decorative video stays inside the stage stacking context, beneath the overlay and UI. */
 .stage-video{position:fixed;inset:0;z-index:-2;width:100vw;height:100svh;object-fit:cover;object-position:50% 50%;pointer-events:none;background:#171a14 url('/assets/alpine-runner.jpg') center/cover no-repeat}
-.stage:before{background:linear-gradient(90deg,rgba(3,5,3,.62),rgba(3,5,3,.18) 48%,rgba(3,5,3,.48)),linear-gradient(0deg,rgba(2,3,2,.40),transparent 58%)}
+.login-page .stage:before{background:linear-gradient(90deg,rgba(3,5,3,.62),rgba(3,5,3,.18) 48%,rgba(3,5,3,.48)),linear-gradient(0deg,rgba(2,3,2,.40),transparent 58%)}
+.workspace-page .stage:before{background:linear-gradient(90deg,rgba(3,5,3,.82),rgba(3,5,3,.54) 45%,rgba(3,5,3,.78)),linear-gradient(0deg,rgba(2,3,2,.65),transparent 55%)}
 .login-card{position:relative;overflow:hidden;border:1px solid rgba(255,255,255,.16);background:linear-gradient(145deg,rgba(10,13,10,.90),rgba(2,4,3,.82));box-shadow:inset 0 1px 0 rgba(255,255,255,.13),0 38px 100px rgba(0,0,0,.66);backdrop-filter:blur(30px) saturate(126%);-webkit-backdrop-filter:blur(30px) saturate(126%)}
 .login-card input{border-color:rgba(255,255,255,.17);background:rgba(255,255,255,.075);box-shadow:inset 0 1px 0 rgba(255,255,255,.055);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
 .login-card input:focus{border-color:var(--acid);box-shadow:0 0 0 3px #c8ff7815,inset 0 1px 0 rgba(255,255,255,.055)}
