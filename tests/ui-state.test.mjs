@@ -8,6 +8,7 @@ import {
   taskDetailHref,
 } from '../public/task-presenter.js';
 import * as stageHelpers from '../public/app.js';
+import { parseResultRoute, resultViewModel, setupResultPage } from '../public/result.js';
 import {
   buildGenerationPayload,
   closeProjectDrawer,
@@ -45,6 +46,143 @@ import {
   shouldSaveStaleUpload,
   sidebarShouldBeInert,
 } from '../public/app.js';
+
+test('result routes decode exact project and task segments', () => {
+  assert.deepEqual(parseResultRoute('/projects/project%20a/results/task%2F1'), { projectId: 'project a', taskId: 'task/1' });
+  for (const path of ['', '/', '/projects//results/task', '/projects/p/results/', '/projects/p/results/t/', '/projects/p/results/t/extra', '/projects/%ZZ/results/t', '/projects/p/results/%E0%A4%A', '/projects/p/tasks/t', '/projects/p/results/t?x=1', '/projects/p/results/t#x']) {
+    assert.equal(parseResultRoute(path), null);
+  }
+});
+
+test('result states expose only explicit active progress', () => {
+  for (const status of ['queued', 'generating', 'submitting']) {
+    const state = resultViewModel({ status, resultJson: '{}' });
+    assert.equal(state.kind, 'active');
+    assert.equal(state.title, '生成中');
+    assert.equal(state.progress, null);
+    assert.equal(state.videoUrl, '');
+  }
+  assert.equal(resultViewModel({ status: 'generating', resultJson: '{"data":{"progress":35}}' }).progress, 35);
+  assert.equal(resultViewModel({ status: 'generating', resultJson: '{"progress":"35"}' }).progress, null);
+});
+
+test('result states distinguish playable successes from unavailable results', () => {
+  for (const status of ['succeeded', 'completed', 'done', 'SUCCESS']) {
+    const state = resultViewModel({ status, resultJson: '{"videoUrl":"https://cdn.test/a.mp4"}' });
+    assert.equal(state.kind, 'video');
+    assert.equal(state.videoUrl, 'https://cdn.test/a.mp4');
+    assert.equal(state.progress, null);
+  }
+  for (const resultJson of ['{}', '{broken', '{"videoUrl":"javascript:alert(1)"}']) {
+    const state = resultViewModel({ status: 'succeeded', resultJson });
+    assert.equal(state.kind, 'unavailable');
+    assert.equal(state.videoUrl, '');
+  }
+});
+
+test('result states give failed and unknown tasks explicit terminal messages', () => {
+  for (const status of ['failed', 'error', 'cancelled']) {
+    assert.equal(resultViewModel({ status }).kind, 'failed');
+  }
+  for (const detail of [null, {}, { status: 'unknown' }, { status: 'unexpected' }]) {
+    const state = resultViewModel(detail);
+    assert.equal(state.kind, 'unknown');
+    assert.ok(state.title);
+    assert.ok(state.copy);
+    assert.equal(state.videoUrl, '');
+  }
+});
+
+test('workspace query selection prefers only an owned project and preserves saved-project fallback', () => {
+  assert.equal(typeof stageHelpers.selectInitialProject, 'function');
+  const projects = [{ id: 'first' }, { id: 'saved' }, { id: 'project a' }];
+  assert.equal(stageHelpers.selectInitialProject(projects, 'saved', '?project=project%20a'), projects[2]);
+  assert.equal(stageHelpers.selectInitialProject(projects, 'saved', '?project=not-owned'), projects[1]);
+  assert.equal(stageHelpers.selectInitialProject(projects, 'saved', ''), projects[1]);
+  assert.equal(stageHelpers.selectInitialProject(projects, 'missing', '?project=not-owned'), projects[0]);
+  assert.equal(stageHelpers.selectInitialProject([], 'saved', '?project=project%20a'), null);
+});
+
+function resultPageHarness() {
+  const createElement = (tagName) => ({
+    tagName, children: [], hidden: false, disabled: false, textContent: '', attributes: {},
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; if (name === 'src') delete this.src; },
+    pause() {}, load() {},
+  });
+  const ids = ['result-detail', 'result-player', 'result-progress', 'result-terminal', 'result-meta', 'result-error', 'back-to-workspace', 'result-project', 'result-heading', 'result-status', 'result-percentage', 'result-terminal-title', 'result-terminal-copy', 'result-prompt', 'result-retry'];
+  const elements = Object.fromEntries(ids.map((id) => [id, createElement(id === 'result-player' ? 'video' : 'div')]));
+  const view = { querySelector: (selector) => elements[selector.slice(1)], createElement };
+  const redirects = [];
+  const pageLocation = { pathname: '/projects/project%20a/results/task%2F1', replace: (path) => redirects.push(path) };
+  return { view, pageLocation, redirects, elements };
+}
+
+test('result page loads the encoded API route, renders safe metadata, and clears an invalid player on retry', async () => {
+  const { view, pageLocation, elements, redirects } = resultPageHarness();
+  const calls = [];
+  let detail = { id: 'task/1', projectId: 'project a', projectName: '<img src=x>', status: 'succeeded', mode: 'image', request: { prompt: '<script>prompt</script>', model: 'm', resolution: '1080p', duration: 5, aspectRatio: '16:9', secret: 'never-render' }, resultJson: '{"videoUrl":"https://cdn.test/a.mp4"}', createdAt: 1750000000000, updatedAt: 1750000001000 };
+  await setupResultPage({ view, pageLocation, fetcher: async (path) => { calls.push(path); return { ok: true, status: 200, json: async () => detail }; } });
+  assert.deepEqual(calls, ['/api/projects/project%20a/tasks/task%2F1']);
+  assert.equal(elements['result-player'].src, 'https://cdn.test/a.mp4');
+  assert.equal(elements['result-player'].controls, true);
+  assert.equal(elements['result-player'].hidden, false);
+  assert.equal(elements['result-project'].textContent, '<img src=x>');
+  assert.equal(elements['result-project'].innerHTML, undefined);
+  assert.equal(elements['result-prompt'].textContent, '<script>prompt</script>');
+  assert.equal(elements['back-to-workspace'].href, '/workspace?project=project%20a');
+  assert.equal(elements['result-meta'].children.length, 7);
+  assert.equal(JSON.stringify(elements['result-meta']).includes('never-render'), false);
+  assert.deepEqual(redirects, []);
+  detail = { ...detail, resultJson: '{"videoUrl":"javascript:alert(1)"}' };
+  await elements['result-retry'].onclick();
+  assert.equal(elements['result-player'].src, undefined);
+  assert.equal(elements['result-player'].hidden, true);
+  assert.equal(elements['result-terminal'].hidden, false);
+  assert.equal(elements['result-terminal-title'].textContent, '结果暂不可播放');
+});
+
+test('result page keeps active progress centered and shows percentages only when present', async () => {
+  const { view, pageLocation, elements } = resultPageHarness();
+  let resultJson = '{}';
+  await setupResultPage({ view, pageLocation, fetcher: async () => ({ ok: true, status: 200, json: async () => ({ projectId: 'project a', status: 'generating', resultJson }) }) });
+  assert.equal(elements['result-progress'].hidden, false);
+  assert.equal(elements['result-percentage'].hidden, true);
+  resultJson = '{"progress":35}';
+  await elements['result-retry'].onclick();
+  assert.equal(elements['result-percentage'].hidden, false);
+  assert.equal(elements['result-percentage'].textContent, '35%');
+});
+
+test('only result API 401 redirects; missing and network failures provide safe retry states', async () => {
+  const unauthorized = resultPageHarness();
+  await setupResultPage({ ...unauthorized, fetcher: async () => ({ ok: false, status: 401, json: async () => ({}) }) });
+  assert.deepEqual(unauthorized.redirects, ['/login']);
+  for (const status of [404, 403, 503]) {
+    const harness = resultPageHarness();
+    await setupResultPage({ ...harness, fetcher: async () => ({ ok: false, status, json: async () => ({ error: '<script>failure</script>' }) }) });
+    assert.deepEqual(harness.redirects, []);
+    assert.equal(harness.elements['result-error'].textContent, '<script>failure</script>');
+    assert.equal(harness.elements['result-error'].innerHTML, undefined);
+    assert.equal(harness.elements['result-terminal'].hidden, false);
+    assert.equal(harness.elements['result-retry'].disabled, false);
+  }
+  const network = resultPageHarness();
+  await setupResultPage({ ...network, fetcher: async () => { throw new Error('offline'); } });
+  assert.equal(network.elements['result-error'].textContent, 'offline');
+  assert.deepEqual(network.redirects, []);
+});
+
+test('invalid result routes never request task data', async () => {
+  const harness = resultPageHarness();
+  harness.pageLocation.pathname = '/projects/p/results/t/extra';
+  let calls = 0;
+  await setupResultPage({ ...harness, fetcher: async () => { calls += 1; } });
+  assert.equal(calls, 0);
+  assert.equal(harness.elements['result-terminal-title'].textContent, '任务链接无效');
+});
 
 test('shared task presenter encodes each task detail path segment', () => {
   assert.equal(taskDetailHref('project a', 'task/1'), '/projects/project%20a/results/task%2F1');

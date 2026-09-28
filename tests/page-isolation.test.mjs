@@ -32,6 +32,26 @@ test('obsolete combined index document is removed', async () => {
   await assert.rejects(access(publicFile('index.html')), { code: 'ENOENT' });
 });
 
+test('result page is standalone with safe background and stable media layout', async () => {
+  const html = await readFile(publicFile('result.html'), 'utf8');
+  for (const id of ['result-detail', 'result-player', 'result-progress', 'result-terminal', 'result-meta', 'result-error', 'back-to-workspace']) assert.ok(html.includes(`id="${id}"`));
+  assert.doesNotMatch(html, /id="login-form"|id="generator-form"|src="\/app\.js"|src="\/login\.js"/);
+  assert.match(html, /src="\/result\.js"/);
+  assert.match(html, /href="\/result-detail\.css"/);
+  const video = html.match(/<video\b[^>]*class="stage-video"[^>]*>/)?.[0] || '';
+  for (const attribute of ['muted', 'autoplay', 'loop', 'playsinline']) assert.match(video, new RegExp(`\\b${attribute}\\b`));
+  assert.match(video, /poster="\/assets\/alpine-runner\.jpg"/);
+  assert.match(video, /aria-hidden="true"/);
+  assert.doesNotMatch(video, /\bcontrols\b/);
+  assert.ok(html.includes(`<source src="${videoUrl}"`));
+  const css = await readFile(publicFile('result-detail.css'), 'utf8');
+  assert.match(css, /\.result-media-stage\s*\{[^}]*aspect-ratio:\s*16\s*\/\s*9/);
+  assert.match(css, /\.result-detail-layer\s*\{[^}]*position:\s*absolute[^}]*inset:\s*0[^}]*place-content:\s*center/);
+  assert.match(css, /#result-player\s*\{[^}]*object-fit:\s*contain/);
+  assert.match(css, /#result-meta\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(css, /@media\s*\(max-width:\s*720px\)[\s\S]*#result-meta\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+});
+
 test('page overlays are scoped with stronger workspace contrast', async () => {
   const css = await readFile(publicFile('styles.css'), 'utf8');
   assert.match(css, /\.login-page \.stage:before\{[^}]*rgba\(3,5,3,\.62\)/);

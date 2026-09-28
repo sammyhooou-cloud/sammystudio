@@ -14,6 +14,11 @@ export function selectCurrentProject(projects, savedId) {
   return projects.find(({ id }) => id === savedId) || projects[0] || null;
 }
 
+export function selectInitialProject(projects, savedId, search = '') {
+  const requestedId = new URLSearchParams(search).get('project');
+  return selectCurrentProject(projects, projects.some(({ id }) => id === requestedId) ? requestedId : savedId);
+}
+
 export function upsertProject(projects, project) {
   return [project, ...projects.filter(({ id }) => id !== project.id)];
 }
@@ -749,10 +754,16 @@ function setup() {
   async function loadProjects() {
     const response = await request('/api/projects');
     projects = response.projects || [];
-    const selected = selectCurrentProject(projects, readStoredProjectId(projectStorage()));
+    const selected = selectInitialProject(projects, readStoredProjectId(projectStorage()), window.location.search);
     renderProjects();
-    if (selected) await switchProject(selected);
-    else projectError.textContent = '暂无可用项目';
+    if (selected) {
+      await switchProject(selected);
+      if (currentProjectId === selected.id && new URLSearchParams(window.location.search).has('project')) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('project');
+        window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+      }
+    } else projectError.textContent = '暂无可用项目';
   }
 
   const fill = (select, values) => { select.innerHTML = values.map((value) => `<option value="${value}">${value}${select === duration ? ' 秒' : ''}</option>`).join(''); };
