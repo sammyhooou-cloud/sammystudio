@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { submitTask, getTaskStatus } from '../src/tasks.js';
+import * as taskApi from '../src/tasks.js';
 
 const capabilities = {
   text_to_video: {
@@ -66,7 +67,7 @@ const taskEnv = (db, media = new RecoveryMedia()) => ({ DB: db, MEDIA: media });
 
 class TaskDb {
   constructor() {
-    this.projects = [{ id: 'project-1' }];
+    this.projects = [{ id: 'project-1', name: 'Project One' }, { id: 'project-2', name: 'Project Two' }];
     this.tasks = [];
     this.projectTasks = [];
     this.settings = [];
@@ -100,8 +101,15 @@ class TaskDb {
         if (sql.includes('JOIN project_tasks')) {
           if (sql.includes('video_tasks.id = ?')) {
             const [taskId, projectId] = this.values;
-            return db.projectTasks.some(({ task_id, project_id }) => task_id === taskId && project_id === projectId)
-              ? db.tasks.find(({ id }) => id === taskId) ?? null : null;
+            const belongs = db.projectTasks.some(({ task_id, project_id }) => task_id === taskId && project_id === projectId);
+            if (!belongs) return null;
+            const task = db.tasks.find(({ id }) => id === taskId);
+            if (!task) return null;
+            if (sql.includes('JOIN projects')) {
+              const project = db.projects.find(({ id }) => id === projectId);
+              return project ? { ...task, project_name: project.name } : null;
+            }
+            return task;
           }
           const [idempotencyKey, projectId] = this.values;
           const taskIds = db.projectTasks.filter(({ project_id }) => project_id === projectId).map(({ task_id }) => task_id);
@@ -181,6 +189,55 @@ class TaskDb {
     }
   }
 }
+
+test('task detail returns a sanitized project-owned DTO', async () => {
+  const db = new TaskDb();
+  db.tasks.push({
+    id: 'detail-1', remote_id: 'remote-1', mode: 'text', status: 'succeeded',
+    request_json: JSON.stringify({ prompt: 'ocean', model: 'kling-v1', duration: '5', resolution: '720p', aspectRatio: '16:9', idempotency_key: 'secret-key', uploadId: 'upload-1', settingsVersion: 7, providerSecret: 'do-not-return' }),
+    result_json: '{"generationId":"remote-1"}', created_at: 10, updated_at: 20,
+  });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'detail-1' });
+
+  const detail = await taskApi.getTaskDetail('detail-1', 'project-1', taskEnv(db));
+
+  assert.deepEqual(detail, {
+    id: 'detail-1', projectId: 'project-1', projectName: 'Project One', remoteId: 'remote-1',
+    mode: 'text', status: 'succeeded',
+    request: { prompt: 'ocean', model: 'kling-v1', duration: '5', resolution: '720p', aspectRatio: '16:9' },
+    resultJson: '{"generationId":"remote-1"}', createdAt: 10, updatedAt: 20,
+  });
+  assert.equal(Object.hasOwn(detail.request, 'idempotency_key'), false);
+});
+
+test('task detail rejects access through a different project', async () => {
+  const db = new TaskDb();
+  db.tasks.push({ id: 'detail-private', request_json: '{}', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'detail-private' });
+
+  await assert.rejects(() => taskApi.getTaskDetail('detail-private', 'project-2', taskEnv(db)), (error) => {
+    assert.equal(error.message, '任务不存在');
+    assert.equal(error.status, 404);
+    return true;
+  });
+});
+
+test('task detail safely handles malformed request JSON and absent optional values', async () => {
+  const db = new TaskDb();
+  db.tasks.push({ id: 'detail-malformed', request_json: '{bad json', status: 'queued', remote_id: null, result_json: null });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'detail-malformed' });
+
+  const detail = await taskApi.getTaskDetail('detail-malformed', 'project-1', taskEnv(db));
+
+  assert.deepEqual(detail.request, {});
+  assert.equal(detail.remoteId, null);
+  assert.equal(detail.resultJson, null);
+});
+
+test('task detail rejects missing task or project identifiers', async () => {
+  await assert.rejects(() => taskApi.getTaskDetail('', 'project-1', taskEnv(new TaskDb())), (error) => error.message === '任务参数无效' && error.status === 400);
+  await assert.rejects(() => taskApi.getTaskDetail('detail-1', '', taskEnv(new TaskDb())), (error) => error.message === '任务参数无效' && error.status === 400);
+});
 
 test('same project idempotency replay returns its task without another Kling call', async () => {
   const db = new TaskDb();
