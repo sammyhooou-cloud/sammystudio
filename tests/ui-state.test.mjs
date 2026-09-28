@@ -120,7 +120,8 @@ function resultPageHarness() {
     replaceChildren(...children) { this.children = children; },
     setAttribute(name, value) { this.attributes[name] = value; },
     removeAttribute(name) { delete this.attributes[name]; if (name === 'src') delete this.src; },
-    pause() {}, load() {},
+    pause() { this.pauses = (this.pauses || 0) + 1; },
+    load() { this.loads = (this.loads || 0) + 1; },
   });
   const ids = ['result-detail', 'result-player', 'result-progress', 'result-terminal', 'result-meta', 'result-error', 'back-to-workspace', 'result-project', 'result-heading', 'result-status', 'result-percentage', 'result-terminal-title', 'result-terminal-copy', 'result-prompt', 'result-retry'];
   const elements = Object.fromEntries(ids.map((id) => [id, createElement(id === 'result-player' ? 'video' : 'div')]));
@@ -152,6 +153,51 @@ test('result page loads the encoded API route, renders safe metadata, and clears
   assert.equal(elements['result-player'].hidden, true);
   assert.equal(elements['result-terminal'].hidden, false);
   assert.equal(elements['result-terminal-title'].textContent, '结果暂不可播放');
+});
+
+test('later network and transient detail failures preserve the loaded video until a successful retry', async () => {
+  for (const failure of ['network', '503', 'invalid-json', 'invalid-detail']) {
+    const harness = resultPageHarness();
+    let responseKind = 'success';
+    await setupResultPage({ ...harness, fetcher: async () => {
+      if (responseKind === 'network') throw new Error('offline');
+      if (responseKind === '503') return { ok: false, status: 503, json: async () => ({ error: '<script>retry</script>' }) };
+      if (responseKind === 'invalid-json') return { ok: true, status: 200, json: async () => { throw new Error('invalid JSON'); } };
+      if (responseKind === 'invalid-detail') return { ok: true, status: 200, json: async () => null };
+      return { ok: true, status: 200, json: async () => ({ projectId: 'project a', projectName: 'Loaded project', status: 'succeeded', request: { model: 'loaded model' }, resultJson: '{"videoUrl":"https://cdn.test/loaded.mp4"}' }) };
+    } });
+    const metadata = harness.elements['result-meta'].children;
+    const playback = [harness.elements['result-player'].pauses, harness.elements['result-player'].loads];
+    responseKind = failure;
+    await harness.elements['result-retry'].onclick();
+    assert.equal(harness.elements['result-player'].src, 'https://cdn.test/loaded.mp4');
+    assert.equal(harness.elements['result-player'].hidden, false);
+    assert.equal(harness.elements['result-terminal'].hidden, true);
+    assert.equal(harness.elements['result-project'].textContent, 'Loaded project');
+    assert.equal(harness.elements['result-meta'].children, metadata);
+    assert.deepEqual([harness.elements['result-player'].pauses, harness.elements['result-player'].loads], playback);
+    assert.match(harness.elements['result-error'].textContent, /重新加载/);
+    assert.equal(harness.elements['result-error'].innerHTML, undefined);
+    assert.equal(harness.elements['result-retry'].disabled, false);
+    responseKind = 'success';
+    await harness.elements['result-retry'].onclick();
+    assert.equal(harness.elements['result-error'].textContent, '');
+  }
+});
+
+test('definitive missing results replace an existing video with an inaccessible state', async () => {
+  const harness = resultPageHarness();
+  let missing = false;
+  await setupResultPage({ ...harness, fetcher: async () => missing
+    ? { ok: false, status: 404, json: async () => ({ error: '任务不存在' }) }
+    : { ok: true, status: 200, json: async () => ({ status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.test/loaded.mp4"}' }) }
+  });
+  missing = true;
+  await harness.elements['result-retry'].onclick();
+  assert.equal(harness.elements['result-player'].src, undefined);
+  assert.equal(harness.elements['result-player'].hidden, true);
+  assert.equal(harness.elements['result-terminal'].hidden, false);
+  assert.equal(harness.elements['result-terminal-title'].textContent, '任务不可访问');
 });
 
 test('result page keeps active progress centered and shows percentages only when present', async () => {
@@ -282,6 +328,9 @@ test('only result API 401 redirects; missing and network failures provide safe r
   const network = resultPageHarness();
   await setupResultPage({ ...network, fetcher: async () => { throw new Error('offline'); } });
   assert.equal(network.elements['result-error'].textContent, 'offline');
+  assert.equal(network.elements['result-terminal'].hidden, false);
+  assert.equal(network.elements['result-terminal-title'].textContent, '结果加载失败');
+  assert.equal(network.elements['result-retry'].disabled, false);
   assert.deepEqual(network.redirects, []);
 });
 

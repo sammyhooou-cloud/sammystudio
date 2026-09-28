@@ -47,6 +47,18 @@ export async function setupResultPage({ view = document, pageLocation = location
   const retry = element('result-retry');
   const route = parseResultRoute(pageLocation.pathname);
   let inFlight = false;
+  let hasRenderedDetail = false;
+
+  function requireDetail(detail) {
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail) || typeof detail.status !== 'string' || !detail.status.trim()) {
+      throw new Error('任务详情暂不可用');
+    }
+    return detail;
+  }
+
+  function showRetryError(message) {
+    element('result-error').textContent = `${scalarText(message, '任务详情暂不可用')}。可重新加载重试。`;
+  }
 
   function clearStage() {
     player.pause();
@@ -61,6 +73,7 @@ export async function setupResultPage({ view = document, pageLocation = location
 
   function showTerminal(title, copy) {
     clearStage();
+    hasRenderedDetail = false;
     terminal.hidden = false;
     element('result-terminal-title').textContent = title;
     element('result-terminal-copy').textContent = copy;
@@ -101,6 +114,7 @@ export async function setupResultPage({ view = document, pageLocation = location
       row.append(term, definition);
       metadata.append(row);
     }
+    hasRenderedDetail = true;
   }
 
   async function load() {
@@ -121,11 +135,15 @@ export async function setupResultPage({ view = document, pageLocation = location
       if (response.status === 401) { pageLocation.replace('/login'); return; }
       const detail = await response.json().catch(() => ({}));
       if (!response.ok) {
+        if (hasRenderedDetail && (response.status >= 500 || response.status === 408 || response.status === 429)) {
+          showRetryError(detail?.error);
+          return;
+        }
         showTerminal(response.status === 404 ? '任务不可访问' : '结果加载失败', response.status === 404 ? '任务不存在，或不属于当前项目。' : '请检查连接后重新加载。');
         element('result-error').textContent = scalarText(detail?.error, '任务详情暂不可用');
         return;
       }
-      renderDetail(detail);
+      renderDetail(requireDetail(detail));
       if (resultViewModel(detail).kind === 'active') {
         try {
           const sync = await fetcher(`/api/video/tasks/${encodeURIComponent(route.taskId)}?projectId=${encodeURIComponent(route.projectId)}`);
@@ -138,15 +156,18 @@ export async function setupResultPage({ view = document, pageLocation = location
           if (refreshed.status === 401) { pageLocation.replace('/login'); return; }
           const latestDetail = await refreshed.json();
           if (!refreshed.ok) throw new Error(scalarText(latestDetail?.error, '任务详情刷新暂不可用'));
-          renderDetail(latestDetail);
+          renderDetail(requireDetail(latestDetail));
         } catch (error) {
           renderDetail(detail);
-          element('result-error').textContent = `${scalarText(error?.message, '状态同步暂不可用')}。可重新加载重试。`;
+          showRetryError(error?.message);
         }
       }
     } catch (error) {
-      showTerminal('结果加载失败', '请检查连接后重新加载。');
-      element('result-error').textContent = scalarText(error?.message, '任务详情暂不可用');
+      if (hasRenderedDetail) showRetryError(error?.message);
+      else {
+        showTerminal('结果加载失败', '请检查连接后重新加载。');
+        element('result-error').textContent = scalarText(error?.message, '任务详情暂不可用');
+      }
     } finally {
       inFlight = false;
       retry.disabled = false;
