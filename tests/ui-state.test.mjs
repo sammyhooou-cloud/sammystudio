@@ -1,5 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {
+  normalizeTaskStatus,
+  parseTaskRequest,
+  safeVideoUrl,
+  taskProgress,
+  taskDetailHref,
+} from '../public/task-presenter.js';
 import * as stageHelpers from '../public/app.js';
 import {
   buildGenerationPayload,
@@ -38,6 +45,50 @@ import {
   shouldSaveStaleUpload,
   sidebarShouldBeInert,
 } from '../public/app.js';
+
+test('shared task presenter encodes each task detail path segment', () => {
+  assert.equal(taskDetailHref('project a', 'task/1'), '/projects/project%20a/results/task%2F1');
+});
+
+test('shared task presenter preserves normalized status values', () => {
+  for (const status of ['SUCCEEDED', 'GENERATING', 'FAILED', 'UNKNOWN']) {
+    assert.equal(normalizeTaskStatus(status), status.toLowerCase());
+  }
+  for (const status of [undefined, null, 42]) assert.equal(normalizeTaskStatus(status), '');
+});
+
+test('shared task presenter reads explicit nested progress without fabricating absent progress', () => {
+  assert.equal(taskProgress({ data: { progress: 42 } }), 42);
+  assert.equal(taskProgress({ data: { percentage: 42.6 } }), 43);
+  assert.equal(taskProgress({ data: { percent: 0 } }), 0);
+  for (const result of [undefined, null, {}, { data: {} }, ...[-1, 101, '42', NaN, Infinity].map((progress) => ({ progress }))]) {
+    assert.equal(taskProgress(result), null);
+  }
+});
+
+test('shared task presenter rejects unsafe and unrelated video results', () => {
+  assert.equal(safeVideoUrl({ works: [{ contentType: 'video/mp4', url: 'https://cdn.test/clip' }] }), 'https://cdn.test/clip');
+  assert.equal(safeVideoUrl({ data: { video_url: '/media/result.webm' } }), '/media/result.webm');
+  for (const result of [
+    { videoUrl: 'javascript:alert(1)' },
+    { videoUrl: 'http://cdn.test/clip.mp4' },
+    { url: 'https://cdn.test/readme.txt' },
+    '{broken',
+    null,
+  ]) assert.equal(safeVideoUrl(result), '');
+});
+
+test('shared task presenter accepts request objects and JSON objects', () => {
+  const request = { prompt: 'ocean' };
+  assert.equal(parseTaskRequest(request), request);
+  assert.deepEqual(parseTaskRequest('{"prompt":"ocean"}'), request);
+});
+
+test('shared task presenter safely rejects malformed request JSON and non-object requests', () => {
+  for (const request of [undefined, null, '{broken', [], ['prompt'], 42, true, 'plain text', 'null', '[]', '42', 'true', '"text"']) {
+    assert.deepEqual(parseTaskRequest(request), {});
+  }
+});
 
 test('new active task owns the stage while older playable success remains completed', () => {
   const tasks = [
