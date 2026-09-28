@@ -80,6 +80,16 @@ test('result states distinguish playable successes from unavailable results', ()
   }
 });
 
+test('workspace and result pages agree on JSON-encoded video URL strings', () => {
+  for (const url of ['https://cdn.test/video.mp4', 'javascript:alert(1)', 'https://cdn.test/readme.txt']) {
+    const detail = { id: 'task-1', status: 'succeeded', resultJson: JSON.stringify(url) };
+    const workspaceState = taskPresentationState([detail]);
+    const resultState = resultViewModel(detail);
+    assert.equal(resultState.videoUrl, workspaceState.videoUrl);
+    assert.equal(resultState.kind, url.endsWith('.mp4') ? 'video' : 'unavailable');
+  }
+});
+
 test('result states give failed and unknown tasks explicit terminal messages', () => {
   for (const status of ['failed', 'error', 'cancelled']) {
     assert.equal(resultViewModel({ status }).kind, 'failed');
@@ -154,6 +164,106 @@ test('result page keeps active progress centered and shows percentages only when
   await elements['result-retry'].onclick();
   assert.equal(elements['result-percentage'].hidden, false);
   assert.equal(elements['result-percentage'].textContent, '35%');
+});
+
+test('active result loading synchronizes provider status once and rereads completed details', async () => {
+  const harness = resultPageHarness();
+  const calls = [];
+  let detail = { projectId: 'project a', status: 'generating', resultJson: '{"progress":35}' };
+  await setupResultPage({ ...harness, fetcher: async (path) => {
+    calls.push(path);
+    if (path.startsWith('/api/video/tasks/')) detail = { ...detail, status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.test/completed.mp4"}' };
+    return { ok: true, status: 200, json: async () => detail };
+  } });
+  assert.deepEqual(calls, [
+    '/api/projects/project%20a/tasks/task%2F1',
+    '/api/video/tasks/task%2F1?projectId=project%20a',
+    '/api/projects/project%20a/tasks/task%2F1',
+  ]);
+  assert.equal(harness.elements['result-player'].src, 'https://cdn.test/completed.mp4');
+  assert.equal(harness.elements['result-player'].hidden, false);
+  assert.equal(harness.elements['result-progress'].hidden, true);
+  assert.equal(harness.elements['result-error'].textContent, '');
+});
+
+test('transient status failures preserve the known active detail and allow a completing retry', async () => {
+  for (const networkFailure of [false, true]) {
+    const harness = resultPageHarness();
+    const calls = [];
+    let failSync = true;
+    let detail = { projectId: 'project a', projectName: 'Known project', status: 'queued', resultJson: '{"progress":31}' };
+    await setupResultPage({ ...harness, fetcher: async (path) => {
+      calls.push(path);
+      if (path.startsWith('/api/video/tasks/')) {
+        if (failSync) {
+          if (networkFailure) throw new Error('offline');
+          return { ok: false, status: 503, json: async () => ({ error: '<script>sync failure</script>' }) };
+        }
+        detail = { ...detail, status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.test/retried.mp4"}' };
+      }
+      return { ok: true, status: 200, json: async () => detail };
+    } });
+    assert.equal(calls.length, 2);
+    assert.equal(harness.elements['result-progress'].hidden, false);
+    assert.equal(harness.elements['result-terminal'].hidden, true);
+    assert.equal(harness.elements['result-percentage'].textContent, '31%');
+    assert.equal(harness.elements['result-project'].textContent, 'Known project');
+    assert.match(harness.elements['result-error'].textContent, /重新加载/);
+    assert.equal(harness.elements['result-error'].innerHTML, undefined);
+    assert.equal(harness.elements['result-retry'].disabled, false);
+    failSync = false;
+    await harness.elements['result-retry'].onclick();
+    assert.equal(calls.length, 5);
+    assert.equal(harness.elements['result-player'].src, 'https://cdn.test/retried.mp4');
+    assert.equal(harness.elements['result-error'].textContent, '');
+  }
+});
+
+test('terminal result details never request provider status', async () => {
+  for (const status of ['succeeded', 'failed', 'unknown']) {
+    const harness = resultPageHarness();
+    const calls = [];
+    await setupResultPage({ ...harness, fetcher: async (path) => {
+      calls.push(path);
+      return { ok: true, status: 200, json: async () => ({ status, projectId: 'project a' }) };
+    } });
+    assert.deepEqual(calls, ['/api/projects/project%20a/tasks/task%2F1']);
+  }
+});
+
+test('failed refreshed-detail reads retain known active state after successful provider sync', async () => {
+  for (const malformedJson of [false, true]) {
+    const harness = resultPageHarness();
+    let calls = 0;
+    await setupResultPage({ ...harness, fetcher: async () => {
+      calls += 1;
+      if (calls === 3) return malformedJson
+        ? { ok: true, status: 200, json: async () => { throw new Error('invalid JSON'); } }
+        : { ok: false, status: 503, json: async () => ({ error: 'temporarily unavailable' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'generating', resultJson: '{"progress":29}' }) };
+    } });
+    assert.equal(calls, 3);
+    assert.equal(harness.elements['result-progress'].hidden, false);
+    assert.equal(harness.elements['result-terminal'].hidden, true);
+    assert.equal(harness.elements['result-percentage'].textContent, '29%');
+    assert.match(harness.elements['result-error'].textContent, /重新加载/);
+  }
+});
+
+test('status-sync and refreshed-detail authentication failures redirect to login without fallback', async () => {
+  for (const unauthorizedCall of [2, 3]) {
+    const harness = resultPageHarness();
+    let calls = 0;
+    await setupResultPage({ ...harness, fetcher: async () => {
+      calls += 1;
+      return calls === unauthorizedCall
+        ? { ok: false, status: 401, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => ({ status: 'generating', projectId: 'project a' }) };
+    } });
+    assert.deepEqual(harness.redirects, ['/login']);
+    assert.equal(calls, unauthorizedCall);
+    assert.equal(harness.elements['result-error'].textContent, '');
+  }
 });
 
 test('only result API 401 redirects; missing and network failures provide safe retry states', async () => {

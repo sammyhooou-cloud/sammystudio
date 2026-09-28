@@ -9,6 +9,11 @@ export function parseTaskRequest(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
+export function parseTaskResult(value) {
+  if (typeof value !== 'string') return value && typeof value === 'object' ? value : null;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
 function safeMediaUrl(value) {
   if (typeof value !== 'string' || /\s/.test(value)) return '';
   return /^https:\/\/[^\s]+$/i.test(value) || /^\/(?!\/)/.test(value) ? value : '';

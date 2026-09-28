@@ -1,5 +1,5 @@
 import { createImageUploadController, openImageReplacement, renderImagePreview } from './image-preview.js';
-import { normalizeTaskStatus, parseTaskRequest, safeVideoUrl as extractVideoUrl, taskProgress as extractTaskProgress, taskDetailHref } from './task-presenter.js';
+import { normalizeTaskStatus, parseTaskRequest, parseTaskResult, safeVideoUrl as extractVideoUrl, taskProgress as extractTaskProgress, taskDetailHref } from './task-presenter.js';
 
 export { extractVideoUrl, extractTaskProgress };
 
@@ -220,9 +220,7 @@ function taskStatus(task) {
 }
 
 function taskResult(task) {
-  const value = task?.resultJson;
-  if (typeof value !== 'string') return value && typeof value === 'object' ? value : null;
-  try { return JSON.parse(value); } catch { return null; }
+  return parseTaskResult(task?.resultJson);
 }
 
 export function taskListItemModel(task, projectId) {

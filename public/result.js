@@ -1,4 +1,4 @@
-import { normalizeTaskStatus, parseTaskRequest, safeVideoUrl, taskProgress } from './task-presenter.js';
+import { normalizeTaskStatus, parseTaskRequest, parseTaskResult, safeVideoUrl, taskProgress } from './task-presenter.js';
 
 export function parseResultRoute(pathname) {
   if (typeof pathname !== 'string') return null;
@@ -13,7 +13,7 @@ export function parseResultRoute(pathname) {
 
 export function resultViewModel(detail) {
   const status = normalizeTaskStatus(detail?.status);
-  const result = parseTaskRequest(detail?.resultJson);
+  const result = parseTaskResult(detail?.resultJson);
   const state = { kind: 'unknown', title: '状态待核对', copy: '任务状态暂未确认，请重新加载或返回工作台核对。', videoUrl: '', progress: null };
   if (['queued', 'generating', 'submitting'].includes(status)) {
     return { ...state, kind: 'active', title: '生成中', copy: '任务正在处理中，可重新加载查看最新状态。', progress: taskProgress(result) };
@@ -116,7 +116,8 @@ export async function setupResultPage({ view = document, pageLocation = location
     element('result-detail').setAttribute('aria-busy', 'true');
     element('result-error').textContent = '';
     try {
-      const response = await fetcher(`/api/projects/${encodeURIComponent(route.projectId)}/tasks/${encodeURIComponent(route.taskId)}`);
+      const detailPath = `/api/projects/${encodeURIComponent(route.projectId)}/tasks/${encodeURIComponent(route.taskId)}`;
+      const response = await fetcher(detailPath);
       if (response.status === 401) { pageLocation.replace('/login'); return; }
       const detail = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -125,6 +126,24 @@ export async function setupResultPage({ view = document, pageLocation = location
         return;
       }
       renderDetail(detail);
+      if (resultViewModel(detail).kind === 'active') {
+        try {
+          const sync = await fetcher(`/api/video/tasks/${encodeURIComponent(route.taskId)}?projectId=${encodeURIComponent(route.projectId)}`);
+          if (sync.status === 401) { pageLocation.replace('/login'); return; }
+          if (!sync.ok) {
+            const body = await sync.json().catch(() => ({}));
+            throw new Error(scalarText(body?.error, '状态同步暂不可用'));
+          }
+          const refreshed = await fetcher(detailPath);
+          if (refreshed.status === 401) { pageLocation.replace('/login'); return; }
+          const latestDetail = await refreshed.json();
+          if (!refreshed.ok) throw new Error(scalarText(latestDetail?.error, '任务详情刷新暂不可用'));
+          renderDetail(latestDetail);
+        } catch (error) {
+          renderDetail(detail);
+          element('result-error').textContent = `${scalarText(error?.message, '状态同步暂不可用')}。可重新加载重试。`;
+        }
+      }
     } catch (error) {
       showTerminal('结果加载失败', '请检查连接后重新加载。');
       element('result-error').textContent = scalarText(error?.message, '任务详情暂不可用');
