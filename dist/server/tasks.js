@@ -233,6 +233,38 @@ export function normalizeRemoteStatus(raw) {
   return 'queued';
 }
 
+export async function getTaskDetail(id, projectId, env) {
+  if (!id || !projectId) throw new TaskError('任务参数无效', 400);
+  const task = await env.DB.prepare(`SELECT video_tasks.id, video_tasks.remote_id, video_tasks.mode,
+      video_tasks.status, video_tasks.request_json, video_tasks.result_json,
+      video_tasks.created_at, video_tasks.updated_at, projects.name AS project_name
+    FROM video_tasks
+    JOIN project_tasks ON project_tasks.task_id = video_tasks.id
+    JOIN projects ON projects.id = project_tasks.project_id
+    WHERE video_tasks.id = ? AND project_tasks.project_id = ?`).bind(id, projectId).first();
+  if (!task) throw new TaskError('任务不存在', 404);
+  let request = {};
+  try {
+    const parsed = JSON.parse(task.request_json || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) request = parsed;
+  } catch {}
+  const safeRequest = Object.fromEntries(['prompt', 'model', 'duration', 'resolution', 'aspectRatio']
+    .filter((key) => request[key] !== undefined)
+    .map((key) => [key, request[key]]));
+  return {
+    id: task.id,
+    projectId,
+    projectName: task.project_name,
+    remoteId: task.remote_id || null,
+    mode: task.mode,
+    status: task.status,
+    request: safeRequest,
+    resultJson: task.result_json || null,
+    createdAt: task.created_at,
+    updatedAt: task.updated_at,
+  };
+}
+
 export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCaller = callTool) {
   const task = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.id = ? AND project_tasks.project_id = ?').bind(id, projectId).first();
   if (!task) throw new TaskError('任务不存在', 404);

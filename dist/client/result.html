@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#070907"><meta name="description" content="可灵视频任务结果与参数">
+  <title>可灵工作台 · 任务结果</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/result-detail.css">
+</head>
+<body class="result-page">
+  <main class="stage">
+    <video class="stage-video" aria-hidden="true" tabindex="-1" muted autoplay loop playsinline preload="metadata" poster="/assets/alpine-runner.jpg">
+      <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260521_014404_fadafdb1-4df6-4699-be9c-77d25f39a3d0.mp4" type="video/mp4">
+    </video>
+    <header class="masthead"><p><span>WORKSPACE</span>可灵工作台</p><b>K</b><p><span>TASK RESULT</span>任务结果</p></header>
+    <article id="result-detail" class="result-detail panel" aria-busy="true">
+      <header class="result-detail-head"><div><p class="eyebrow">TASK RESULT</p><p id="result-project" class="result-project">任务详情</p><h1 id="result-heading">正在加载结果</h1></div><a id="back-to-workspace" href="/workspace">返回工作台 ↗</a></header>
+      <p id="result-status" class="result-detail-status" aria-live="polite">正在加载</p>
+      <div class="result-media-stage">
+        <video id="result-player" controls playsinline preload="metadata" hidden></video>
+        <div id="result-progress" class="result-detail-layer" hidden><div class="result-loading-visual" aria-hidden="true"></div><h2>生成中</h2><p id="result-percentage" hidden></p></div>
+        <div id="result-terminal" class="result-detail-layer"><h2 id="result-terminal-title">正在加载结果</h2><p id="result-terminal-copy">正在读取任务状态与生成参数。</p></div>
+      </div>
+      <div class="result-detail-feedback"><p id="result-error" class="error" role="alert"></p><button id="result-retry" type="button" disabled>重新加载</button></div>
+      <section class="result-prompt-wrap"><h2>提示词</h2><p id="result-prompt">—</p></section>
+      <dl id="result-meta"></dl>
+    </article>
+  </main><script type="module" src="/result.e0187294fabe.js"></script>
+</body></html>

@@ -1,4 +1,7 @@
 import { createImageUploadController, openImageReplacement, renderImagePreview } from './image-preview.f0285da3e3c7.js';
+import { normalizeTaskStatus, parseTaskRequest, parseTaskResult, safeVideoUrl as extractVideoUrl, taskProgress as extractTaskProgress, taskDetailHref } from './task-presenter.d0a03b080cd6.js';
+
+export { extractVideoUrl, extractTaskProgress };
 
 let currentProjectId = '';
 let projectChangeHandler;
@@ -9,6 +12,11 @@ export function setCurrentProjectId(projectId) {
 
 export function selectCurrentProject(projects, savedId) {
   return projects.find(({ id }) => id === savedId) || projects[0] || null;
+}
+
+export function selectInitialProject(projects, savedId, search = '') {
+  const requestedId = new URLSearchParams(search).get('project');
+  return selectCurrentProject(projects, projects.some(({ id }) => id === requestedId) ? requestedId : savedId);
 }
 
 export function upsertProject(projects, project) {
@@ -196,41 +204,6 @@ export function workspaceImageState(projectId, settings = {}, assets = []) {
   return { asset, url: `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(asset.id)}` };
 }
 
-function safeMediaUrl(value) {
-  if (typeof value !== 'string' || /\s/.test(value)) return '';
-  return /^https:\/\/[^\s]+$/i.test(value) || /^\/(?!\/)/.test(value) ? value : '';
-}
-
-function hasVideoExtension(value) {
-  return /\.(?:mp4|webm|mov|m4v)(?:[?#]|$)/i.test(value);
-}
-
-function videoTyped(value) {
-  return [value?.type, value?.mediaType, value?.media_type, value?.mimeType, value?.mime_type, value?.contentType, value?.kind]
-    .some((item) => typeof item === 'string' && /(?:^|[\/_-])video(?:$|[\/_-])|^video\//i.test(item));
-}
-
-export function extractVideoUrl(value) {
-  if (typeof value === 'string') { const url = safeMediaUrl(value); return url && hasVideoExtension(url) ? url : ''; }
-  if (!value || typeof value !== 'object') return '';
-  for (const key of ['videoUrl', 'video_url', 'urlWithoutWatermark', 'url_without_watermark']) {
-    const url = safeMediaUrl(value[key]);
-    if (url && (key === 'videoUrl' || key === 'video_url' || videoTyped(value) || hasVideoExtension(url))) return url;
-  }
-  const direct = safeMediaUrl(value.url);
-  if (direct && (videoTyped(value) || hasVideoExtension(direct))) return direct;
-  for (const key of ['video', 'result', 'data']) {
-    const found = extractVideoUrl(value[key]); if (found) return found;
-  }
-  for (const key of ['videos', 'outputs', 'works']) {
-    if (!Array.isArray(value[key])) continue;
-    for (const output of value[key]) {
-      const found = extractVideoUrl(output); if (found) return found;
-    }
-  }
-  return '';
-}
-
 export function workspaceTaskState(tasks = []) {
   const safeTasks = Array.isArray(tasks) ? tasks : [];
   const current = safeTasks[0] || null;
@@ -243,24 +216,70 @@ const activeTaskStatuses = new Set(['submitting', 'queued', 'generating']);
 const successfulTaskStatuses = new Set(['succeeded', 'success', 'done', 'completed']);
 
 function taskStatus(task) {
-  return typeof task?.status === 'string' ? task.status.toLowerCase() : '';
+  return normalizeTaskStatus(task?.status);
 }
 
 function taskResult(task) {
-  const value = task?.resultJson;
-  if (typeof value !== 'string') return value && typeof value === 'object' ? value : null;
-  try { return JSON.parse(value); } catch { return null; }
+  return parseTaskResult(task?.resultJson);
 }
 
-export function extractTaskProgress(result) {
-  for (const source of [result, result?.data]) {
-    if (!source || typeof source !== 'object') continue;
-    for (const key of ['progress', 'percentage', 'percent']) {
-      const value = source[key];
-      if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100) return Math.round(value);
-    }
+export function taskListItemModel(task, projectId) {
+  const status = taskStatus(task);
+  if (activeTaskStatuses.has(status)) {
+    const label = { submitting: '正在提交', queued: '排队中', generating: '生成中' }[status];
+    return { label, action: '生成中', href: '', tone: 'active' };
   }
-  return null;
+  const href = projectId && task?.id ? taskDetailHref(projectId, task.id) : '';
+  if (successfulTaskStatuses.has(status)) {
+    return { label: '已完成', action: extractVideoUrl(taskResult(task)) ? '查看结果' : '查看详情', href, tone: 'success' };
+  }
+  return status === 'failed'
+    ? { label: '生成失败', action: '查看详情', href, tone: 'failure' }
+    : { label: '状态待核对', action: '查看详情', href, tone: 'warning' };
+}
+
+export function renderTaskHistory(history, tasks, projectId, selectedTaskId = '') {
+  const view = history.ownerDocument;
+  const focusedTaskId = history.contains(view.activeElement) ? view.activeElement.dataset.taskId : '';
+  history.replaceChildren();
+  for (const task of tasks) {
+    const model = taskListItemModel(task, projectId);
+    const item = view.createElement('article');
+    item.className = `task-history-item tone-${model.tone}`;
+    item.dataset.taskId = task?.id || '';
+    item.classList.toggle('active', Boolean(selectedTaskId) && selectedTaskId === task?.id);
+    const details = view.createElement('div');
+    details.className = 'task-history-details';
+    const status = view.createElement('strong');
+    status.className = 'task-history-status';
+    status.textContent = model.label;
+    const metadata = view.createElement('div');
+    metadata.className = 'task-history-meta';
+    const mode = view.createElement('span');
+    mode.textContent = task?.mode === 'image' ? '图生视频' : task?.mode === 'text' ? '文生视频' : '模式待同步';
+    const time = view.createElement('time');
+    const value = task?.createdAt;
+    const date = typeof value === 'number' || (typeof value === 'string' && value.trim()) ? new Date(value) : null;
+    if (date && Number.isFinite(date.getTime())) {
+      time.dateTime = date.toISOString();
+      time.textContent = date.toLocaleString('zh-CN', { hour12: false });
+    } else time.textContent = '时间待同步';
+    metadata.append(mode, time);
+    const summary = view.createElement('p');
+    summary.className = 'task-history-summary';
+    const request = parseTaskRequest(task?.requestJson);
+    const scalar = (value) => typeof value === 'string' ? value.trim() : typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
+    const duration = scalar(request.duration);
+    summary.textContent = [scalar(request.model), scalar(request.resolution), duration ? `${duration}秒` : '', scalar(request.aspectRatio)].filter(Boolean).join(' · ') || '参数待同步';
+    details.append(status, metadata, summary);
+    const action = view.createElement(model.href ? 'a' : 'span');
+    action.className = 'task-history-action';
+    action.textContent = model.action;
+    if (model.href) { action.href = model.href; action.dataset.taskId = task?.id || ''; }
+    item.append(details, action);
+    history.append(item);
+  }
+  if (focusedTaskId) [...history.querySelectorAll('a[data-task-id]')].find((link) => link.dataset.taskId === focusedTaskId)?.focus();
 }
 
 export function taskPresentationState(tasks = [], selectedTaskId = '') {
@@ -421,9 +440,6 @@ async function request(path, options = {}) {
 }
 
 function setup() {
-  const loginView = document.querySelector('#login-view');
-  const workspace = document.querySelector('#workspace-view');
-  const loginForm = document.querySelector('#login-form');
   const generator = document.querySelector('#generator-form');
   const statusLight = document.querySelector('#status-light');
   const statusText = document.querySelector('#status-text');
@@ -610,23 +626,8 @@ function setup() {
     returnCurrentTask.hidden = !returnCurrentTaskId(projectTasks, selectedTaskId, stageOverride, submittingWithoutTask);
     const history = document.querySelector('#task-history');
     const historyWrap = document.querySelector('#task-history-wrap');
-    const focusedTaskId = history.contains(document.activeElement) ? document.activeElement.dataset.taskId : '';
-    history.replaceChildren();
-    state.completed.forEach(({ task }, index) => {
-      const item = document.createElement('button'); item.type = 'button'; item.className = 'task-history-item';
-      const label = document.createElement('strong'); label.textContent = `完成片段 ${String(index + 1).padStart(2, '0')}`;
-      const action = document.createElement('span'); action.textContent = '播放';
-      item.title = task.id || '';
-      item.dataset.taskId = task.id || '';
-      const selected = Boolean(selectedHistoryId) && selectedHistoryId === task.id;
-      item.classList.toggle('active', selected);
-      item.setAttribute('aria-pressed', String(selected));
-      item.append(label, action);
-      item.onclick = () => { selectedTaskId = task.id; stageOverride = null; submittingWithoutTask = false; renderTasks(); };
-      history.append(item);
-    });
-    historyWrap.hidden = state.completed.length === 0;
-    if (focusedTaskId) [...history.children].find((item) => item.dataset.taskId === focusedTaskId)?.focus();
+    renderTaskHistory(history, projectTasks, currentProjectId, selectedHistoryId);
+    historyWrap.hidden = projectTasks.length === 0;
     if (submittingWithoutTask) showSubmittingStage();
     else renderSelectedTask(visibleStage);
     poller.sync(currentProjectId, projectTasks);
@@ -751,10 +752,16 @@ function setup() {
   async function loadProjects() {
     const response = await request('/api/projects');
     projects = response.projects || [];
-    const selected = selectCurrentProject(projects, readStoredProjectId(projectStorage()));
+    const selected = selectInitialProject(projects, readStoredProjectId(projectStorage()), window.location.search);
     renderProjects();
-    if (selected) await switchProject(selected);
-    else projectError.textContent = '暂无可用项目';
+    if (selected) {
+      await switchProject(selected);
+      if (currentProjectId === selected.id && new URLSearchParams(window.location.search).has('project')) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('project');
+        window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+      }
+    } else projectError.textContent = '暂无可用项目';
   }
 
   const fill = (select, values) => { select.innerHTML = values.map((value) => `<option value="${value}">${value}${select === duration ? ' 秒' : ''}</option>`).join(''); };
@@ -784,15 +791,11 @@ function setup() {
     await refreshStatus();
     await loadProjects();
   });
-  async function enterWorkspace() {
-    loginView.hidden = true; workspace.hidden = false;
+  async function loadWorkspace() {
     retryWorkspace.hidden = true;
     try { await loadWorkspaceEntry(); }
     catch (error) { projectError.textContent = `工作台加载失败：${error.message}`; retryWorkspace.hidden = false; throw error; }
   }
-  request('/api/session').then(enterWorkspace).catch(() => {});
-  document.querySelector('#password-toggle').onclick = () => { const input = document.querySelector('#password'); input.type = input.type === 'password' ? 'text' : 'password'; };
-  loginForm.onsubmit = async (event) => { event.preventDefault(); try { await request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password: document.querySelector('#password').value }) }); await enterWorkspace(); } catch (error) { document.querySelector('#login-error').textContent = error.message; } };
   document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); document.querySelector('#upload-field').hidden = mode !== 'image'; updateSubmitDisabled(); fillModels(); saveDraft(); });
   modelSelect.onchange = () => { updateOptions(); saveDraft(); };
   generator.addEventListener('input', saveDraft);
@@ -824,7 +827,7 @@ function setup() {
     if (next >= 0 && ((event.shiftKey && current <= 0) || (!event.shiftKey && current === focusable.length - 1) || current < 0)) { event.preventDefault(); focusable[next].focus(); }
   });
   addEventListener('resize', () => { if (drawerOpen && !isMobileDrawer()) setDrawer(false); else sidebar.inert = sidebarShouldBeInert(drawerOpen, isMobileDrawer()); setSidebarCollapsed(sidebarCollapsed); });
-  retryWorkspace.onclick = () => { enterWorkspace().catch(() => {}); };
+  retryWorkspace.onclick = () => { loadWorkspace().catch(() => {}); };
   document.querySelector('#new-project').onclick = () => { createForm.hidden = false; document.querySelector('#new-project-name').focus(); };
   document.querySelector('#cancel-create-project').onclick = () => { createForm.hidden = true; createForm.reset(); projectError.textContent = ''; };
   createForm.onsubmit = async (event) => {
@@ -907,6 +910,7 @@ function setup() {
     } finally { updateSubmitDisabled(); }
   };
   document.querySelector('#refresh-status').onclick = refreshStatus;
-  document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.reload(); };
+  document.querySelector('#logout').onclick = async () => { await request('/api/session', { method: 'DELETE' }); location.replace('/login'); };
+  loadWorkspace().catch(() => {});
 }
 if (typeof document !== 'undefined') setup();

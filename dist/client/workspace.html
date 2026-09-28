@@ -5,19 +5,13 @@
   <meta name="theme-color" content="#070907"><meta name="description" content="可灵视频生成工作台">
   <title>可灵工作台 · 视频生成</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/project-navigation.css"><link rel="stylesheet" href="/image-preview.css"><link rel="stylesheet" href="/task-history.css">
 </head>
-<body>
+<body class="workspace-page">
   <main class="stage">
     <video class="stage-video" aria-hidden="true" tabindex="-1" muted autoplay loop playsinline preload="metadata" poster="/assets/alpine-runner.jpg">
       <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260521_014404_fadafdb1-4df6-4699-be9c-77d25f39a3d0.mp4" type="video/mp4">
     </video>
     <header class="masthead"><p><span>WORKSPACE</span>可灵工作台</p><b>K</b><p><span>MODULE 01</span>视频生成</p></header>
-    <section id="login-view" class="login-wrap">
-      <div class="login-card">
-        <p class="eyebrow">KELING WORKSPACE</p><h1>欢迎回来</h1><p class="intro">进入你的智能创作空间</p>
-        <form id="login-form"><label>用户名<input id="username" autocomplete="username" required></label><label>密码<span class="password"><input id="password" type="password" autocomplete="current-password" required><button id="password-toggle" type="button">显示</button></span></label><p id="login-error" class="error" aria-live="polite"></p><button class="primary" type="submit">登录工作台 <span>↗</span></button></form>
-      </div>
-    </section>
-    <section id="workspace-view" class="workspace" hidden>
+    <section id="workspace-view" class="workspace">
       <button id="project-drawer-toggle" class="project-drawer-toggle" type="button" aria-expanded="false" aria-controls="project-sidebar"><span>项目</span><strong id="mobile-project-name">—</strong></button>
       <div id="project-backdrop" class="project-backdrop" hidden></div>
       <div class="workspace-shell">
@@ -47,12 +41,12 @@
                 <div id="result-terminal" class="result-layer terminal-state" hidden><h3 id="terminal-title"></h3><p id="terminal-copy"></p></div>
                 <video id="result-video" controls hidden></video>
               </div>
-              <div id="task-history-wrap" class="task-history-wrap" hidden><p class="eyebrow">已完成片段</p><div id="task-history" class="task-history"></div></div>
+              <div id="task-history-wrap" class="task-history-wrap" hidden><p class="eyebrow">任务记录</p><div id="task-history" class="task-history"></div></div>
             </aside>
           </div>
           <p id="last-check" class="last-check">尚未连接</p>
         </div>
       </div>
     </section>
-  </main><script type="module" src="/app.33bc1589042b.js"></script>
+  </main><script type="module" src="/app.d4f260dfd4e3.js"></script>
 </body></html>
