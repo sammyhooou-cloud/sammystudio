@@ -56,6 +56,10 @@ test('result stage keeps all display states in one fixed region', () => {
   assert.match(rule('#result-video'), /object-fit\s*:\s*contain/);
 });
 
+test('growing task history does not stretch the generator form', () => {
+  assert.match(rule('.workspace-grid > .generator'), /align-self\s*:\s*start/);
+});
+
 test('generation visual animates a gradient without moving its container', () => {
   assert.match(rule('.generation-visual'), /(?:conic|linear|radial)-gradient\s*\(/);
   assert.match(css, /@keyframes\s+generation-[\w-]+\s*\{[^}]*\}[^}]*\}/);
