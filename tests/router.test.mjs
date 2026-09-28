@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
+import { siteAssets } from '../src/site-assets.js';
 
 function env() {
   return {
@@ -60,6 +61,93 @@ class RouteDb {
 }
 
 const sessionHeaders = { cookie: 'keling_session=test-token', origin: 'https://site.test', 'content-type': 'application/json' };
+
+function seedDocumentAssets(t) {
+  for (const page of ['login', 'workspace', 'result']) {
+    const key = `/${page}.html`;
+    const previous = siteAssets.get(key);
+    siteAssets.set(key, { body: `<html>${page} page</html>`, type: 'text/html; charset=utf-8' });
+    t.after(() => previous ? siteAssets.set(key, previous) : siteAssets.delete(key));
+  }
+}
+
+function pageDb() {
+  return {
+    prepare(sql) {
+      assert.match(sql, /^SELECT token_hash, expires_at FROM admin_sessions/);
+      return { bind() { return { async first() { return { token_hash: 'valid', expires_at: Date.now() + 60_000 }; } }; } };
+    },
+  };
+}
+
+test('root document navigation redirects according to authentication', async () => {
+  for (const method of ['GET', 'HEAD']) {
+    for (const authenticated of [false, true]) {
+      const response = await worker.fetch(new Request('https://site.test/', { method, headers: authenticated ? sessionHeaders : undefined }), { DB: pageDb() }, {});
+      assert.equal(response.status, 302);
+      assert.equal(response.headers.get('location'), `https://site.test/${authenticated ? 'workspace' : 'login'}`);
+    }
+  }
+});
+
+test('login document serves anonymous visitors and redirects authenticated visitors', async (t) => {
+  seedDocumentAssets(t);
+  for (const method of ['GET', 'HEAD']) {
+    const anonymous = await worker.fetch(new Request('https://site.test/login', { method }), { DB: pageDb() }, {});
+    assert.equal(anonymous.status, 200);
+    assert.match(anonymous.headers.get('content-type'), /^text\/html/);
+    if (method === 'GET') assert.equal(await anonymous.text(), '<html>login page</html>');
+    const authenticated = await worker.fetch(new Request('https://site.test/login', { method, headers: sessionHeaders }), { DB: pageDb() }, {});
+    assert.equal(authenticated.status, 302);
+    assert.equal(authenticated.headers.get('location'), 'https://site.test/workspace');
+  }
+});
+
+test('workspace and result documents require authentication without schema initialization', async (t) => {
+  seedDocumentAssets(t);
+  for (const [pathname, page] of [['/workspace', 'workspace'], ['/projects/project-1/results/task-1', 'result']]) {
+    for (const method of ['GET', 'HEAD']) {
+      const anonymous = await worker.fetch(new Request(`https://site.test${pathname}`, { method }), { DB: pageDb() }, {});
+      assert.equal(anonymous.status, 302, `${method} ${pathname}`);
+      assert.equal(anonymous.headers.get('location'), 'https://site.test/login');
+      const authenticated = await worker.fetch(new Request(`https://site.test${pathname}`, { method, headers: sessionHeaders }), { DB: pageDb() }, {});
+      assert.equal(authenticated.status, 200, `${method} ${pathname}`);
+      assert.match(authenticated.headers.get('content-type'), /^text\/html/);
+      if (method === 'GET') assert.equal(await authenticated.text(), `<html>${page} page</html>`);
+    }
+  }
+});
+
+test('static assets, unmatched paths, and unrelated POSTs preserve asset fallback', async (t) => {
+  const key = '/styles.css';
+  const previous = siteAssets.get(key);
+  siteAssets.set(key, { body: 'body { color: red; }', type: 'text/css' });
+  t.after(() => previous ? siteAssets.set(key, previous) : siteAssets.delete(key));
+  const runtime = { DB: { prepare() { throw new Error('Assets must not query sessions or initialize schema'); } }, ASSETS: { fetch: async () => new Response('fallback asset') } };
+  const css = await worker.fetch(new Request('https://site.test/styles.css'), runtime, {});
+  assert.equal(await css.text(), 'body { color: red; }');
+  for (const pathname of ['/app.js', '/image.png', '/missing', '/projects//results/task-1', '/projects/project-1/results/', '/projects/project-1/results/task-1/extra']) {
+    const response = await worker.fetch(new Request(`https://site.test${pathname}`), runtime, {});
+    assert.equal(response.status, 200, pathname);
+    assert.equal(await response.text(), 'fallback asset');
+  }
+  for (const pathname of ['/', '/login', '/workspace', '/projects/project-1/results/task-1']) {
+    const response = await worker.fetch(new Request(`https://site.test${pathname}`, { method: 'POST' }), runtime, {});
+    assert.equal(response.status, 200, pathname);
+    assert.equal(await response.text(), 'fallback asset');
+  }
+});
+
+test('missing document assets use the normal fallback or 404 response', async () => {
+  for (const [pathname, headers] of [['/login', undefined], ['/workspace', sessionHeaders], ['/projects/project-1/results/task-1', sessionHeaders]]) {
+    const request = new Request(`https://site.test${pathname}`, { headers });
+    const missing = await worker.fetch(request, { DB: pageDb() }, {});
+    assert.equal(missing.status, 404, pathname);
+    assert.equal(await missing.text(), 'Not found');
+    const fallback = await worker.fetch(request, { DB: pageDb(), ASSETS: { fetch: async () => new Response('fallback asset') } }, {});
+    assert.equal(await fallback.text(), 'fallback asset');
+  }
+});
 
 async function projectRequest(db, pathname, method = 'GET', body) {
   return worker.fetch(new Request(`https://site.test${pathname}`, {
@@ -148,8 +236,11 @@ class TaskRouteDb extends RouteDb {
         if (sql.includes('JOIN project_tasks')) {
           if (sql.includes('video_tasks.id = ?')) {
             const [id, projectId] = this.values;
-            return db.projectTasks.some(({ task_id, project_id }) => task_id === id && project_id === projectId)
-              ? db.tasks.find((task) => task.id === id) ?? null : null;
+            if (!db.projectTasks.some(({ task_id, project_id }) => task_id === id && project_id === projectId)) return null;
+            const task = db.tasks.find((task) => task.id === id) ?? null;
+            if (!sql.includes('JOIN projects')) return task;
+            const project = db.projects.find(({ id }) => id === projectId);
+            return task && project ? { ...task, project_name: project.name } : null;
           }
           const [idempotencyKey, projectId] = this.values;
           const taskIds = db.projectTasks.filter(({ project_id }) => project_id === projectId).map(({ task_id }) => task_id);
@@ -160,6 +251,81 @@ class TaskRouteDb extends RouteDb {
     };
   }
 }
+
+test('task detail API preserves anonymous JSON 401 responses', async () => {
+  const response = await worker.fetch(new Request('https://site.test/api/projects/project-1/tasks/task-1'), { DB: new TaskRouteDb() }, {});
+  assert.equal(response.status, 401);
+  assert.match(response.headers.get('content-type'), /^application\/json/);
+  assert.equal(response.headers.get('location'), null);
+  assert.deepEqual(await response.json(), { error: '请先登录' });
+});
+
+test('task detail API decodes both IDs and returns the owned task detail', async () => {
+  const db = new TaskRouteDb();
+  db.projects.push({ id: 'project one', name: '项目详情', created_at: 1, updated_at: 2 });
+  db.tasks.push({ id: 'task one', remote_id: 'remote-1', mode: 'text', status: 'succeeded', request_json: JSON.stringify({ prompt: 'ocean', model: 'kling-v1', duration: 5, resolution: '720p', aspectRatio: '16:9', privateToken: 'secret' }), result_json: '{"url":"https://video.test/result.mp4"}', created_at: 1, updated_at: 2 });
+  db.projectTasks.push({ project_id: 'project one', task_id: 'task one' });
+  const response = await projectRequest(db, '/api/projects/project%20one/tasks/task%20one');
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { id: 'task one', projectId: 'project one', projectName: '项目详情', remoteId: 'remote-1', mode: 'text', status: 'succeeded', request: { prompt: 'ocean', model: 'kling-v1', duration: 5, resolution: '720p', aspectRatio: '16:9' }, resultJson: '{"url":"https://video.test/result.mp4"}', createdAt: 1, updatedAt: 2 });
+  assert.equal(db.statusQueries, 0);
+});
+
+test('task detail API hides missing and cross-project tasks', async () => {
+  const db = new TaskRouteDb();
+  db.projects.push({ id: 'project-2', name: 'Two', created_at: 2, updated_at: 2 });
+  db.tasks.push({ id: 'task-1', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
+  for (const pathname of ['/api/projects/project-2/tasks/task-1', '/api/projects/project-1/tasks/missing', '/api/projects/missing/tasks/task-1']) {
+    const response = await projectRequest(db, pathname);
+    assert.equal(response.status, 404, pathname);
+    assert.deepEqual(await response.json(), { error: '任务不存在' });
+  }
+});
+
+test('task detail API rejects malformed and empty IDs', async () => {
+  for (const pathname of ['/api/projects/%E0%A4%A/tasks/task-1', '/api/projects/project-1/tasks/%E0%A4%A', '/api/projects//tasks/task-1', '/api/projects/project-1/tasks/']) {
+    const response = await projectRequest(new TaskRouteDb(), pathname);
+    assert.equal(response.status, 400, pathname);
+    assert.deepEqual(await response.json(), { error: '任务参数无效' });
+  }
+});
+
+test('task detail API sanitizes unexpected database failures', async () => {
+  class FailingDetailDb extends TaskRouteDb {
+    prepare(sql) {
+      if (!sql.includes('FROM video_tasks')) return super.prepare(sql);
+      return { bind() { return { async first() { throw new Error('database password leaked'); } }; } };
+    }
+  }
+  const response = await projectRequest(new FailingDetailDb(), '/api/projects/project-1/tasks/task-1');
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: '任务详情暂不可用' });
+});
+
+test('failed OAuth callbacks return to the workspace with an error flag', async () => {
+  const response = await worker.fetch(new Request('https://site.test/api/kling/oauth/callback'), { DB: new RouteDb() }, {});
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), 'https://site.test/workspace?oauth_error=1');
+});
+
+test('successful OAuth callbacks return to the workspace with an authorization flag', async (t) => {
+  class OAuthRouteDb extends RouteDb {
+    prepare(sql) {
+      if (sql.startsWith('SELECT') && sql.includes('FROM oauth_states')) return { bind() { return { async first() { return { verifier: 'verifier', redirect_uri: 'https://site.test/api/kling/oauth/callback', expires_at: Date.now() + 60_000 }; } }; } };
+      if (sql.startsWith('SELECT') && sql.includes('FROM oauth_clients')) return { async first() { return { client_id: 'client-1' }; } };
+      return super.prepare(sql);
+    }
+  }
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    if (url === 'https://klingai.com/auth/.well-known/oauth-authorization-server') return Response.json({ token_endpoint: 'https://klingai.com/auth/token' });
+    assert.equal(url, 'https://klingai.com/auth/token');
+    return Response.json({ access_token: 'token', expires_in: 3600 });
+  });
+  const response = await worker.fetch(new Request('https://site.test/api/kling/oauth/callback?state=valid-state&code=valid-code'), { DB: new OAuthRouteDb(), TOKEN_ENCRYPTION_KEY: 'test-secret' }, {});
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), 'https://site.test/workspace?authorized=1');
+});
 
 test('task status route requires authentication and project ownership', async () => {
   const db = new TaskRouteDb();

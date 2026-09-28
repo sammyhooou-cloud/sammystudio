@@ -1,7 +1,7 @@
 import { createSession, deleteSession, requireSession, unauthorized } from './auth.js';
 import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
-import { submitTask, getTaskStatus, getTaskByAttempt, TaskError } from './tasks.js';
+import { submitTask, getTaskStatus, getTaskByAttempt, getTaskDetail, TaskError } from './tasks.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
 import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
@@ -31,6 +31,18 @@ function siteAsset(pathname) {
   if (!asset) return null;
   const body = asset.base64 ? Uint8Array.from(atob(asset.body), (char) => char.charCodeAt(0)) : asset.body;
   return new Response(body, { headers: { 'content-type': asset.type, 'cache-control': asset.immutable ? 'public, max-age=31536000, immutable' : 'no-cache, must-revalidate' } });
+}
+
+async function documentResponse(request, env) {
+  if (!['GET', 'HEAD'].includes(request.method)) return null;
+  const url = new URL(request.url);
+  const resultMatch = url.pathname.match(/^\/projects\/[^/]+\/results\/[^/]+$/);
+  if (!['/', '/login', '/workspace'].includes(url.pathname) && !resultMatch) return null;
+  const session = await requireSession(request, env);
+  if (url.pathname === '/') return Response.redirect(`${url.origin}${session ? '/workspace' : '/login'}`, 302);
+  if (url.pathname === '/login') return session ? Response.redirect(`${url.origin}/workspace`, 302) : siteAsset('/login.html');
+  if (!session) return Response.redirect(`${url.origin}/login`, 302);
+  return siteAsset(url.pathname === '/workspace' ? '/workspace.html' : '/result.html');
 }
 
 export function mutationRequestError(request) {
@@ -144,7 +156,7 @@ async function api(request, env) {
   }
   if (url.pathname === '/api/kling/status' && request.method === 'GET') return json(await getKlingStatus(env));
   if (url.pathname === '/api/kling/oauth/start' && request.method === 'GET') return Response.redirect((await beginAuthorization(request, env)).url.toString(), 302);
-  if (url.pathname === '/api/kling/oauth/callback' && request.method === 'GET') { try { await finishAuthorization(request, env); return Response.redirect(`${url.origin}/?authorized=1`, 302); } catch (error) { return Response.redirect(`${url.origin}/?oauth_error=1`, 302); } }
+  if (url.pathname === '/api/kling/oauth/callback' && request.method === 'GET') { try { await finishAuthorization(request, env); return Response.redirect(`${url.origin}/workspace?authorized=1`, 302); } catch (error) { return Response.redirect(`${url.origin}/workspace?oauth_error=1`, 302); } }
   if (url.pathname === '/api/uploads' && request.method === 'POST') return upload(request, env);
   if (url.pathname === '/api/video/tasks' && request.method === 'POST') {
     let input;
@@ -162,6 +174,17 @@ async function api(request, env) {
     catch (error) {
       if (error instanceof TaskError) return json({ error: error.message }, error.status);
       return json({ error: '任务状态暂不可用' }, 503);
+    }
+  }
+  const taskDetailMatch = url.pathname.match(/^\/api\/projects\/([^/]*)\/tasks\/([^/]*)$/);
+  if (taskDetailMatch && request.method === 'GET') {
+    const projectId = decodeProjectId(taskDetailMatch[1]);
+    const taskId = decodeProjectId(taskDetailMatch[2]);
+    if (!projectId || !taskId) return json({ error: '任务参数无效' }, 400);
+    try { return json(await getTaskDetail(taskId, projectId, env)); }
+    catch (error) {
+      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      return json({ error: '任务详情暂不可用' }, 503);
     }
   }
   const taskMatch = url.pathname.match(/^\/api\/video\/tasks\/([^/]+)$/);
@@ -182,7 +205,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api/')) await ensureSchema(env.DB);
-    const response = url.pathname.startsWith('/api/') ? await api(request, env, ctx) : siteAsset(url.pathname) || (env.ASSETS ? await env.ASSETS.fetch(request) : new Response('Not found', { status: 404 }));
+    const response = url.pathname.startsWith('/api/') ? await api(request, env, ctx) : await documentResponse(request, env) || siteAsset(url.pathname) || (env.ASSETS ? await env.ASSETS.fetch(request) : new Response('Not found', { status: 404 }));
     return withSecurity(response);
   },
 };
