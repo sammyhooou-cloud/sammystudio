@@ -1,5 +1,5 @@
 import { createImageUploadController, openImageReplacement, renderImagePreview } from './image-preview.js';
-import { normalizeTaskStatus, safeVideoUrl as extractVideoUrl, taskProgress as extractTaskProgress } from './task-presenter.js';
+import { normalizeTaskStatus, parseTaskRequest, safeVideoUrl as extractVideoUrl, taskProgress as extractTaskProgress, taskDetailHref } from './task-presenter.js';
 
 export { extractVideoUrl, extractTaskProgress };
 
@@ -218,6 +218,65 @@ function taskResult(task) {
   const value = task?.resultJson;
   if (typeof value !== 'string') return value && typeof value === 'object' ? value : null;
   try { return JSON.parse(value); } catch { return null; }
+}
+
+export function taskListItemModel(task, projectId) {
+  const status = taskStatus(task);
+  if (activeTaskStatuses.has(status)) {
+    const label = { submitting: '正在提交', queued: '排队中', generating: '生成中' }[status];
+    return { label, action: '生成中', href: '', tone: 'active' };
+  }
+  const href = projectId && task?.id ? taskDetailHref(projectId, task.id) : '';
+  if (successfulTaskStatuses.has(status)) {
+    return { label: '已完成', action: extractVideoUrl(taskResult(task)) ? '查看结果' : '查看详情', href, tone: 'success' };
+  }
+  return status === 'failed'
+    ? { label: '生成失败', action: '查看详情', href, tone: 'failure' }
+    : { label: '状态待核对', action: '查看详情', href, tone: 'warning' };
+}
+
+export function renderTaskHistory(history, tasks, projectId, selectedTaskId = '') {
+  const view = history.ownerDocument;
+  const focusedTaskId = history.contains(view.activeElement) ? view.activeElement.dataset.taskId : '';
+  history.replaceChildren();
+  for (const task of tasks) {
+    const model = taskListItemModel(task, projectId);
+    const item = view.createElement('article');
+    item.className = `task-history-item tone-${model.tone}`;
+    item.dataset.taskId = task?.id || '';
+    item.classList.toggle('active', Boolean(selectedTaskId) && selectedTaskId === task?.id);
+    const details = view.createElement('div');
+    details.className = 'task-history-details';
+    const status = view.createElement('strong');
+    status.className = 'task-history-status';
+    status.textContent = model.label;
+    const metadata = view.createElement('div');
+    metadata.className = 'task-history-meta';
+    const mode = view.createElement('span');
+    mode.textContent = task?.mode === 'image' ? '图生视频' : task?.mode === 'text' ? '文生视频' : '模式待同步';
+    const time = view.createElement('time');
+    const value = task?.createdAt;
+    const date = typeof value === 'number' || (typeof value === 'string' && value.trim()) ? new Date(value) : null;
+    if (date && Number.isFinite(date.getTime())) {
+      time.dateTime = date.toISOString();
+      time.textContent = date.toLocaleString('zh-CN', { hour12: false });
+    } else time.textContent = '时间待同步';
+    metadata.append(mode, time);
+    const summary = view.createElement('p');
+    summary.className = 'task-history-summary';
+    const request = parseTaskRequest(task?.requestJson);
+    const scalar = (value) => typeof value === 'string' ? value.trim() : typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
+    const duration = scalar(request.duration);
+    summary.textContent = [scalar(request.model), scalar(request.resolution), duration ? `${duration}秒` : '', scalar(request.aspectRatio)].filter(Boolean).join(' · ') || '参数待同步';
+    details.append(status, metadata, summary);
+    const action = view.createElement(model.href ? 'a' : 'span');
+    action.className = 'task-history-action';
+    action.textContent = model.action;
+    if (model.href) { action.href = model.href; action.dataset.taskId = task?.id || ''; }
+    item.append(details, action);
+    history.append(item);
+  }
+  if (focusedTaskId) [...history.querySelectorAll('a[data-task-id]')].find((link) => link.dataset.taskId === focusedTaskId)?.focus();
 }
 
 export function taskPresentationState(tasks = [], selectedTaskId = '') {
@@ -564,23 +623,8 @@ function setup() {
     returnCurrentTask.hidden = !returnCurrentTaskId(projectTasks, selectedTaskId, stageOverride, submittingWithoutTask);
     const history = document.querySelector('#task-history');
     const historyWrap = document.querySelector('#task-history-wrap');
-    const focusedTaskId = history.contains(document.activeElement) ? document.activeElement.dataset.taskId : '';
-    history.replaceChildren();
-    state.completed.forEach(({ task }, index) => {
-      const item = document.createElement('button'); item.type = 'button'; item.className = 'task-history-item';
-      const label = document.createElement('strong'); label.textContent = `完成片段 ${String(index + 1).padStart(2, '0')}`;
-      const action = document.createElement('span'); action.textContent = '播放';
-      item.title = task.id || '';
-      item.dataset.taskId = task.id || '';
-      const selected = Boolean(selectedHistoryId) && selectedHistoryId === task.id;
-      item.classList.toggle('active', selected);
-      item.setAttribute('aria-pressed', String(selected));
-      item.append(label, action);
-      item.onclick = () => { selectedTaskId = task.id; stageOverride = null; submittingWithoutTask = false; renderTasks(); };
-      history.append(item);
-    });
-    historyWrap.hidden = state.completed.length === 0;
-    if (focusedTaskId) [...history.children].find((item) => item.dataset.taskId === focusedTaskId)?.focus();
+    renderTaskHistory(history, projectTasks, currentProjectId, selectedHistoryId);
+    historyWrap.hidden = projectTasks.length === 0;
     if (submittingWithoutTask) showSubmittingStage();
     else renderSelectedTask(visibleStage);
     poller.sync(currentProjectId, projectTasks);

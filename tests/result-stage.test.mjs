@@ -14,7 +14,7 @@ function rule(selector) {
   return css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`))?.[1] || '';
 }
 
-test('result markup defines distinct layers and a completed clips list', () => {
+test('result markup defines distinct layers and a task records list', () => {
   assert.match(html, /id="result-stage"\s+class="result-stage"/);
   assert.match(html, /id="result-empty"[^>]*class="[^"]*result-layer/);
   assert.match(html, /id="result-progress"[^>]*class="[^"]*result-layer generation-state[^"]*"[^>]*hidden/);
@@ -25,7 +25,7 @@ test('result markup defines distinct layers and a completed clips list', () => {
   assert.match(html, /id="terminal-copy"/);
   assert.match(html, /id="result-video"[^>]*controls[^>]*hidden/);
   assert.match(html, /id="task-history-wrap"[^>]*hidden/);
-  assert.match(html, /<p class="eyebrow">已完成片段<\/p>/);
+  assert.match(html, /<p class="eyebrow">任务记录<\/p>/);
 });
 
 test('result header exposes a hidden accessible return control and focuses the current task after activation', () => {
@@ -80,8 +80,14 @@ test('pending attempt guidance does not replace the visible stage status', () =>
   assert.doesNotMatch(blockedSubmit, /#task-state/);
 });
 
-test('choosing a completed clip can replace the temporary submission stage', () => {
-  assert.match(app, /item\.onclick\s*=\s*\(\)\s*=>\s*\{\s*selectedTaskId\s*=\s*task\.id;\s*stageOverride\s*=\s*null;\s*submittingWithoutTask\s*=\s*false;\s*renderTasks\(\)/);
+test('task records use explicit detail navigation without taking over the fixed stage', () => {
+  assert.match(app, /renderTaskHistory\(history, projectTasks, currentProjectId, selectedHistoryId\)/);
+  assert.doesNotMatch(app, /item\.onclick\s*=\s*\(\)\s*=>\s*\{\s*selectedTaskId\s*=\s*task\.id/);
+  assert.match(app, /historyWrap\.hidden = projectTasks\.length === 0/);
+  assert.match(rule('.task-history'), /display\s*:\s*grid/);
+  assert.match(rule('.task-history-item'), /grid-template-columns\s*:\s*minmax\(0,\s*1fr\) 84px/);
+  assert.doesNotMatch(rule('.task-history-item'), /position\s*:\s*absolute/);
+  assert.match(rule('.task-history-summary'), /overflow-wrap\s*:\s*anywhere/);
 });
 
 test('submission entry rebuilds history with no completed clip selected', () => {

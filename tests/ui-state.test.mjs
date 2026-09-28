@@ -90,6 +90,93 @@ test('shared task presenter safely rejects malformed request JSON and non-object
   }
 });
 
+test('task records expose a project-scoped result link only for playable successes', () => {
+  assert.equal(typeof stageHelpers.taskListItemModel, 'function');
+  const completed = { id: 'task-1', status: 'succeeded', resultJson: '{"videoUrl":"https://cdn.test/clip.mp4"}' };
+  assert.deepEqual(stageHelpers.taskListItemModel(completed, 'project-1'), {
+    label: '已完成', action: '查看结果', href: '/projects/project-1/results/task-1', tone: 'success',
+  });
+  for (const resultJson of [undefined, '{broken', '{"videoUrl":"javascript:alert(1)"}']) {
+    assert.equal(stageHelpers.taskListItemModel({ ...completed, resultJson }, 'project-1').action, '查看详情');
+  }
+});
+
+test('task records keep active tasks non-clickable with truthful status labels', () => {
+  assert.equal(typeof stageHelpers.taskListItemModel, 'function');
+  for (const [status, label] of [['queued', '排队中'], ['generating', '生成中'], ['submitting', '正在提交']]) {
+    assert.deepEqual(stageHelpers.taskListItemModel({ id: 'task-1', status }, 'project-1'), {
+      label, action: '生成中', href: '', tone: 'active',
+    });
+  }
+});
+
+test('failed and unknown task records offer encoded project-scoped detail links', () => {
+  assert.equal(typeof stageHelpers.taskListItemModel, 'function');
+  for (const [status, label, tone] of [['FAILED', '生成失败', 'failure'], ['unknown', '状态待核对', 'warning']]) {
+    assert.deepEqual(stageHelpers.taskListItemModel({ id: 'task/1', status }, 'project a'), {
+      label, action: '查看详情', href: '/projects/project%20a/results/task%2F1', tone,
+    });
+  }
+});
+
+function taskHistoryHarness() {
+  const view = { activeElement: null };
+  const createElement = (tagName) => ({
+    tagName, children: [], dataset: {}, className: '', textContent: '',
+    classList: { toggle() {} },
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    contains(element) { return this === element || this.children.some((child) => child.contains(element)); },
+    querySelectorAll(selector) { return this.children.flatMap((child) => [...(child.tagName === 'a' ? [child] : []), ...child.querySelectorAll(selector)]); },
+    focus() { view.activeElement = this; },
+    setAttribute(name, value) { this[name] = value; },
+  });
+  view.createElement = createElement;
+  const history = createElement('div');
+  history.ownerDocument = view;
+  return { history, view };
+}
+
+test('task history renders every task in server order with safe metadata and explicit navigation', () => {
+  assert.equal(typeof stageHelpers.renderTaskHistory, 'function');
+  const { history } = taskHistoryHarness();
+  const tasks = [
+    { id: 'active', status: 'generating', mode: 'image', createdAt: 1750000000000, requestJson: '{"model":"<script>model</script>","resolution":"1080p","duration":5,"aspectRatio":"16:9"}' },
+    { id: 'done', status: 'succeeded', mode: 'text', resultJson: '{"videoUrl":"https://cdn.test/clip.mp4"}' },
+    { id: 'failed', status: 'failed', requestJson: '{broken' },
+    { id: 'unknown', status: 'unknown', requestJson: '[]' },
+  ];
+  stageHelpers.renderTaskHistory(history, tasks, 'project a');
+  assert.deepEqual(history.children.map((row) => row.dataset.taskId), tasks.map(({ id }) => id));
+  const [active, completed] = history.children;
+  assert.equal(active.children[0].children[1].children[0].textContent, '图生视频');
+  assert.equal(active.children[0].children[1].children[1].dateTime, '2025-06-15T15:06:40.000Z');
+  assert.equal(active.children[0].children[2].textContent, '<script>model</script> · 1080p · 5秒 · 16:9');
+  assert.equal(active.children[0].children[2].innerHTML, undefined);
+  assert.equal(active.children[1].tagName, 'span');
+  assert.equal(active.children[1].textContent, '生成中');
+  assert.equal(completed.children[1].tagName, 'a');
+  assert.equal(completed.children[1].href, '/projects/project%20a/results/done');
+  assert.equal(completed.children[1].textContent, '查看结果');
+  assert.equal(completed.children[1].onclick, undefined);
+  assert.equal(history.children[2].children[0].children[2].textContent, '参数待同步');
+});
+
+test('task history preserves link focus across polling renders and safely clears an empty list', () => {
+  assert.equal(typeof stageHelpers.renderTaskHistory, 'function');
+  const { history, view } = taskHistoryHarness();
+  const tasks = [{ id: 'task-1', status: 'failed', createdAt: 'invalid' }];
+  stageHelpers.renderTaskHistory(history, tasks, 'project-1');
+  const oldLink = history.children[0].children[1];
+  oldLink.focus();
+  stageHelpers.renderTaskHistory(history, tasks, 'project-1');
+  assert.notEqual(view.activeElement, oldLink);
+  assert.equal(view.activeElement, history.children[0].children[1]);
+  assert.equal(history.children[0].children[0].children[1].children[1].textContent, '时间待同步');
+  stageHelpers.renderTaskHistory(history, [], 'project-1');
+  assert.deepEqual(history.children, []);
+});
+
 test('new active task owns the stage while older playable success remains completed', () => {
   const tasks = [
     { id: 'new', status: 'generating', resultJson: '{"status":"PROCESSING"}' },
