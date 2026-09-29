@@ -13,14 +13,15 @@ function provider(deps = {}) {
   return adapter.createKlingProvider({}, { capabilitiesSource: models, ...deps });
 }
 
-test('provider registry contains Kling and rejects unknown or inherited IDs', () => {
+test('provider registry contains Kling and MiniMax and rejects unknown or inherited IDs', () => {
   assert.equal(typeof registry.createVideoProvider, 'function', 'provider registry must exist');
-  assert.deepEqual(registry.providerIds, ['kling']);
+  assert.deepEqual(registry.providerIds, ['kling', 'minimax']);
   assert.equal(Object.isFrozen(registry.providerIds), true);
-  for (const id of ['minimax', 'unknown', 'toString', '__proto__', undefined]) {
+  for (const id of ['unknown', 'toString', '__proto__', undefined]) {
     assert.throws(() => registry.createVideoProvider(id, {}), { message: '视频供应商无效' });
   }
   assert.equal(registry.createVideoProvider('kling', {}).id, 'kling');
+  assert.equal(registry.createVideoProvider('minimax', {}).id, 'minimax');
 });
 
 test('Kling adapter exposes the fixed provider contract and injectable status source', async () => {

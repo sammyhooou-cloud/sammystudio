@@ -1,6 +1,7 @@
 import { createKlingProvider } from './kling.js';
+import { createMiniMaxProvider } from './minimax.js';
 
-const factories = Object.freeze({ kling: createKlingProvider });
+const factories = Object.freeze({ kling: createKlingProvider, minimax: createMiniMaxProvider });
 export const providerIds = Object.freeze(Object.keys(factories));
 
 export function createVideoProvider(id, env, deps = {}) {
