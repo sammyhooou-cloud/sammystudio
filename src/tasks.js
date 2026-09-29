@@ -1,4 +1,5 @@
 import { createVideoProvider } from './providers/index.js';
+import { persistTaskOutput } from './task-outputs.js';
 
 export class TaskError extends Error {
   constructor(message, status, task, code) {
@@ -48,8 +49,22 @@ function taskProvider(id, env, options) {
   catch (error) {
     if (error instanceof TaskError) throw error;
     if (error.message === '视频供应商无效') throw new TaskError('视频供应商无效', 400);
-    throw new TaskError('视频供应商暂不可用', 503);
+    throw new TaskError('视频供应商暂不可用', 503, undefined, safeErrorCode(error));
   }
+}
+
+const providerErrorMessages = Object.freeze({
+  provider_not_configured: '请配置 MiniMax API Key',
+  provider_auth_failed: 'MiniMax 认证失败，请检查服务端配置',
+  insufficient_balance: 'MiniMax 额度不足，请前往控制台查看',
+  invalid_parameters: 'MiniMax 生成参数或参考图无效',
+  provider_unavailable: 'MiniMax 暂不可用，请稍后重试',
+  invalid_response: 'MiniMax 返回结果未确认，请勿重新创建任务',
+});
+
+function safeErrorCode(error) {
+  if (error instanceof TaskError) return error.code;
+  return Object.hasOwn(providerErrorMessages, error?.code) ? error.code : undefined;
 }
 
 async function loadCapabilities(provider) {
@@ -57,7 +72,7 @@ async function loadCapabilities(provider) {
   catch (error) {
     if (error instanceof TaskError) throw error;
     if (provider.id === 'kling' && error.status === 409) throw new TaskError('请先连接可灵 MCP', 409);
-    throw new TaskError('视频供应商暂不可用', 503);
+    throw new TaskError('视频供应商暂不可用', 503, undefined, safeErrorCode(error));
   }
 }
 
@@ -198,11 +213,13 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   } catch (error) {
     if (error?.submissionState === 'failed') {
       await markFailed(env.DB, id);
-      throw new TaskError('参考图上传失败', 502, { id, remote_id: null, status: 'failed' });
+      const code = safeErrorCode(error);
+      const message = providerId === 'minimax' ? providerErrorMessages[code] || 'MiniMax 提交失败，请稍后重试' : '参考图上传失败';
+      throw new TaskError(message, 502, { id, remote_id: null, status: 'failed' }, code);
     }
     await markUnknown(env.DB, id);
     const message = providerId === 'kling' ? '提交结果未确认，请勿重新创建任务；请联系管理员核对可灵记录' : '提交结果未确认，请勿重新创建任务；请联系管理员核对供应商记录';
-    throw new TaskError(message, 502, { id, remote_id: null, status: 'unknown' }, error instanceof TaskError ? error.code : undefined);
+    throw new TaskError(message, 502, { id, remote_id: null, status: 'unknown' }, safeErrorCode(error));
   }
   const remoteId = created?.remoteId || null;
   if (!remoteId) {
@@ -273,11 +290,22 @@ export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCal
   }
   if (!task.remote_id || !['queued', 'generating'].includes(task.status)) return { ...taskDto(task), resultJson: task.result_json || null };
   const options = fetcher && typeof fetcher === 'object' ? fetcher : { fetcher, toolCaller };
-  let result;
-  try { result = await taskProvider(task.provider || 'kling', env, options).query(task.remote_id); }
-  catch (error) { throw new TaskError('任务状态暂不可用', 503, undefined, error instanceof TaskError ? error.code : undefined); }
+  let provider, result;
+  try {
+    provider = taskProvider(task.provider || 'kling', env, options);
+    result = await provider.query(task.remote_id);
+  } catch (error) { throw new TaskError('任务状态暂不可用', 503, undefined, safeErrorCode(error)); }
   const status = result.status;
-  const resultJson = JSON.stringify(result.raw);
+  let storedResult = result.raw;
+  if (provider.persistOutput && status === 'succeeded') {
+    let videoUrl;
+    try {
+      if (!result.outputUrl) throw new Error('missing output');
+      videoUrl = await persistTaskOutput({ taskId: id, projectId, sourceUrl: result.outputUrl, env, fetcher: options.fetcher || fetch });
+    } catch { throw new TaskError('视频输出保存暂不可用，请稍后重试', 503, undefined, 'output_persist_failed'); }
+    storedResult = { providerResult: result.raw, videoUrl };
+  }
+  const resultJson = JSON.stringify(storedResult);
   await env.DB.prepare('UPDATE video_tasks SET status = ?, result_json = ?, updated_at = ? WHERE id = ? AND status IN (?, ?)').bind(status, resultJson, Date.now(), id, 'queued', 'generating').run();
   return { id, remote_id: task.remote_id, status, resultJson };
 }

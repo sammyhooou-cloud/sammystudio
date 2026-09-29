@@ -405,6 +405,85 @@ class TaskRouteDb extends RouteDb {
   }
 }
 
+class OutputRouteDb extends TaskRouteDb {
+  constructor() {
+    super();
+    this.outputs = [];
+    this.failOutputRead = false;
+  }
+
+  prepare(sql) {
+    if (!sql.includes('FROM task_outputs')) return super.prepare(sql);
+    const db = this;
+    return {
+      values: [],
+      bind(...values) { return { ...this, values }; },
+      async first() {
+        if (db.failOutputRead) throw new Error('database outputs/private.mp4 secret password');
+        const [taskId, projectId] = this.values;
+        if (!db.projectTasks.some(({ task_id, project_id }) => task_id === taskId && project_id === projectId)) return null;
+        return db.outputs.find(({ task_id }) => task_id === taskId) ?? null;
+      },
+    };
+  }
+}
+
+function outputRouteEnv(taskId = 'task-1', projectId = 'project-1') {
+  const db = new OutputRouteDb();
+  db.tasks.push({ id: taskId, status: 'succeeded' });
+  db.projectTasks.push({ project_id: projectId, task_id: taskId });
+  db.outputs.push({ task_id: taskId, object_key: 'outputs/private.mp4', content_type: 'video/mp4' });
+  return { DB: db, MEDIA: { get: async (key) => { assert.equal(key, 'outputs/private.mp4'); return { body: new Response('owned video').body }; } } };
+}
+
+async function outputRequest(runtime, pathname, headers = sessionHeaders) {
+  return worker.fetch(new Request(`https://site.test${pathname}`, { headers }), runtime, {});
+}
+
+test('task output API requires authentication before reading storage', async () => {
+  const runtime = outputRouteEnv(); runtime.MEDIA.get = () => assert.fail('anonymous request must not read storage');
+  const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output', {});
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: '请先登录' });
+});
+
+test('task output API decodes both IDs and streams an owned video with private caching', async () => {
+  const response = await outputRequest(outputRouteEnv('task /一', 'project /二'), `/api/projects/${encodeURIComponent('project /二')}/tasks/${encodeURIComponent('task /一')}/output`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'video/mp4');
+  assert.equal(response.headers.get('cache-control'), 'private, max-age=3600');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(await response.text(), 'owned video');
+});
+
+test('task output API hides missing, cross-project and missing-R2 outputs', async () => {
+  for (const pathname of ['/api/projects/other/tasks/task-1/output', '/api/projects/project-1/tasks/missing/output']) {
+    const runtime = outputRouteEnv(); runtime.MEDIA.get = () => assert.fail('missing ownership must not read storage');
+    const response = await outputRequest(runtime, pathname);
+    assert.equal(response.status, 404); assert.deepEqual(await response.json(), { error: '视频输出不存在' });
+  }
+  const runtime = outputRouteEnv(); runtime.MEDIA.get = async () => null;
+  const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output');
+  assert.equal(response.status, 404); assert.deepEqual(await response.json(), { error: '视频输出不存在' });
+});
+
+test('task output API rejects malformed and empty IDs', async () => {
+  for (const pathname of ['/api/projects/%E0%A4%A/tasks/task-1/output', '/api/projects/project-1/tasks/%E0%A4%A/output', '/api/projects//tasks/task-1/output', '/api/projects/project-1/tasks//output', '/api/projects/%20/tasks/task-1/output', '/api/projects/project-1/tasks/%20/output']) {
+    const response = await outputRequest(outputRouteEnv(), pathname);
+    assert.equal(response.status, 400, pathname); assert.deepEqual(await response.json(), { error: '任务参数无效' });
+  }
+});
+
+test('task output API sanitizes database and R2 exceptions consistently', async () => {
+  for (const failure of ['db', 'r2']) {
+    const runtime = outputRouteEnv();
+    if (failure === 'db') runtime.DB.failOutputRead = true;
+    else runtime.MEDIA.get = async () => { throw new Error('R2 outputs/private.mp4 secret credentials'); };
+    const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output');
+    assert.equal(response.status, 503); assert.deepEqual(await response.json(), { error: '视频输出暂不可用' });
+  }
+});
+
 test('task detail API preserves anonymous JSON 401 responses', async () => {
   const response = await worker.fetch(new Request('https://site.test/api/projects/project-1/tasks/task-1'), { DB: new TaskRouteDb() }, {});
   assert.equal(response.status, 401);

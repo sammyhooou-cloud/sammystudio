@@ -3,6 +3,7 @@ import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
 import { createVideoProvider } from './providers/index.js';
 import { submitTask, getTaskStatus, getTaskByAttempt, getTaskDetail, TaskError } from './tasks.js';
+import { readTaskOutput } from './task-outputs.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
 import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject, updateProjectProvider } from './projects.js';
@@ -204,6 +205,14 @@ async function api(request, env) {
       if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务状态暂不可用' }, 503);
     }
+  }
+  const taskOutputMatch = url.pathname.match(/^\/api\/projects\/([^/]*)\/tasks\/([^/]*)\/output$/);
+  if (taskOutputMatch && request.method === 'GET') {
+    const projectId = decodeProjectId(taskOutputMatch[1]);
+    const taskId = decodeProjectId(taskOutputMatch[2]);
+    if (!projectId?.trim() || !taskId?.trim()) return json({ error: '任务参数无效' }, 400);
+    try { return await readTaskOutput({ taskId, projectId, env }) || json({ error: '视频输出不存在' }, 404); }
+    catch { return json({ error: '视频输出暂不可用' }, 503); }
   }
   const taskDetailMatch = url.pathname.match(/^\/api\/projects\/([^/]*)\/tasks\/([^/]*)$/);
   if (taskDetailMatch && request.method === 'GET') {

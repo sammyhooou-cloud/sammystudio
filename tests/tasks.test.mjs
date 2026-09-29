@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { submitTask, getTaskStatus } from '../src/tasks.js';
 import * as taskApi from '../src/tasks.js';
+import { ProviderError } from '../src/providers/minimax.js';
 
 const capabilities = {
   text_to_video: {
@@ -70,6 +71,7 @@ class TaskDb {
     this.projects = [{ id: 'project-1', name: 'Project One' }, { id: 'project-2', name: 'Project Two' }];
     this.tasks = [];
     this.projectTasks = [];
+    this.taskOutputs = [];
     this.settings = [];
     this.settingsVersions = new Map();
     this.batchCount = 0;
@@ -82,6 +84,7 @@ class TaskDb {
     this.afterSettingsRead = null;
     this.upload = null;
     this.beforeOrphanUpdate = null;
+    this.failOutputInsert = false;
   }
 
   prepare(sql) {
@@ -92,6 +95,11 @@ class TaskDb {
       bind(...values) { return { ...statement, values }; },
       async first() {
         db.queries.push({ sql, values: this.values });
+        if (sql.includes('FROM task_outputs')) {
+          const [taskId, projectId] = this.values;
+          if (!db.projectTasks.some(({ task_id, project_id }) => task_id === taskId && project_id === projectId)) return null;
+          return db.taskOutputs.find(({ task_id }) => task_id === taskId) ?? null;
+        }
         if (sql.startsWith('INSERT INTO project_settings_versions')) {
           const projectId = this.values[0];
           const version = (db.settingsVersions.get(projectId) || 0) + 1;
@@ -131,7 +139,11 @@ class TaskDb {
       },
       async run() {
         const values = this.values;
-        if (sql.startsWith('INSERT INTO video_tasks')) {
+        if (sql.startsWith('INSERT OR IGNORE INTO task_outputs')) {
+          if (db.failOutputInsert) throw new Error('database outputs/minimax-poll.mp4 private insert failure');
+          if (!db.taskOutputs.some(({ task_id }) => task_id === values[1])) db.taskOutputs.push({ id: values[0], task_id: values[1], object_key: values[2], content_type: values[3], byte_size: values[4], created_at: values[5] });
+        }
+        else if (sql.startsWith('INSERT INTO video_tasks')) {
           if (db.tasks.some(({ idempotency_key }) => idempotency_key === values[1])) throw new Error('UNIQUE constraint failed: video_tasks.idempotency_key');
           db.tasks.push({ id: values[0], idempotency_key: values[1], remote_id: values[2], mode: values[3], status: values[4], request_json: values[5], ...(sql.includes('provider') ? { provider: values[8] } : {}) });
         }
@@ -920,4 +932,143 @@ test('TaskError supports coded positional and options forms without changing leg
   const options = new taskApi.TaskError({ message: '明确错误', status: 409, code: 'PROVIDER_UNAVAILABLE', task });
   assert.equal(options.message, '明确错误'); assert.equal(options.status, 409);
   assert.equal(options.code, 'PROVIDER_UNAVAILABLE'); assert.deepEqual(options.task, task);
+});
+
+function minimaxPollingTask(db, status = 'queued') {
+  db.tasks.push({ id: 'minimax-poll', provider: 'minimax', remote_id: 'minimax-remote', status, result_json: '{"task_id":"minimax-remote"}' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'minimax-poll' });
+  return db.tasks[0];
+}
+
+const miniMaxQueryResult = { status: 'succeeded', raw: { id: 'minimax-remote', status: 'succeeded', content: { url: 'https://cdn.test/minimax.mp4' } }, outputUrl: 'https://cdn.test/minimax.mp4' };
+
+test('MiniMax succeeds only after output persistence and exposes the internal playback URL', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db); const media = new RecoveryMedia();
+  let factories = 0; let downloads = 0;
+  media.put = async (key, body, options) => {
+    assert.equal(task.status, 'queued', 'success must wait for R2');
+    assert.equal(db.taskOutputs.length, 0);
+    assert.equal(key, 'outputs/minimax-poll.mp4');
+    assert.ok(body instanceof ReadableStream);
+    assert.equal(options.httpMetadata.contentType, 'video/mp4');
+    return { size: (await new Response(body).arrayBuffer()).byteLength };
+  };
+  const options = {
+    providerFactory: (id) => { factories += 1; assert.equal(id, 'minimax'); return { id, persistOutput: true, query: async () => miniMaxQueryResult }; },
+    fetcher: async (url) => { downloads += 1; assert.equal(task.status, 'queued'); assert.equal(url, miniMaxQueryResult.outputUrl); return new Response('video', { headers: { 'content-type': 'video/mp4', 'content-length': '5' } }); },
+  };
+  const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), options);
+  assert.equal(factories, 1); assert.equal(downloads, 1);
+  assert.equal(db.taskOutputs.length, 1);
+  assert.equal(task.status, 'succeeded');
+  assert.deepEqual(JSON.parse(result.resultJson), { providerResult: miniMaxQueryResult.raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
+  assert.equal(task.result_json, result.resultJson);
+});
+
+test('MiniMax output persistence failures retain polling status and a later poll retries successfully', async () => {
+  for (const status of ['queued', 'generating']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db, status); const oldResult = task.result_json;
+    let fail = true; let downloads = 0;
+    const media = { put: async (_key, body) => { if (fail) throw new Error('outputs/minimax-poll.mp4 provider private storage error'); return { size: (await new Response(body).arrayBuffer()).byteLength }; } };
+    const options = { providerFactory: () => ({ persistOutput: true, query: async () => miniMaxQueryResult }), fetcher: async () => { downloads += 1; return new Response('video', { headers: { 'content-type': 'video/mp4' } }); } };
+    await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db, media), options), (error) => {
+      assert.ok(error instanceof taskApi.TaskError); assert.equal(error.status, 503); assert.equal(error.code, 'output_persist_failed');
+      assert.doesNotMatch(error.message, /outputs\/|https:|private/);
+      return true;
+    });
+    assert.equal(task.status, status); assert.equal(task.result_json, oldResult); assert.equal(db.taskOutputs.length, 0);
+    fail = false;
+    const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), options);
+    assert.equal(result.status, 'succeeded'); assert.equal(downloads, 2); assert.equal(db.taskOutputs.length, 1);
+  }
+});
+
+test('MiniMax success without an output URL stays retryable and never marks success', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db, 'generating');
+  await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ persistOutput: true, query: async () => ({ ...miniMaxQueryResult, outputUrl: null }) }), fetcher: () => assert.fail('missing URL must not download') }), { status: 503, code: 'output_persist_failed' });
+  assert.equal(task.status, 'generating'); assert.equal(db.taskOutputs.length, 0);
+});
+
+test('MiniMax status retry reuses an already persisted output without downloading again', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db);
+  db.taskOutputs.push({ id: 'existing', task_id: task.id, object_key: 'outputs/minimax-poll.mp4', content_type: 'video/mp4' });
+  const media = { put: () => assert.fail('existing output must not be written again') };
+  const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), { providerFactory: () => ({ persistOutput: true, query: async () => miniMaxQueryResult }), fetcher: () => assert.fail('existing output must not be downloaded again') });
+  assert.equal(result.status, 'succeeded');
+  assert.equal(JSON.parse(result.resultJson).videoUrl, '/api/projects/project-1/tasks/minimax-poll/output');
+  assert.equal(db.taskOutputs.length, 1);
+});
+
+test('MiniMax non-success queries update normally without persisting an output', async () => {
+  for (const status of ['failed', 'queued', 'generating']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db);
+    const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, { put: () => assert.fail('non-success must not persist') }), { providerFactory: () => ({ persistOutput: true, query: async () => ({ status, raw: { status } }) }), fetcher: () => assert.fail('non-success must not download') });
+    assert.equal(result.status, status); assert.deepEqual(JSON.parse(result.resultJson), { status });
+  }
+});
+
+test('Kling external result handling is unchanged with persistence disabled', async () => {
+  const db = new TaskDb(); db.tasks.push({ id: 'kling-poll', provider: 'kling', remote_id: 'kling-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'kling-poll' });
+  const raw = { works: [{ contentType: 'video', url: 'https://kling.test/clip.mp4' }] };
+  const result = await getTaskStatus('kling-poll', 'project-1', taskEnv(db, { put: () => assert.fail('Kling must not persist output') }), { providerFactory: () => ({ persistOutput: false, query: async () => ({ status: 'succeeded', raw, outputUrl: raw.works[0].url }) }), fetcher: () => assert.fail('Kling must not download output') });
+  assert.deepEqual(JSON.parse(result.resultJson), raw); assert.equal(result.status, 'succeeded'); assert.equal(db.taskOutputs.length, 0);
+});
+
+test('polling preserves safe ProviderError codes without exposing supplier error text', async () => {
+  for (const code of ['provider_auth_failed', 'provider_not_configured', 'provider_unavailable', 'invalid_response']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db);
+    await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ query: async () => { const error = new ProviderError(code); error.message = 'raw supplier secret'; throw error; } }) }), (error) => {
+      assert.equal(error.code, code); assert.ok(error instanceof taskApi.TaskError); assert.equal(error.status, 503); assert.equal(error.message, '任务状态暂不可用'); return true;
+    });
+    assert.equal(task.status, 'queued');
+  }
+});
+
+test('definitive MiniMax create errors fail the task with useful safe Chinese messages and codes', async () => {
+  const cases = {
+    provider_not_configured: '请配置 MiniMax API Key',
+    provider_auth_failed: 'MiniMax 认证失败，请检查服务端配置',
+    insufficient_balance: 'MiniMax 额度不足，请前往控制台查看',
+    invalid_parameters: 'MiniMax 生成参数或参考图无效',
+    provider_unavailable: 'MiniMax 暂不可用，请稍后重试',
+  };
+  for (const [code, message] of Object.entries(cases)) {
+    const db = new TaskDb(); db.projects[0].video_provider = 'minimax';
+    await assert.rejects(() => submitTask(input, taskEnv(db), `minimax-create-${code}`, { providerFactory: () => ({ id: 'minimax', capabilities: async () => capabilities, create: async () => { const error = new ProviderError(code, { definitive: true, submissionState: 'failed' }); error.message = 'raw supplier secret'; throw error; } }) }), (error) => {
+      assert.ok(error instanceof taskApi.TaskError); assert.equal(error.message, message); assert.equal(error.code, code); assert.equal(error.task.status, 'failed'); return true;
+    });
+    assert.equal(db.tasks[0].status, 'failed');
+  }
+});
+
+test('ambiguous MiniMax submission preserves the safe error code and remains unknown', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'minimax';
+  await assert.rejects(() => submitTask(input, taskEnv(db), 'minimax-create-unknown', { providerFactory: () => ({ id: 'minimax', capabilities: async () => capabilities, create: async () => { throw new ProviderError('provider_unavailable', { submissionState: 'unknown' }); } }) }), (error) => error.code === 'provider_unavailable' && error.task.status === 'unknown');
+});
+
+test('provider construction and capability errors preserve safe codes through TaskError', async () => {
+  for (const phase of ['factory', 'capabilities']) {
+    const db = new TaskDb(); db.projects[0].video_provider = 'minimax';
+    const fail = () => { throw new ProviderError('provider_not_configured'); };
+    const options = { providerFactory: phase === 'factory' ? fail : () => ({ id: 'minimax', capabilities: fail }) };
+    await assert.rejects(() => submitTask(input, taskEnv(db), `configuration-${phase}`, options), (error) => error instanceof taskApi.TaskError && error.code === 'provider_not_configured' && error.status === 503);
+    assert.equal(db.tasks.length, 0);
+  }
+});
+
+test('polling drops unrecognized supplier codes instead of exposing raw supplier text', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db);
+  await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ query: async () => { const error = new Error('secret supplier message'); error.code = 'https://supplier.test/private?secret=token'; throw error; } }) }), (error) => error.code === undefined && error.message === '任务状态暂不可用');
+});
+
+test('MiniMax output database insertion failure never reports success and can retry', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db, 'generating'); db.failOutputInsert = true;
+  const media = { put: async (_key, body) => ({ size: (await new Response(body).arrayBuffer()).byteLength }) };
+  const options = { providerFactory: () => ({ persistOutput: true, query: async () => miniMaxQueryResult }), fetcher: async () => new Response('video', { headers: { 'content-type': 'video/mp4' } }) };
+  await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db, media), options), { status: 503, code: 'output_persist_failed' });
+  assert.equal(task.status, 'generating'); assert.equal(db.taskOutputs.length, 0);
+  db.failOutputInsert = false;
+  const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), options);
+  assert.equal(result.status, 'succeeded'); assert.equal(db.taskOutputs.length, 1);
 });
