@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
 import { siteAssets } from '../src/site-assets.js';
 import { TaskError } from '../src/tasks.js';
+import { encryptJson } from '../src/crypto.js';
+import { minimaxCapabilities } from '../src/providers/minimax.js';
 
 function env() {
   return {
@@ -63,6 +65,155 @@ class RouteDb {
 }
 
 const sessionHeaders = { cookie: 'keling_session=test-token', origin: 'https://site.test', 'content-type': 'application/json' };
+
+class ProviderStatusDb extends RouteDb {
+  constructor(token = null) {
+    super();
+    this.token = token;
+    this.statusQueries = 0;
+  }
+
+  prepare(sql) {
+    if (!sql.includes('FROM oauth_tokens')) return super.prepare(sql);
+    return { first: async () => { this.statusQueries += 1; return this.token; } };
+  }
+}
+
+async function providerStatusRequest(runtime, providerId, options = {}) {
+  return worker.fetch(new Request(`https://site.test/api/video/providers/${providerId}/status`, {
+    headers: sessionHeaders, ...options,
+  }), runtime, {});
+}
+
+test('provider status API preserves Kling status and reuses its models without duplicate queries', async (t) => {
+  const secret = 'test-only-kling-token';
+  const db = new ProviderStatusDb({ encrypted_token: await encryptJson({ access_token: secret }, 'test-secret'), expires_at: Date.now() + 60_000 });
+  const models = { text_to_video: { models: [{ model: 'kling-v1' }] }, image_to_video: { models: [{ model: 'kling-v1' }] } };
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(url, 'https://klingai.com/mcp');
+    const rpc = JSON.parse(options.body);
+    assert.equal(rpc.method, 'tools/call');
+    calls.push(rpc.params.name);
+    assert.ok(['who_am_i', 'query_membership_and_credits'].includes(rpc.params.name), 'status must never create a video');
+    return Response.json({ result: { structuredContent: rpc.params.name === 'who_am_i' ? { availableModels: models } : { membershipType: 'Pro', availableRemainCredits: 25 } } });
+  });
+  const response = await providerStatusRequest({ DB: db, TOKEN_ENCRYPTION_KEY: 'test-secret' }, '%6bling');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.provider, 'kling');
+  assert.equal(body.connection, 'online');
+  assert.equal(body.membership, 'Pro');
+  assert.equal(body.credits, 25);
+  assert.deepEqual(body.models, models);
+  assert.equal(typeof body.checkedAt, 'string');
+  assert.deepEqual(calls, ['who_am_i', 'query_membership_and_credits']);
+  assert.equal(db.statusQueries, 2);
+  assert.equal(JSON.stringify(body).includes(secret), false);
+});
+
+test('provider status API keeps offline Kling models without retrying capabilities', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unconfigured Kling must not request the supplier'));
+  const db = new ProviderStatusDb();
+  const response = await providerStatusRequest({ DB: db }, 'kling');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.provider, 'kling');
+  assert.equal(body.connection, 'offline');
+  assert.equal(body.message, '请连接可灵 MCP');
+  assert.deepEqual(body.models, {});
+  assert.equal(db.statusQueries, 1);
+});
+
+test('provider status API checks MiniMax with one GET and exposes static capabilities safely', async (t) => {
+  const key = 'test-only-minimax-key';
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls += 1;
+    assert.equal(url, 'https://api.minimax.io/v2/query/video_generation?page_num=1&page_size=1');
+    assert.equal(options.method, 'GET');
+    assert.equal(options.body, undefined);
+    assert.equal(new Headers(options.headers).get('authorization'), `Bearer ${key}`);
+    return Response.json({ supplier_private_detail: key, provider: 'kling', models: { private: key } });
+  });
+  const response = await providerStatusRequest({ DB: new ProviderStatusDb(), MINIMAX_API_KEY: key }, 'minimax');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body, { provider: 'minimax', connection: 'online', label: 'MiniMax 已连接', balanceLabel: '额度：控制台查看', models: minimaxCapabilities });
+  assert.equal(calls, 1);
+  assert.equal(JSON.stringify(body).includes(key), false);
+  assert.equal(JSON.stringify(body).includes('supplier_private_detail'), false);
+});
+
+test('provider status API safely exposes MiniMax without a configured key', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unconfigured MiniMax must not request the supplier'));
+  for (const key of [undefined, '', '   ']) {
+    const response = await providerStatusRequest({ DB: new ProviderStatusDb(), MINIMAX_API_KEY: key }, 'minimax');
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { provider: 'minimax', connection: 'unconfigured', label: 'MiniMax 未配置', balanceLabel: '额度：控制台查看', models: minimaxCapabilities });
+  }
+});
+
+test('provider status API rejects unknown and inherited supplier IDs', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('invalid providers must not request a supplier'));
+  for (const id of ['unknown', 'toString', '__proto__', 'constructor', 'kling%2Fextra']) {
+    const response = await providerStatusRequest({ DB: new ProviderStatusDb() }, id);
+    assert.equal(response.status, 404, id);
+    assert.deepEqual(await response.json(), { error: '视频供应商无效' });
+  }
+});
+
+test('provider status API rejects malformed provider ID encoding', async () => {
+  const response = await providerStatusRequest({ DB: new ProviderStatusDb() }, '%E0%A4%A');
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: '供应商 ID 格式无效' });
+});
+
+test('provider status API authenticates before resolving or checking a supplier', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('anonymous requests must not reach a supplier'));
+  const db = new ProviderStatusDb();
+  for (const id of ['kling', 'minimax', 'unknown', '%E0%A4%A']) {
+    const response = await providerStatusRequest({ DB: db }, id, { headers: undefined });
+    assert.equal(response.status, 401, id);
+    assert.deepEqual(await response.json(), { error: '请先登录' });
+  }
+  assert.equal(db.statusQueries, 0);
+});
+
+test('provider status API sanitizes unexpected provider exceptions as 503', async (t) => {
+  const key = 'test-only-private-key';
+  const db = new ProviderStatusDb();
+  db.token = { get encrypted_token() { throw { get message() { throw new Error(`${key} raw-supplier-error`); } }; } };
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('failed status must not create a video'));
+  const response = await providerStatusRequest({ DB: db, MINIMAX_API_KEY: key }, 'kling');
+  assert.equal(response.status, 503);
+  const body = await response.json();
+  assert.deepEqual(body, { provider: 'kling', connection: 'offline', label: '供应商暂不可用', balanceLabel: '额度：暂不可用', models: {} });
+  assert.equal(JSON.stringify(body).includes(key), false);
+  assert.equal(JSON.stringify(body).includes('raw-supplier-error'), false);
+  assert.equal(db.statusQueries, 1);
+});
+
+test('provider status API only matches exact GET status paths', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unmatched status paths must not request a supplier'));
+  for (const [path, method] of [['/api/video/providers/minimax/status', 'POST'], ['/api/video/providers/minimax/status/', 'GET'], ['/api/video/providers/minimax/status/extra', 'GET']]) {
+    const response = await worker.fetch(new Request(`https://site.test${path}`, { method, headers: sessionHeaders }), { DB: new ProviderStatusDb(), MINIMAX_API_KEY: 'test-key' }, {});
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: '接口不存在' });
+  }
+});
+
+test('legacy Kling status API retains its response shape and authentication', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unconfigured legacy status must not request the supplier'));
+  const runtime = { DB: new ProviderStatusDb() };
+  const response = await worker.fetch(new Request('https://site.test/api/kling/status', { headers: sessionHeaders }), runtime, {});
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(Object.keys(body).sort(), ['checkedAt', 'connection', 'credits', 'membership', 'message', 'models']);
+  assert.equal(body.connection, 'offline');
+  const anonymous = await worker.fetch(new Request('https://site.test/api/kling/status'), runtime, {});
+  assert.equal(anonymous.status, 401);
+});
 
 function seedDocumentAssets(t) {
   for (const page of ['login', 'workspace', 'result']) {

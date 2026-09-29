@@ -1,6 +1,7 @@
 import { createSession, deleteSession, requireSession, unauthorized } from './auth.js';
 import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
+import { createVideoProvider } from './providers/index.js';
 import { submitTask, getTaskStatus, getTaskByAttempt, getTaskDetail, TaskError } from './tasks.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
@@ -165,6 +166,21 @@ async function api(request, env) {
       if (error.message === '项目不存在') return json({ error: error.message }, 404);
       if (projectInputError(error)) return json({ error: error instanceof SyntaxError ? '请提供有效的 JSON' : error.message }, 400);
       throw error;
+    }
+  }
+  const providerStatusMatch = url.pathname.match(/^\/api\/video\/providers\/([^/]+)\/status$/);
+  if (providerStatusMatch && request.method === 'GET') {
+    const providerId = decodeProjectId(providerStatusMatch[1]);
+    if (providerId === null) return json({ error: '供应商 ID 格式无效' }, 400);
+    let provider;
+    try { provider = createVideoProvider(providerId, env); }
+    catch { return json({ error: '视频供应商无效' }, 404); }
+    try {
+      const status = await provider.status();
+      const models = Object.hasOwn(status, 'models') ? status.models : await provider.capabilities();
+      return json({ ...status, provider: provider.id, models });
+    } catch {
+      return json({ provider: providerId, connection: 'offline', label: '供应商暂不可用', balanceLabel: '额度：暂不可用', models: {} }, 503);
     }
   }
   if (url.pathname === '/api/kling/status' && request.method === 'GET') return json(await getKlingStatus(env));
