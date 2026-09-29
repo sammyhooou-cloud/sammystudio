@@ -999,6 +999,22 @@ test('MiniMax status retry reuses an already persisted output without downloadin
   assert.equal(db.taskOutputs.length, 1);
 });
 
+test('MiniMax completes an already persisted output even when the supplier URL is unavailable', async () => {
+  for (const outputUrl of [null, undefined, '', 'invalid-url', 'http://expired.test/clip.mp4']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db, 'generating');
+    db.taskOutputs.push({ id: 'existing', task_id: task.id, object_key: 'outputs/minimax-poll.mp4', content_type: 'video/mp4' });
+    const raw = { id: 'minimax-remote', status: 'succeeded' };
+    const media = { put: () => assert.fail('existing output must not write R2'), get: () => assert.fail('existing output must not read R2') };
+    const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), {
+      providerFactory: () => ({ persistOutput: true, query: async () => ({ status: 'succeeded', raw, outputUrl }) }),
+      fetcher: () => assert.fail('existing output must not download again'),
+    });
+    assert.equal(result.status, 'succeeded'); assert.equal(task.status, 'succeeded');
+    assert.deepEqual(JSON.parse(result.resultJson), { providerResult: raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
+    assert.equal(task.result_json, result.resultJson); assert.equal(db.taskOutputs.length, 1);
+  }
+});
+
 test('MiniMax non-success queries update normally without persisting an output', async () => {
   for (const status of ['failed', 'queued', 'generating']) {
     const db = new TaskDb(); const task = minimaxPollingTask(db);

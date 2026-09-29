@@ -53,13 +53,14 @@ async function ownedOutput(db, taskId, projectId) {
 }
 
 export async function persistTaskOutput({ taskId, projectId, sourceUrl, env, fetcher = fetch, now = Date.now, idFactory = () => crypto.randomUUID() }) {
-  if (!validIds(taskId, projectId) || typeof sourceUrl !== 'string' || !httpsUrl(sourceUrl)) throw new OutputError('任务输出参数无效', 400);
+  if (!validIds(taskId, projectId)) throw new OutputError('任务输出参数无效', 400);
   try {
     const owner = await env.DB.prepare(`SELECT video_tasks.id FROM video_tasks
       JOIN project_tasks ON project_tasks.task_id = video_tasks.id
       WHERE video_tasks.id = ? AND project_tasks.project_id = ?`).bind(taskId, projectId).first();
     if (!owner) throw new OutputError('任务不存在', 404);
     if (await ownedOutput(env.DB, taskId, projectId)) return outputUrl(projectId, taskId);
+    if (typeof sourceUrl !== 'string' || !httpsUrl(sourceUrl)) throw new OutputError('任务输出参数无效', 400);
 
     const response = await fetcher(sourceUrl, { redirect: 'follow' });
     const { contentType, byteSize } = videoMetadata(response, httpsUrl(sourceUrl));

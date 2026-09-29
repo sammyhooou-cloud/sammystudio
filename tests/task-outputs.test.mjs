@@ -107,6 +107,18 @@ test('an existing owned output immediately returns an encoded internal URL witho
   await assert.rejects(() => persist({ env, taskId, projectId: 'other', fetcher: () => assert.fail('output lookup must be project-scoped') }), { status: 404 });
 });
 
+test('an existing owned output ignores unavailable source URLs without fetching or touching R2', async (t) => {
+  const { env, db } = setup(t);
+  db.output();
+  env.MEDIA = { put: () => assert.fail('existing output must not write R2'), get: () => assert.fail('existing output must not read R2') };
+  for (const sourceUrl of [null, undefined, '', 'invalid-url', 'http://expired.test/clip.mp4', 'https://user:password@expired.test/clip.mp4']) {
+    const url = await persist({ env, sourceUrl, fetcher: () => assert.fail('existing output must not fetch its old source URL') });
+    assert.equal(url, '/api/projects/project-1/tasks/task-1/output');
+    assert.equal(db.rows().length, 1);
+    await assert.rejects(() => persist({ env, projectId: 'other-project', sourceUrl, fetcher: () => assert.fail('cross-project task must not fetch') }), { status: 404 });
+  }
+});
+
 test('successful video persistence streams to R2 and writes complete output metadata once', async (t) => {
   const { env, db, puts } = setup(t);
   const response = videoResponse(); const stream = response.body;

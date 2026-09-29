@@ -300,7 +300,6 @@ export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCal
   if (provider.persistOutput && status === 'succeeded') {
     let videoUrl;
     try {
-      if (!result.outputUrl) throw new Error('missing output');
       videoUrl = await persistTaskOutput({ taskId: id, projectId, sourceUrl: result.outputUrl, env, fetcher: options.fetcher || fetch });
     } catch { throw new TaskError('视频输出保存暂不可用，请稍后重试', 503, undefined, 'output_persist_failed'); }
     storedResult = { providerResult: result.raw, videoUrl };
