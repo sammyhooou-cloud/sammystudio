@@ -1,20 +1,17 @@
 const API_URL = 'https://api.minimax.io/v2/video_generation';
 const QUERY_URL = 'https://api.minimax.io/v2/query/video_generation';
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 const IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const RATIOS = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'];
 const BALANCE_LABEL = '额度：控制台查看';
 const FAILURE_MESSAGE = 'MiniMax 视频生成失败';
 const ERROR_MESSAGES = Object.freeze({
-  configuration_missing: '请配置 MiniMax API Key',
-  invalid_input: 'MiniMax 生成参数或参考图无效',
-  invalid_request: 'MiniMax 请求参数不受支持',
-  auth_error: 'MiniMax 认证失败，请检查服务端配置',
+  provider_not_configured: '请配置 MiniMax API Key',
+  invalid_parameters: 'MiniMax 生成参数或参考图无效',
+  provider_auth_failed: 'MiniMax 认证失败，请检查服务端配置',
   insufficient_balance: 'MiniMax 额度不足，请前往控制台查看',
-  rate_limited: 'MiniMax 请求受限，提交结果未确认，请勿重新创建任务',
   provider_unavailable: 'MiniMax 暂不可用，提交结果未确认，请勿重新创建任务',
-  network_error: 'MiniMax 连接中断，提交结果未确认，请勿重新创建任务',
-  timeout: 'MiniMax 请求超时，提交结果未确认，请勿重新创建任务',
   invalid_response: 'MiniMax 返回结果未确认，请勿重新创建任务',
 });
 
@@ -56,7 +53,7 @@ export const minimaxCapabilities = freeze({
 });
 
 function invalidInput() {
-  return new ProviderError('invalid_input', { httpStatus: 400, definitive: true, submissionState: 'failed' });
+  return new ProviderError('invalid_parameters', { httpStatus: 400, definitive: true, submissionState: 'failed' });
 }
 
 function validPrompt(prompt) {
@@ -98,7 +95,7 @@ async function imageDataUri(reference) {
 }
 
 function httpError(status, submission) {
-  const code = ({ 400: 'invalid_request', 401: 'auth_error', 402: 'insufficient_balance', 422: 'invalid_request', 429: 'rate_limited' })[status] || 'provider_unavailable';
+  const code = ({ 400: 'invalid_parameters', 401: 'provider_auth_failed', 402: 'insufficient_balance', 422: 'invalid_parameters' })[status] || 'provider_unavailable';
   const definitive = [400, 401, 402, 422].includes(status);
   return new ProviderError(code, { httpStatus: status, definitive, ...(submission ? { submissionState: definitive ? 'failed' : 'unknown' } : {}) });
 }
@@ -123,13 +120,46 @@ function safeTask(task, apiKey) {
   return raw;
 }
 
+function cancelStream(stream) {
+  try { stream?.cancel().catch(() => {}); } catch {}
+}
+
+function assertResponseLength(response, invalidResponse) {
+  const declaredLength = response.headers.get('content-length')?.trim();
+  if (declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > MAX_RESPONSE_BYTES) {
+    cancelStream(response.body);
+    throw invalidResponse();
+  }
+}
+
+async function readResponseJson(response, invalidResponse) {
+  if (typeof response.body?.getReader !== 'function') throw invalidResponse();
+  const reader = response.body.getReader();
+  const bytes = new Uint8Array(MAX_RESPONSE_BYTES);
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array) || length + value.byteLength > MAX_RESPONSE_BYTES) {
+        cancelStream(reader);
+        throw invalidResponse();
+      }
+      bytes.set(value, length);
+      length += value.byteLength;
+    }
+    try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, length))); }
+    catch { throw invalidResponse(); }
+  } finally { reader.releaseLock(); }
+}
+
 export function createMiniMaxProvider(env = {}, deps = {}) {
   const fetcher = deps.fetcher || fetch;
   const timeoutMs = deps.timeoutMs ?? 30_000;
 
   function apiKey() {
     const key = typeof env.MINIMAX_API_KEY === 'string' ? env.MINIMAX_API_KEY.trim() : '';
-    if (!key) throw new ProviderError('configuration_missing', { httpStatus: 503, definitive: true, submissionState: 'failed' });
+    if (!key) throw new ProviderError('provider_not_configured', { httpStatus: 503, definitive: true, submissionState: 'failed' });
     return key;
   }
 
@@ -146,13 +176,15 @@ export function createMiniMaxProvider(env = {}, deps = {}) {
         redirect: 'error',
         ...(body ? { body: JSON.stringify(body) } : {}),
       });
-      if (checkStatus) return response.status;
-      if (!response.ok) throw httpError(response.status, Boolean(body));
-      try { return { payload: await response.json(), httpStatus: response.status }; }
-      catch { throw new ProviderError(timedOut ? 'timeout' : 'invalid_response', { httpStatus: timedOut ? 504 : response.status, ...(body ? { submissionState: 'unknown' } : {}) }); }
+      if (checkStatus && response.status !== 200) { cancelStream(response.body); return response.status; }
+      if (!checkStatus && !response.ok) { cancelStream(response.body); throw httpError(response.status, Boolean(body)); }
+      const invalidResponse = () => new ProviderError('invalid_response', { httpStatus: response.status, ...(body ? { submissionState: 'unknown' } : {}) });
+      assertResponseLength(response, invalidResponse);
+      if (checkStatus) { cancelStream(response.body); return response.status; }
+      return { payload: await readResponseJson(response, invalidResponse), httpStatus: response.status };
     } catch (error) {
       if (error instanceof ProviderError) throw error;
-      throw new ProviderError(timedOut ? 'timeout' : 'network_error', { httpStatus: timedOut ? 504 : 503, ...(body ? { submissionState: 'unknown' } : {}) });
+      throw new ProviderError('provider_unavailable', { httpStatus: timedOut ? 504 : 503, ...(body ? { submissionState: 'unknown' } : {}) });
     } finally { clearTimeout(timer); }
   }
 

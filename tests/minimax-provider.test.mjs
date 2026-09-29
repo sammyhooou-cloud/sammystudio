@@ -13,6 +13,27 @@ const input = { mode: 'text', model: 'MiniMax-H3', prompt: '海浪轻轻拍打�
 const balanceLabel = '额度：控制台查看';
 const ratios = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'];
 const maxImageSize = 15 * 1024 * 1024;
+const maxResponseSize = 1024 * 1024;
+
+function chunkedResponse(chunks, { headers, onCancel } = {}) {
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) controller.enqueue(chunks[index++]);
+      else controller.close();
+    },
+    cancel() { onCancel?.(); },
+  });
+  return new Response(body, { headers });
+}
+
+function abortingResponse(signal) {
+  return new Response(new ReadableStream({
+    start(controller) {
+      signal.addEventListener('abort', () => controller.error(new Error(`${key} supplier-private-detail`)), { once: true });
+    },
+  }));
+}
 
 function provider(deps = {}, env = { MINIMAX_API_KEY: key }) {
   assert.equal(typeof adapter.createMiniMaxProvider, 'function', 'MiniMax provider adapter must exist');
@@ -97,7 +118,7 @@ test('MiniMax image encoding handles large byte arrays without Node Buffer', asy
   const savedBuffer = globalThis.Buffer;
   const instance = provider({ fetcher: async (_url, options) => {
     assert.equal(JSON.parse(options.body).content[1].image_url.url, `data:image/webp;base64,${expected}`);
-    return { ok: true, status: 200, json: async () => ({ task_id: 'large-image' }) };
+    return { ok: true, status: 200, headers: new Headers(), body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"task_id":"large-image"}')); controller.close(); } }), json: async () => ({ task_id: 'large-image' }) };
   } });
   try {
     globalThis.Buffer = undefined;
@@ -107,8 +128,8 @@ test('MiniMax image encoding handles large byte arrays without Node Buffer', asy
 
 test('MiniMax missing configuration fails before any API request', async () => {
   for (const env of [{}, { MINIMAX_API_KEY: '' }, { MINIMAX_API_KEY: '   ' }]) {
-    await assert.rejects(() => provider({}, env).create({ input }), (error) => assertSafe(error, { code: 'configuration_missing', httpStatus: 503, definitive: true, submissionState: 'failed' }));
-    await assert.rejects(() => provider({}, env).query('task-1'), (error) => assertSafe(error, { code: 'configuration_missing', definitive: true }));
+    await assert.rejects(() => provider({}, env).create({ input }), (error) => assertSafe(error, { code: 'provider_not_configured', httpStatus: 503, definitive: true, submissionState: 'failed' }));
+    await assert.rejects(() => provider({}, env).query('task-1'), (error) => assertSafe(error, { code: 'provider_not_configured', definitive: true }));
   }
 });
 
@@ -137,7 +158,7 @@ test('MiniMax status sanitizes network errors', async () => {
   assert.deepEqual(await instance.status(), { connection: 'offline', label: 'MiniMax 暂不可用', balanceLabel });
 });
 
-for (const [status, code, definitive, submissionState] of [[400, 'invalid_request', true, 'failed'], [401, 'auth_error', true, 'failed'], [402, 'insufficient_balance', true, 'failed'], [422, 'invalid_request', true, 'failed'], [429, 'rate_limited', false, 'unknown'], [500, 'provider_unavailable', false, 'unknown']]) {
+for (const [status, code, definitive, submissionState] of [[400, 'invalid_parameters', true, 'failed'], [401, 'provider_auth_failed', true, 'failed'], [402, 'insufficient_balance', true, 'failed'], [422, 'invalid_parameters', true, 'failed'], [429, 'provider_unavailable', false, 'unknown'], ...[500, 501, 502, 503, 504, 599].map((status) => [status, 'provider_unavailable', false, 'unknown'])]) {
   test(`MiniMax create maps HTTP ${status} to safe ${submissionState} submission`, async () => {
     const instance = provider({ fetcher: async () => Response.json({ error: `${key} supplier-private-detail` }, { status }) });
     await assert.rejects(() => instance.create({ input }), (error) => assertSafe(error, { code, httpStatus: status, definitive, submissionState }));
@@ -155,17 +176,17 @@ test('MiniMax create keeps malformed success JSON ambiguous', async () => {
 });
 
 test('MiniMax create keeps a network failure ambiguous', async () => {
-  await assert.rejects(() => provider({ fetcher: async () => { throw new Error(`${key} supplier-private-detail`); } }).create({ input }), (error) => assertSafe(error, { code: 'network_error', httpStatus: 503, definitive: false, submissionState: 'unknown' }));
+  await assert.rejects(() => provider({ fetcher: async () => { throw new Error(`${key} supplier-private-detail`); } }).create({ input }), (error) => assertSafe(error, { code: 'provider_unavailable', httpStatus: 503, definitive: false, submissionState: 'unknown' }));
 });
 
 test('MiniMax create keeps a timeout ambiguous', async () => {
   const instance = provider({ timeoutMs: 5, fetcher: async (_url, { signal }) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error(`${key} supplier-private-detail`)), { once: true })) });
-  await assert.rejects(() => instance.create({ input }), (error) => assertSafe(error, { code: 'timeout', httpStatus: 504, definitive: false, submissionState: 'unknown' }));
+  await assert.rejects(() => instance.create({ input }), (error) => assertSafe(error, { code: 'provider_unavailable', httpStatus: 504, definitive: false, submissionState: 'unknown' }));
 });
 
 test('MiniMax create keeps a timeout reading success JSON ambiguous', async () => {
-  const instance = provider({ timeoutMs: 5, fetcher: async (_url, { signal }) => ({ ok: true, status: 200, json: async () => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error(`${key} supplier-private-detail`)), { once: true })) }) });
-  await assert.rejects(() => instance.create({ input }), (error) => assertSafe(error, { code: 'timeout', httpStatus: 504, definitive: false, submissionState: 'unknown' }));
+  const instance = provider({ timeoutMs: 5, fetcher: async (_url, { signal }) => abortingResponse(signal) });
+  await assert.rejects(() => instance.create({ input }), (error) => assertSafe(error, { code: 'provider_unavailable', httpStatus: 504, definitive: false, submissionState: 'unknown' }));
 });
 
 test('MiniMax create discards supplier metadata from loggable results', async () => {
@@ -181,8 +202,8 @@ test('MiniMax status maps an aborted connection check to offline', async () => {
 });
 
 test('MiniMax query classifies response-body timeouts safely', async () => {
-  const instance = provider({ timeoutMs: 5, fetcher: async (_url, { signal }) => ({ ok: true, status: 200, json: async () => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error(`${key} supplier-private-detail`)), { once: true })) }) });
-  await assert.rejects(() => instance.query('task-1'), (error) => assertSafe(error, { code: 'timeout', httpStatus: 504, definitive: false }));
+  const instance = provider({ timeoutMs: 5, fetcher: async (_url, { signal }) => abortingResponse(signal) });
+  await assert.rejects(() => instance.query('task-1'), (error) => assertSafe(error, { code: 'provider_unavailable', httpStatus: 504, definitive: false }));
 });
 
 test('MiniMax query encodes the task ID and returns the parsed task only', async () => {
@@ -229,16 +250,16 @@ test('MiniMax query handles a task without an echoed ID', async () => {
 
 test('MiniMax query sanitizes malformed JSON and HTTP errors', async () => {
   await assert.rejects(() => provider({ fetcher: async () => new Response('supplier-private-detail') }).query('task-1'), (error) => assertSafe(error, { code: 'invalid_response' }));
-  for (const [status, code] of [[401, 'auth_error'], [500, 'provider_unavailable']]) await assert.rejects(() => provider({ fetcher: async () => Response.json({ error: `${key} supplier-private-detail` }, { status }) }).query('task-1'), (error) => assertSafe(error, { code, httpStatus: status }));
-  await assert.rejects(() => provider({ fetcher: async () => { throw new Error(`${key} supplier-private-detail`); } }).query('task-1'), (error) => assertSafe(error, { code: 'network_error' }));
+  for (const [status, code] of [[401, 'provider_auth_failed'], [500, 'provider_unavailable']]) await assert.rejects(() => provider({ fetcher: async () => Response.json({ error: `${key} supplier-private-detail` }, { status }) }).query('task-1'), (error) => assertSafe(error, { code, httpStatus: status }));
+  await assert.rejects(() => provider({ fetcher: async () => { throw new Error(`${key} supplier-private-detail`); } }).query('task-1'), (error) => assertSafe(error, { code: 'provider_unavailable' }));
 });
 
 test('MiniMax validates prompt and generation parameters before dispatch', async () => {
   for (const change of [{ mode: 'unknown' }, { model: 'unknown' }, { prompt: '' }, { prompt: '   ' }, { prompt: null }, { prompt: 42 }, { prompt: 'a'.repeat(7001) }, { duration: '3' }, { duration: '16' }, { duration: 4.5 }, { duration: '' }, { duration: true }, { duration: '6junk' }, { resolution: '480P' }, { resolution: '1080P' }, { aspectRatio: 'adaptive' }, { aspectRatio: undefined }, { aspectRatio: '2:1' }, { model: 'MiniMax-H3-Max', resolution: '2K' }, { model: 'MiniMax-H3-Max', duration: '4' }]) {
-    await assert.rejects(() => provider().create({ input: { ...input, ...change } }), (error) => assertSafe(error, { code: 'invalid_input', httpStatus: 400, definitive: true, submissionState: 'failed' }));
+    await assert.rejects(() => provider().create({ input: { ...input, ...change } }), (error) => assertSafe(error, { code: 'invalid_parameters', httpStatus: 400, definitive: true, submissionState: 'failed' }));
   }
-  await assert.rejects(() => provider().create({}), (error) => assertSafe(error, { code: 'invalid_input', submissionState: 'failed' }));
-  await assert.rejects(() => provider().query(''), (error) => assertSafe(error, { code: 'invalid_input' }));
+  await assert.rejects(() => provider().create({}), (error) => assertSafe(error, { code: 'invalid_parameters', submissionState: 'failed' }));
+  await assert.rejects(() => provider().query(''), (error) => assertSafe(error, { code: 'invalid_parameters' }));
 });
 
 test('MiniMax accepts model boundaries and concrete text ratios', async () => {
@@ -251,13 +272,13 @@ test('MiniMax accepts model boundaries and concrete text ratios', async () => {
 test('MiniMax counts Unicode characters for its 7000-character prompt limit', async () => {
   const instance = provider({ fetcher: async () => Response.json({ task_id: 'unicode-prompt' }) });
   assert.equal((await instance.create({ input: { ...input, prompt: '🙂'.repeat(7000) } })).remoteId, 'unicode-prompt');
-  await assert.rejects(() => provider().create({ input: { ...input, prompt: '🙂'.repeat(7001) } }), (error) => assertSafe(error, { code: 'invalid_input', submissionState: 'failed' }));
+  await assert.rejects(() => provider().create({ input: { ...input, prompt: '🙂'.repeat(7001) } }), (error) => assertSafe(error, { code: 'invalid_parameters', submissionState: 'failed' }));
 });
 
 test('MiniMax validates private references before dispatch', async () => {
   const imageInput = { ...input, mode: 'image', aspectRatio: 'adaptive' };
   for (const invalid of [undefined, {}, reference(new Uint8Array()), reference(undefined, { mime_type: 'image/gif' }), reference(undefined, { size: maxImageSize + 1 }), reference(undefined, { size: -1 }), reference(undefined, { size: 0 }), reference(undefined, { object: {} }), reference(undefined, { object: { arrayBuffer: async () => { throw new Error(`${key} supplier-private-detail`); } } }), reference(undefined, { object: { arrayBuffer: async () => 'bad' } }), reference(new Uint8Array(maxImageSize + 1), { size: 3 })]) {
-    await assert.rejects(() => provider().create({ input: imageInput, reference: invalid }), (error) => assertSafe(error, { code: 'invalid_input', definitive: true, submissionState: 'failed' }));
+    await assert.rejects(() => provider().create({ input: imageInput, reference: invalid }), (error) => assertSafe(error, { code: 'invalid_parameters', definitive: true, submissionState: 'failed' }));
   }
 });
 
@@ -280,4 +301,66 @@ test('MiniMax accepts the 15MB reference boundary within the 64MB request limit'
     return Response.json({ task_id: 'max-size-image' });
   } });
   assert.equal((await instance.create({ input: { ...input, mode: 'image', aspectRatio: 'adaptive' }, reference: reference(bytes) })).remoteId, 'max-size-image');
+});
+
+for (const operation of ['create', 'query']) {
+  const call = (instance) => operation === 'create' ? instance.create({ input }) : instance.query('task-1');
+  const acceptedBody = operation === 'create' ? { task_id: 'task-1' } : { task: { id: 'task-1', status: 'running', model: '海浪🙂' } };
+
+  test(`MiniMax ${operation} rejects declared oversized JSON before reading`, async () => {
+    let cancelled = false;
+    let reads = 0;
+    const response = chunkedResponse([new TextEncoder().encode(JSON.stringify(acceptedBody))], { headers: { 'content-length': String(maxResponseSize + 1) }, onCancel: () => { cancelled = true; } });
+    const getReader = response.body.getReader.bind(response.body);
+    response.body.getReader = (...args) => { reads += 1; return getReader(...args); };
+    const instance = provider({ fetcher: async () => response });
+    await assert.rejects(() => call(instance), (error) => assertSafe(error, { code: 'invalid_response', httpStatus: 200, definitive: false, ...(operation === 'create' ? { submissionState: 'unknown' } : {}) }));
+    assert.equal(reads, 0);
+    assert.equal(cancelled, true);
+  });
+
+  test(`MiniMax ${operation} cancels chunked JSON once cumulative bytes exceed 1 MiB`, async () => {
+    let cancelled = false;
+    const body = JSON.stringify({ ...acceptedBody, padding: 'x'.repeat(maxResponseSize) });
+    const bytes = new TextEncoder().encode(body);
+    const response = chunkedResponse([bytes.subarray(0, 600_000), bytes.subarray(600_000, 1_050_000), bytes.subarray(1_050_000)], { onCancel: () => { cancelled = true; } });
+    const instance = provider({ fetcher: async () => response });
+    await assert.rejects(() => call(instance), (error) => assertSafe(error, { code: 'invalid_response', httpStatus: 200, definitive: false, ...(operation === 'create' ? { submissionState: 'unknown' } : {}) }));
+    assert.equal(cancelled, true);
+  });
+
+  test(`MiniMax ${operation} parses streamed JSON without unbounded convenience methods`, async () => {
+    const bytes = new TextEncoder().encode(JSON.stringify(acceptedBody));
+    const response = chunkedResponse(Array.from(bytes, (byte) => new Uint8Array([byte])));
+    for (const method of ['json', 'text', 'arrayBuffer']) response[method] = async () => { assert.fail(`${method} must not read a supplier response`); };
+    const result = await call(provider({ fetcher: async () => response }));
+    if (operation === 'create') assert.equal(result.remoteId, 'task-1');
+    else assert.deepEqual(result, { status: 'generating', raw: acceptedBody.task, outputUrl: null, error: null });
+  });
+}
+
+test('MiniMax accepts valid JSON exactly at the response byte limit', async () => {
+  const prefix = '{"task_id":"at-limit","padding":"';
+  const suffix = '"}';
+  const bytes = new TextEncoder().encode(prefix + 'x'.repeat(maxResponseSize - prefix.length - suffix.length) + suffix);
+  assert.equal(bytes.byteLength, maxResponseSize);
+  const response = chunkedResponse([bytes], { headers: { 'content-length': String(maxResponseSize) } });
+  assert.equal((await provider({ fetcher: async () => response }).create({ input })).remoteId, 'at-limit');
+});
+
+test('MiniMax rejects a response without a readable byte stream', async () => {
+  const response = { ok: true, status: 200, headers: new Headers(), body: null, json: async () => ({ task_id: 'unbounded-fallback' }) };
+  await assert.rejects(() => provider({ fetcher: async () => response }).create({ input }), (error) => assertSafe(error, { code: 'invalid_response', submissionState: 'unknown' }));
+});
+
+test('MiniMax status rejects declared oversized list responses safely', async () => {
+  let cancelled = false;
+  const response = chunkedResponse([new Uint8Array([123, 125])], { headers: { 'content-length': String(maxResponseSize + 1) }, onCancel: () => { cancelled = true; } });
+  assert.deepEqual(await provider({ fetcher: async () => response }).status(), { connection: 'offline', label: 'MiniMax 暂不可用', balanceLabel });
+  assert.equal(cancelled, true);
+});
+
+test('MiniMax classifies a response stream network failure as provider unavailable', async () => {
+  const response = new Response(new ReadableStream({ start(controller) { controller.error(new TypeError(`${key} supplier-private-detail`)); } }));
+  await assert.rejects(() => provider({ fetcher: async () => response }).create({ input }), (error) => assertSafe(error, { code: 'provider_unavailable', httpStatus: 503, definitive: false, submissionState: 'unknown' }));
 });
