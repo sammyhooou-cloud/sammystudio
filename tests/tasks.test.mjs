@@ -133,7 +133,7 @@ class TaskDb {
         const values = this.values;
         if (sql.startsWith('INSERT INTO video_tasks')) {
           if (db.tasks.some(({ idempotency_key }) => idempotency_key === values[1])) throw new Error('UNIQUE constraint failed: video_tasks.idempotency_key');
-          db.tasks.push({ id: values[0], idempotency_key: values[1], remote_id: values[2], mode: values[3], status: values[4], request_json: values[5] });
+          db.tasks.push({ id: values[0], idempotency_key: values[1], remote_id: values[2], mode: values[3], status: values[4], request_json: values[5], ...(sql.includes('provider') ? { provider: values[8] } : {}) });
         }
         else if (sql.startsWith('UPDATE video_tasks SET remote_id')) {
           db.finalizationAttempts += 1;
@@ -676,7 +676,8 @@ test('recovery record is minimal and excludes extra secrets or raw input data', 
   await assert.rejects(() => submitTask({ ...input, apiToken: 'secret-token', rawFile: [1, 2, 3] }, taskEnv(db, media), 'safe-recovery', capabilities, fetch, async () => ({ taskId: 'remote-safe', access_token: 'provider-secret' })));
   const record = JSON.parse([...media.objects.values()][0]);
 
-  assert.deepEqual(Object.keys(record).sort(), ['id', 'idempotencyKey', 'phase', 'projectId', 'remoteId', 'request', 'result', 'settings', 'settingsVersion', 'traceId']);
+  assert.deepEqual(Object.keys(record).sort(), ['id', 'idempotencyKey', 'phase', 'projectId', 'provider', 'remoteId', 'request', 'result', 'settings', 'settingsVersion', 'traceId']);
+  assert.equal(record.provider, 'kling');
   assert.equal(typeof record.settingsVersion, 'number');
   assert.equal(record.remoteId, 'remote-safe');
   assert.deepEqual(record.result, { generationId: 'remote-safe' });
@@ -808,4 +809,115 @@ test('task links the generated task and saves a serializable settings snapshot',
   });
   assert.equal(db.batchCount, 1);
   assert.doesNotThrow(() => JSON.stringify(JSON.parse(db.settings[0].settings_json)));
+});
+
+test('fresh task injects a provider factory and snapshots the project provider', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia();
+  db.projects[0].video_provider = 'custom';
+  let created = 0; let intent;
+  const providerFactory = (id, env) => {
+    assert.equal(id, 'custom'); assert.equal(env.DB, db);
+    return { id, persistOutput: false, capabilities: async () => capabilities, create: async ({ input: valid, reference, traceId }) => {
+      created += 1; assert.equal(valid.duration, '5'); assert.equal(reference, undefined);
+      intent = JSON.parse(media.objects.get(`task-recovery/${db.tasks[0].id}.json`));
+      assert.equal(intent.traceId, traceId);
+      return { remoteId: 'custom-remote', status: 'queued', raw: { privateProviderResult: true } };
+    } };
+  };
+  const result = await submitTask(input, taskEnv(db, media), 'factory', { providerFactory });
+  assert.equal(created, 1); assert.equal(result.remote_id, 'custom-remote');
+  assert.equal(db.tasks[0].provider, 'custom'); assert.equal(intent.provider, 'custom');
+  assert.match(db.queries.find(({ sql }) => sql.includes('FROM projects')).sql, /SELECT id, video_provider/);
+});
+
+test('legacy project provider defaults to Kling for fresh tasks', async () => {
+  const db = new TaskDb();
+  await submitTask(input, taskEnv(db), 'legacy-provider', { providerFactory: (id) => {
+    assert.equal(id, 'kling');
+    return { id, capabilities: async () => capabilities, create: async () => ({ remoteId: 'legacy-remote', status: 'queued', raw: {} }) };
+  } });
+  assert.equal(db.tasks[0].provider, 'kling');
+});
+
+test('replay with an existing remote ID never instantiates or creates the current project provider', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'stored', provider: 'kling', idempotency_key: '["project-1","stored-key"]', remote_id: 'paid-remote', status: 'submitting' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'stored' });
+  const replay = await submitTask(input, taskEnv(db), 'stored-key', { providerFactory: () => { assert.fail('replay must not create a provider'); } });
+  assert.equal(replay.remote_id, 'paid-remote');
+  assert.equal(db.tasks.length, 1);
+});
+
+test('polling uses the saved task provider after the project switches providers', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'poll-provider', provider: 'custom', remote_id: 'paid-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'poll-provider' });
+  const result = await getTaskStatus('poll-provider', 'project-1', taskEnv(db), { providerFactory: (id) => {
+    assert.equal(id, 'custom');
+    return { id, create: async () => { assert.fail('polling must never create'); }, query: async (remoteId) => {
+      assert.equal(remoteId, 'paid-remote'); return { status: 'succeeded', raw: { url: 'https://cdn.test/custom.mp4' }, outputUrl: 'https://cdn.test/custom.mp4' };
+    } };
+  } });
+  assert.equal(result.status, 'succeeded');
+  assert.equal(JSON.parse(result.resultJson).url, 'https://cdn.test/custom.mp4');
+});
+
+test('polling legacy tasks defaults to Kling independently of the project provider', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'legacy-poll', remote_id: 'legacy-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'legacy-poll' });
+  await getTaskStatus('legacy-poll', 'project-1', taskEnv(db), { providerFactory: (id) => {
+    assert.equal(id, 'kling'); return { query: async () => ({ status: 'generating', raw: { status: 'RUNNING' } }) };
+  } });
+  assert.equal(db.tasks[0].status, 'generating');
+});
+
+test('accepted recovery follows the stored provider even when the project changes', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'recover-provider', provider: 'custom', idempotency_key: '["project-1","recover-provider"]', remote_id: null, status: 'submitting' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'recover-provider' });
+  media.objects.set('task-recovery/recover-provider.json', JSON.stringify({ id: 'recover-provider', projectId: 'project-1', provider: 'custom', settings: {}, settingsVersion: 1, remoteId: 'known-paid', result: { generationId: 'known-paid' } }));
+  const replay = await submitTask(input, taskEnv(db, media), 'recover-provider', { providerFactory: () => { assert.fail('accepted replay must not create'); } });
+  assert.equal(replay.remote_id, 'known-paid'); assert.equal(db.tasks[0].provider, 'custom');
+});
+
+test('recovery provider mismatch is rejected before attaching a remote ID', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia();
+  db.tasks.push({ id: 'mismatch-provider', provider: 'custom', idempotency_key: '["project-1","mismatch-provider"]', remote_id: null, status: 'submitting' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'mismatch-provider' });
+  media.objects.set('task-recovery/mismatch-provider.json', JSON.stringify({ id: 'mismatch-provider', projectId: 'project-1', provider: 'kling', settings: {}, settingsVersion: 1, remoteId: 'wrong-provider-remote', result: {} }));
+  await assert.rejects(() => submitTask(input, taskEnv(db, media), 'mismatch-provider', { providerFactory: () => { assert.fail('replay must not create'); } }), { message: '任务恢复记录无效' });
+  assert.equal(db.tasks[0].remote_id, null);
+});
+
+test('injected provider ambiguous error remains unknown and replay makes no second paid call', async () => {
+  const db = new TaskDb(); const env = taskEnv(db); let creates = 0;
+  const options = { providerFactory: () => ({ id: 'kling', capabilities: async () => capabilities, create: async () => { creates += 1; throw new Error('raw secret provider failure'); } }) };
+  await assert.rejects(() => submitTask(input, env, 'injected-unknown', options), (error) => error.task?.status === 'unknown' && !error.message.includes('secret'));
+  const replay = await submitTask(input, env, 'injected-unknown', options);
+  assert.equal(replay.status, 'unknown'); assert.equal(creates, 1);
+});
+
+test('injected provider without a remote ID remains unknown', async () => {
+  const db = new TaskDb();
+  await assert.rejects(() => submitTask(input, taskEnv(db), 'injected-empty', { providerFactory: () => ({ id: 'kling', capabilities: async () => capabilities, create: async () => ({ status: 'queued', raw: {} }) }) }), (error) => error.task?.status === 'unknown');
+});
+
+test('non-Error provider rejection still marks a paid submission unknown', async () => {
+  for (const reason of [null, undefined, 'raw secret rejection']) {
+    const db = new TaskDb();
+    await assert.rejects(() => submitTask(input, taskEnv(db), 'untyped-rejection', { providerFactory: () => ({ id: 'kling', capabilities: async () => capabilities, create: async () => { throw reason; } }) }), (error) => error.task?.status === 'unknown' && !error.message.includes('secret'));
+    assert.equal(db.tasks[0].status, 'unknown');
+  }
+});
+
+test('TaskError supports coded positional and options forms without changing legacy calls', () => {
+  const task = { id: 'task-1', status: 'failed' };
+  const legacy = new taskApi.TaskError('旧错误', 400, task);
+  assert.equal(legacy.status, 400); assert.deepEqual(legacy.task, task); assert.equal(legacy.code, undefined);
+  const coded = new taskApi.TaskError('明确错误', 409, task, 'PROVIDER_UNAVAILABLE');
+  assert.equal(coded.code, 'PROVIDER_UNAVAILABLE');
+  const options = new taskApi.TaskError({ message: '明确错误', status: 409, code: 'PROVIDER_UNAVAILABLE', task });
+  assert.equal(options.message, '明确错误'); assert.equal(options.status, 409);
+  assert.equal(options.code, 'PROVIDER_UNAVAILABLE'); assert.deepEqual(options.task, task);
 });

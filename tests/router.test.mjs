@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
 import { siteAssets } from '../src/site-assets.js';
+import { TaskError } from '../src/tasks.js';
 
 function env() {
   return {
@@ -663,6 +664,29 @@ test('fresh task still checks status and rejects an offline MCP connection', asy
   assert.equal(response.status, 409);
   assert.deepEqual(await response.json(), { error: '请先连接可灵 MCP' });
   assert.equal(db.statusQueries, 1);
+});
+
+test('fresh task resolves the project provider before checking Kling status', async () => {
+  const db = new TaskRouteDb(); db.projects[0].video_provider = 'unknown';
+  const response = await worker.fetch(taskRequest('project-1', 'unknown-provider'), { DB: db }, {});
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: '视频供应商无效' });
+  assert.equal(db.statusQueries, 0);
+});
+
+test('task API serializes errorCode only for coded TaskError responses', async () => {
+  class CodedTaskDb extends TaskRouteDb {
+    prepare(sql) {
+      if (!sql.startsWith('SELECT') || !sql.includes('FROM video_tasks')) return super.prepare(sql);
+      return { bind() { return { async first() { throw new TaskError('供应商暂不可用', 503, undefined, 'PROVIDER_UNAVAILABLE'); } }; } };
+    }
+  }
+  const db = new CodedTaskDb();
+  for (const request of [taskRequest('project-1'), new Request('https://site.test/api/video/tasks/task-1?projectId=project-1', { headers: sessionHeaders }), new Request('https://site.test/api/video/tasks/attempt?projectId=project-1', { headers: { ...sessionHeaders, 'idempotency-key': 'key' } }), new Request('https://site.test/api/projects/project-1/tasks/task-1', { headers: sessionHeaders })]) {
+    const response = await worker.fetch(request, { DB: db }, {});
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: '供应商暂不可用', errorCode: 'PROVIDER_UNAVAILABLE' });
+  }
 });
 
 test('unexpected database failures return a sanitized server response', async () => {

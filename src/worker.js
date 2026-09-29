@@ -15,6 +15,7 @@ function withSecurity(response) {
 }
 
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8' } });
+const taskErrorBody = (error) => ({ error: error.message, ...(error.code ? { errorCode: error.code } : {}), ...(error.task ? { task: error.task } : {}) });
 
 function projectInputError(error) {
   return error instanceof SyntaxError || ['项目名称不能为空', '项目名称不能超过60个字符'].includes(error?.message);
@@ -175,16 +176,16 @@ async function api(request, env) {
     try { input = await request.json(); }
     catch { return json({ error: '请提供有效的 JSON' }, 400); }
     try {
-      return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID(), () => getKlingStatus(env)));
+      return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID()));
     } catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message, ...(error.task ? { task: error.task } : {}) }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务处理失败' }, 500);
     }
   }
   if (url.pathname === '/api/video/tasks/attempt' && request.method === 'GET') {
     try { return json(await getTaskByAttempt(url.searchParams.get('projectId'), request.headers.get('idempotency-key'), env)); }
     catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务状态暂不可用' }, 503);
     }
   }
@@ -195,7 +196,7 @@ async function api(request, env) {
     if (!projectId || !taskId) return json({ error: '任务参数无效' }, 400);
     try { return json(await getTaskDetail(taskId, projectId, env)); }
     catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务详情暂不可用' }, 503);
     }
   }
@@ -206,7 +207,7 @@ async function api(request, env) {
     if (!id || !projectId) return json({ error: '任务参数无效' }, 400);
     try { return json(await getTaskStatus(id, projectId, env)); }
     catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务状态暂不可用' }, 503);
     }
   }
