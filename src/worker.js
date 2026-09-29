@@ -4,7 +4,7 @@ import { getKlingStatus } from './kling-mcp.js';
 import { submitTask, getTaskStatus, getTaskByAttempt, getTaskDetail, TaskError } from './tasks.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
-import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
+import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject, updateProjectProvider } from './projects.js';
 
 const securityHeaders = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'permissions-policy': 'camera=(), microphone=(), geolocation=()', 'content-security-policy': "default-src 'self'; img-src 'self' blob: data:; media-src 'self' https:; style-src 'self'; script-src 'self'; connect-src 'self' https://klingai.com" };
 
@@ -141,6 +141,18 @@ async function api(request, env) {
     catch (error) {
       if (error.message === '项目不存在') return json({ error: error.message }, 404);
       throw error;
+    }
+  }
+  const providerMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/provider$/);
+  if (providerMatch && request.method === 'PATCH') {
+    const projectId = decodeProjectId(providerMatch[1]);
+    if (projectId === null) return json({ error: '项目 ID 格式无效' }, 400);
+    try { return json(await updateProjectProvider(env.DB, projectId, await request.json())); }
+    catch (error) {
+      if (error instanceof SyntaxError) return json({ error: '请提供有效的 JSON' }, 400);
+      if (error?.message === '视频供应商无效') return json({ error: error.message }, 400);
+      if (error?.message === '项目不存在') return json({ error: error.message }, 404);
+      return json({ error: '项目供应商更新暂不可用' }, 503);
     }
   }
   const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);

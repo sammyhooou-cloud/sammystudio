@@ -45,7 +45,8 @@ class RouteDb {
         if (sql.startsWith('UPDATE projects')) {
           const project = db.projects.find(({ id }) => id === values[2]);
           if (!project) return { success: true, meta: { changes: 0 } };
-          project.name = values[0];
+          if (sql.startsWith('UPDATE projects SET video_provider')) project.video_provider = values[0];
+          else project.name = values[0];
           project.updated_at = values[1];
           return { success: true, meta: { changes: 1 } };
         }
@@ -440,6 +441,61 @@ test('project routes map invalid input, missing projects, and malformed ids to J
     assert.equal(response.status, status, `${method} ${pathname}`);
     assert.equal(typeof (await response.json()).error, 'string');
   }
+});
+
+test('authenticated provider updates decode the project id and persist the provider', async () => {
+  const db = new RouteDb();
+  db.projects.push({ id: 'project one', name: '项目供应商', created_at: 1, updated_at: 2 });
+  const response = await projectRequest(db, '/api/projects/project%20one/provider', 'PATCH', JSON.stringify({ provider: ' MiniMax ' }));
+
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.deepEqual(result, { id: 'project one', videoProvider: 'minimax', updatedAt: db.projects[1].updated_at });
+  assert.equal(db.projects[1].name, '项目供应商');
+  const workspace = await projectRequest(db, '/api/projects/project%20one/workspace');
+  assert.equal((await workspace.json()).project.videoProvider, 'minimax');
+});
+
+test('provider route returns JSON errors for invalid input, malformed ids, and missing projects', async () => {
+  for (const [pathname, body, status, error] of [
+    ['/api/projects/project-1/provider', '{broken', 400, '请提供有效的 JSON'],
+    ['/api/projects/project-1/provider', JSON.stringify({ provider: 'other' }), 400, '视频供应商无效'],
+    ['/api/projects/project-1/provider', JSON.stringify({}), 400, '视频供应商无效'],
+    ['/api/projects/missing/provider', JSON.stringify({ provider: 'minimax' }), 404, '项目不存在'],
+    ['/api/projects/%E0%A4%A/provider', JSON.stringify({ provider: 'minimax' }), 400, '项目 ID 格式无效'],
+  ]) {
+    const response = await projectRequest(new RouteDb(), pathname, 'PATCH', body);
+    assert.equal(response.status, status, pathname);
+    assert.deepEqual(await response.json(), { error });
+  }
+});
+
+test('provider route requires a session and enforces mutation origin and content type', async () => {
+  for (const [headers, status, error] of [
+    [{ origin: 'https://site.test', 'content-type': 'application/json' }, 401, '请先登录'],
+    [{ ...sessionHeaders, origin: 'https://other.test' }, 403, '请求来源无效'],
+    [{ ...sessionHeaders, 'content-type': 'text/plain' }, 415, '请求内容类型无效'],
+  ]) {
+    const db = new RouteDb();
+    const response = await worker.fetch(new Request('https://site.test/api/projects/project-1/provider', {
+      method: 'PATCH', headers, body: JSON.stringify({ provider: 'minimax' }),
+    }), { DB: db }, {});
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), { error });
+    assert.equal(db.projects[0].video_provider, undefined);
+  }
+});
+
+test('provider route sanitizes unexpected database errors', async () => {
+  class FailingProviderDb extends RouteDb {
+    prepare(sql) {
+      if (!sql.startsWith('UPDATE projects SET video_provider')) return super.prepare(sql);
+      return { bind() { return { async run() { throw new Error('database password leaked'); } }; } };
+    }
+  }
+  const response = await projectRequest(new FailingProviderDb(), '/api/projects/project-1/provider', 'PATCH', JSON.stringify({ provider: 'minimax' }));
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: '项目供应商更新暂不可用' });
 });
 
 test('upload rejects a missing or invalid project before writing media', async () => {
