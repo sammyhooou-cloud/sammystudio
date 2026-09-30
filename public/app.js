@@ -220,7 +220,30 @@ export function pendingWorkspaceSettings(attempts, projectId, assets = [], capab
 }
 
 export function nextPollDelay(current, success) { return success ? 3000 : Math.min(Math.max(current, 3000) * 2, 30000); }
-export function createActiveTaskPoller({ load, onUpdate, schedule = setTimeout, cancel = clearTimeout }) {
+export const outputPersistenceRetryMessage = '视频已生成，但保存到本站失败，正在重试';
+
+export function markOutputPersistenceFailure(tasks, taskId) {
+  let changed = false;
+  const marked = tasks.map((task) => {
+    if (task.id !== taskId || !activeTaskStatuses.has(taskStatus(task)) || task.outputPersistFailed) return task;
+    changed = true;
+    return { ...task, outputPersistFailed: true };
+  });
+  return changed ? marked : tasks;
+}
+
+export function mergePolledTaskRow(item, updated) {
+  return {
+    ...item,
+    remoteId: updated.remote_id,
+    status: updated.status,
+    provider: ['kling', 'minimax'].includes(updated.provider) ? updated.provider : item.provider,
+    resultJson: updated.resultJson ?? item.resultJson,
+    outputPersistFailed: false,
+    updatedAt: Date.now(),
+  };
+}
+export function createActiveTaskPoller({ load, onUpdate, onError = () => {}, schedule = setTimeout, cancel = clearTimeout }) {
   let projectId = '', activeIds = [], timer = null, inFlight = false, generation = 0, nextIndex = 0, delay = 3000;
   const active = (task) => ['queued', 'generating', 'submitting'].includes(task.status);
   const scheduleNext = () => {
@@ -241,7 +264,8 @@ export function createActiveTaskPoller({ load, onUpdate, schedule = setTimeout, 
         delay = nextPollDelay(delay, true);
         nextIndex = activeIds.includes(selectedId) ? (activeIds.indexOf(selectedId) + 1) % activeIds.length : Math.min(selectedIndex, Math.max(activeIds.length - 1, 0));
       }
-    } catch {
+    } catch (error) {
+      if (selectedGeneration === generation && selectedProject === projectId && error?.code === 'output_persist_failed') onError(error, selectedProject, selectedId);
       if (selectedGeneration === generation) delay = nextPollDelay(delay, false);
       if (activeIds.length) nextIndex = (selectedIndex + 1) % activeIds.length;
     } finally { inFlight = false; scheduleNext(); }
@@ -329,7 +353,7 @@ function taskResult(task) {
 export function taskListItemModel(task, projectId) {
   const status = taskStatus(task);
   if (activeTaskStatuses.has(status)) {
-    const label = { submitting: '正在提交', queued: '排队中', generating: '生成中' }[status];
+    const label = task.outputPersistFailed ? outputPersistenceRetryMessage : { submitting: '正在提交', queued: '排队中', generating: '生成中' }[status];
     return { label, action: '生成中', href: '', tone: 'active' };
   }
   const href = projectId && task?.id ? taskDetailHref(projectId, task.id) : '';
@@ -457,6 +481,7 @@ export function mergeReconciledTask(tasks, row, canClaimStage) {
       const promoteStatus = reconciliationStatusRank(row.status) > reconciliationStatusRank(item.status);
       return {
         ...item,
+        provider: item.provider || row.provider,
         remoteId: canClaimStage ? (row.remoteId || item.remoteId) : (item.remoteId || row.remoteId),
         status: promoteStatus && row.status ? row.status : item.status,
         resultJson: canClaimStage ? (row.resultJson ?? item.resultJson) : (item.resultJson ?? row.resultJson),
@@ -502,6 +527,10 @@ export function prependProjectTask(activeProjectId, submittedProjectId, tasks, t
   return [task, ...tasks.filter(({ id }) => id !== task.id)].slice(0, 100);
 }
 
+export function submissionTaskRow(task, mode, provider) {
+  return { id: task.id, remoteId: task.remote_id, status: task.status, provider: normalizeWorkspaceProvider(provider), mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() };
+}
+
 export async function performProjectSwitch({ load, setBusy, commit, fail }) {
   setBusy(true);
   try { await commit(await load()); return true; }
@@ -515,11 +544,11 @@ export function optionsForModel(capabilities, mode, modelId) {
   return { resolutions: args.resolution?.allowedValues || [], durations: args.duration?.allowedValues || [], aspectRatios: args.aspect_ratio?.allowedValues || ['16:9', '9:16', '1:1'] };
 }
 
-export function validateWorkspace(value) {
+export function validateWorkspace(value, provider = 'kling') {
   const errors = {};
   if (!value.projectId) errors.projectId = '请先选择项目';
   if (!value.model) errors.model = '请选择模型';
-  if (value.mode === 'text' && !value.prompt?.trim()) errors.prompt = '请输入视频提示词';
+  if ((value.mode === 'text' || (value.mode === 'image' && provider === 'minimax')) && !value.prompt?.trim()) errors.prompt = '请输入视频提示词';
   if (value.mode === 'image' && !value.uploadId) errors.uploadId = '请上传首帧参考图';
   return errors;
 }
@@ -538,10 +567,18 @@ export function buildGenerationPayload(value) {
   };
 }
 
+export function requestFailure(response, body = {}) {
+  const error = new Error(body.error || '请求失败');
+  error.task = body.task;
+  error.status = response.status;
+  error.code = body.errorCode;
+  return error;
+}
+
 async function request(path, options = {}) {
   const response = await fetch(path, options);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) { const error = new Error(body.error || '请求失败'); error.task = body.task; error.status = response.status; throw error; }
+  if (!response.ok) throw requestFailure(response, body);
   return body;
 }
 
@@ -600,8 +637,13 @@ function setup() {
   const poller = createActiveTaskPoller({
     load: (projectId, id) => request(`/api/video/tasks/${encodeURIComponent(id)}?projectId=${encodeURIComponent(projectId)}`),
     onUpdate: (updated) => {
-      projectTasks = projectTasks.map((item) => item.id === updated.id ? { ...item, remoteId: updated.remote_id, status: updated.status, resultJson: updated.resultJson ?? item.resultJson, updatedAt: Date.now() } : item);
+      projectTasks = projectTasks.map((item) => item.id === updated.id ? mergePolledTaskRow(item, updated) : item);
       renderTasks();
+    },
+    onError: (_error, projectId, taskId) => {
+      if (projectId !== currentProjectId) return;
+      const marked = markOutputPersistenceFailure(projectTasks, taskId);
+      if (marked !== projectTasks) { projectTasks = marked; renderTasks(); }
     },
   });
 
@@ -616,6 +658,7 @@ function setup() {
     if (!pending) return;
     const generationAtStart = generationSequence;
     const pendingKeyAtStart = pending.key;
+    const pendingProviderAtStart = provider;
     try {
       const task = await request(`/api/video/tasks/attempt?projectId=${encodeURIComponent(projectId)}`, { headers: { 'idempotency-key': pending.key } });
       if (sequence !== workspaceLoadSequence || projectId !== currentProjectId) return;
@@ -623,7 +666,7 @@ function setup() {
         const canClaimStage = reconciliationMayClaimStage(generationAtStart, generationSequence, pendingKeyAtStart, attempts.pendingForProject(projectId)?.key);
         attempts.resolve(pending);
         renderPendingAttemptState();
-        const row = { id: task.id, remoteId: task.remote_id, status: task.status, mode: pending.payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() };
+        const row = submissionTaskRow(task, pending.payload.mode, pendingProviderAtStart);
         projectTasks = mergeReconciledTask(projectTasks, row, canClaimStage);
         ({ selectedTaskId, stageOverride } = reconciledStageSelection(selectedTaskId, stageOverride, task.id, canClaimStage));
         renderTasks();
@@ -834,7 +877,7 @@ function setup() {
         progress.textContent = `${state.progress}%`;
         progress.hidden = false;
       }
-      status.textContent = '生成中';
+      status.textContent = state.current.outputPersistFailed ? outputPersistenceRetryMessage : '生成中';
     } else if (state.kind === 'video') {
       status.textContent = '已完成';
     } else {
@@ -1060,13 +1103,14 @@ function setup() {
     event.preventDefault();
     if (projectSwitchBusy || providerSwitchBusy || projectCreateBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate) return;
     const submittedProjectId = currentProjectId;
+    const submittedProvider = provider;
     const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount });
     const pending = attempts.pendingForProject(submittedProjectId);
     if (pending && JSON.stringify(pending.payload) !== JSON.stringify(payload)) {
       document.querySelector('#form-error').textContent = '上次提交待确认；请恢复原设置并使用原请求重试，不能以新设置再次提交。';
       return;
     }
-    const errors = validateWorkspace(payload);
+    const errors = validateWorkspace(payload, submittedProvider);
     if (Object.keys(errors).length) { document.querySelector('#form-error').textContent = Object.values(errors)[0]; return; }
     const attempt = attempts.begin(payload);
     if (!attempt) return;
@@ -1083,7 +1127,7 @@ function setup() {
       const task = await request('/api/video/tasks', { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': attempt.key }, body: JSON.stringify(payload) });
       attempts.settle(attempt, Boolean(task.remote_id || task.status === 'succeeded' || task.status === 'failed'));
       if (submissionIsCurrent()) {
-        projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: task.id, remoteId: task.remote_id, status: task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+        projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, submissionTaskRow(task, payload.mode, submittedProvider));
         selectedTaskId = task.id || '';
         submittingWithoutTask = false;
         stageOverride = null;
@@ -1097,7 +1141,7 @@ function setup() {
         submittingWithoutTask = false;
         document.querySelector('#form-error').textContent = error.message;
         if (error.task?.id) {
-          projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, { id: error.task.id, remoteId: error.task.remote_id, status: error.task.status, mode: payload.mode, resultJson: null, createdAt: Date.now(), updatedAt: Date.now() });
+          projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, submissionTaskRow(error.task, payload.mode, submittedProvider));
           selectedTaskId = error.task.id;
           stageOverride = null;
           renderTasks();

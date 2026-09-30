@@ -62,7 +62,7 @@ function setup(t, taskId = 'task-1', projectId = 'project-1') {
     async get(key) {
       gets.push(key);
       const bytes = objects.get(key);
-      return bytes ? { body: new Response(bytes).body } : null;
+      return bytes ? { body: new Response(bytes).body, size: bytes.byteLength } : null;
     },
     async delete(key) {
       deletes.push(key);
@@ -169,6 +169,14 @@ test('video persistence validates declared sizes before writing to R2', async (t
     await assert.rejects(() => persist({ env, fetcher: async () => videoResponse({ length }) }), { code: 'output_persist_failed' });
     assert.equal(puts.length, 0);
   }
+});
+
+test('zero-byte streamed video fails without inserting an output and deletes its attempt object', async (t) => {
+  const { env, db, objects, deletes } = setup(t);
+  await assert.rejects(() => persist({ env, fetcher: async () => videoResponse({ body: '', length: null }) }), { status: 503, code: 'output_persist_failed' });
+  assert.equal(db.rows().length, 0);
+  assert.equal(objects.has(attemptKey()), false);
+  assert.deepEqual(deletes, [attemptKey()]);
 });
 
 test('video persistence records actual streamed bytes despite missing or suspicious size metadata', async (t) => {
@@ -316,11 +324,54 @@ test('reading an owned output uses a project-scoped JOIN and returns a private s
   assert.ok(response instanceof Response);
   assert.equal(response.headers.get('content-type'), 'video/webm');
   assert.equal(response.headers.get('cache-control'), 'private, max-age=3600');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-length'), '5');
   assert.equal(await response.text(), 'video');
   assert.equal(db.queries.length, 1);
   assert.match(db.queries[0].sql, /JOIN project_tasks/);
   assert.match(db.queries[0].sql, /project_tasks\.project_id = \?/);
   assert.deepEqual(db.queries[0].values, ['task-1', 'project-1']);
+});
+
+test('reading an owned output passes a safe byte range to R2 and returns its partial stream', async (t) => {
+  const { env, db } = setup(t);
+  db.output({ byte_size: 11 });
+  env.MEDIA.get = async (key, options) => {
+    assert.equal(key, 'outputs/task-1.mp4');
+    assert.ok(options.range instanceof Headers);
+    assert.deepEqual([...options.range.entries()], [['range', 'bytes=2-5']]);
+    return { body: new Response('ned ').body, size: 11, range: { offset: 2, length: 4 } };
+  };
+  const response = await read({ env, range: 'bytes=2-5' });
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('content-range'), 'bytes 2-5/11');
+  assert.equal(response.headers.get('content-length'), '4');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(await response.text(), 'ned ');
+});
+
+test('reading an owned output supports suffix range and rejects invalid or unsatisfiable ranges before R2', async (t) => {
+  const { env, db } = setup(t);
+  db.output({ byte_size: 11 });
+  let reads = 0;
+  env.MEDIA.get = async (key, options) => {
+    reads += 1;
+    assert.equal(key, 'outputs/task-1.mp4');
+    assert.equal(options.range.get('range'), 'bytes=-3');
+    return { body: new Response('deo').body, size: 11, range: { offset: 8, length: 3 } };
+  };
+  const suffix = await read({ env, range: 'bytes=-3' });
+  assert.equal(suffix.status, 206);
+  assert.equal(suffix.headers.get('content-range'), 'bytes 8-10/11');
+  assert.equal(await suffix.text(), 'deo');
+  for (const range of ['bytes=0-1,3-4', 'bytes=11-', 'bytes=5-4', 'bytes=-0', 'bytes=abc', 'items=0-1']) {
+    const response = await read({ env, range });
+    assert.equal(response.status, 416, range);
+    assert.equal(response.headers.get('content-range'), 'bytes */11');
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.doesNotMatch(await response.text(), /outputs\/|private/);
+  }
+  assert.equal(reads, 1);
 });
 
 test('reading missing, cross-project or missing-R2 outputs returns null without revealing keys', async (t) => {

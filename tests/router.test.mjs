@@ -145,6 +145,22 @@ test('provider status API checks MiniMax with one GET and exposes static capabil
   assert.equal(JSON.stringify(body).includes('supplier_private_detail'), false);
 });
 
+test('provider status API exposes MiniMax insufficient balance without supplier details', async (t) => {
+  const key = 'test-only-minimax-key';
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls += 1;
+    return Response.json({ error: `${key} supplier-private-detail` }, { status: 402 });
+  });
+  const response = await providerStatusRequest({ DB: new ProviderStatusDb(), MINIMAX_API_KEY: key }, 'minimax');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body, { provider: 'minimax', connection: 'offline', label: 'MiniMax 额度不足，请前往控制台查看', balanceLabel: '额度不足，请前往控制台查看', models: minimaxCapabilities });
+  assert.equal(calls, 1);
+  assert.equal(JSON.stringify(body).includes(key), false);
+  assert.equal(JSON.stringify(body).includes('supplier-private-detail'), false);
+});
+
 test('provider status API safely exposes MiniMax without a configured key', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => assert.fail('unconfigured MiniMax must not request the supplier'));
   for (const key of [undefined, '', '   ']) {
@@ -432,8 +448,8 @@ function outputRouteEnv(taskId = 'task-1', projectId = 'project-1') {
   const db = new OutputRouteDb();
   db.tasks.push({ id: taskId, status: 'succeeded' });
   db.projectTasks.push({ project_id: projectId, task_id: taskId });
-  db.outputs.push({ task_id: taskId, object_key: 'outputs/private.mp4', content_type: 'video/mp4' });
-  return { DB: db, MEDIA: { get: async (key) => { assert.equal(key, 'outputs/private.mp4'); return { body: new Response('owned video').body }; } } };
+  db.outputs.push({ task_id: taskId, object_key: 'outputs/private.mp4', content_type: 'video/mp4', byte_size: 11 });
+  return { DB: db, MEDIA: { get: async (key) => { assert.equal(key, 'outputs/private.mp4'); return { body: new Response('owned video').body, size: 11 }; } } };
 }
 
 async function outputRequest(runtime, pathname, headers = sessionHeaders) {
@@ -452,8 +468,41 @@ test('task output API decodes both IDs and streams an owned video with private c
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('content-type'), 'video/mp4');
   assert.equal(response.headers.get('cache-control'), 'private, max-age=3600');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-length'), '11');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(await response.text(), 'owned video');
+});
+
+test('task output API forwards a single range to R2 and streams a 206 response', async () => {
+  const runtime = outputRouteEnv();
+  runtime.MEDIA.get = async (key, options) => {
+    assert.equal(key, 'outputs/private.mp4');
+    assert.ok(options.range instanceof Headers);
+    assert.deepEqual([...options.range.entries()], [['range', 'bytes=2-5']]);
+    return { body: new Response('ned ').body, size: 11, range: { offset: 2, length: 4 } };
+  };
+  const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output', { ...sessionHeaders, range: 'bytes=2-5' });
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-range'), 'bytes 2-5/11');
+  assert.equal(response.headers.get('content-length'), '4');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(await response.text(), 'ned ');
+});
+
+test('task output API rejects bad ranges without revealing object keys or bypassing ownership', async () => {
+  const path = '/api/projects/project-1/tasks/task-1/output';
+  const runtime = outputRouteEnv();
+  runtime.MEDIA.get = () => assert.fail('bad range must not read R2');
+  const response = await outputRequest(runtime, path, { ...sessionHeaders, range: 'bytes=11-' });
+  assert.equal(response.status, 416);
+  assert.equal(response.headers.get('content-range'), 'bytes */11');
+  assert.doesNotMatch(await response.text(), /outputs\/|private/);
+  const anonymous = await outputRequest(runtime, path, { range: 'bytes=2-5' });
+  assert.equal(anonymous.status, 401);
+  const foreign = await outputRequest(runtime, '/api/projects/other/tasks/task-1/output', { ...sessionHeaders, range: 'bytes=2-5' });
+  assert.equal(foreign.status, 404);
 });
 
 test('task output API hides missing, cross-project and missing-R2 outputs', async () => {

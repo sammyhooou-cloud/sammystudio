@@ -76,6 +76,25 @@ function limitedVideoBody(body, maxBytes) {
   return { stream, complete: () => completed, exceeded: () => exceeded, bytes: () => size, cancel: () => reader.cancel().catch(() => {}) };
 }
 
+function validSingleRange(value, size) {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value);
+  if (!match || (!match[1] && !match[2])) return false;
+  const first = match[1] ? Number(match[1]) : null;
+  const last = match[2] ? Number(match[2]) : null;
+  if (first !== null && !Number.isSafeInteger(first)) return false;
+  if (last !== null && !Number.isSafeInteger(last)) return false;
+  if (first === null) return last > 0 && size > 0;
+  return first < size && (last === null || last >= first);
+}
+
+function rangeNotSatisfiable(size) {
+  return new Response(null, { status: 416, headers: {
+    'accept-ranges': 'bytes',
+    'content-range': `bytes */${size}`,
+    'cache-control': 'private, max-age=3600',
+  } });
+}
+
 async function ownedOutput(db, taskId, projectId) {
   return db.prepare(`SELECT task_outputs.* FROM task_outputs
     JOIN project_tasks ON project_tasks.task_id = task_outputs.task_id
@@ -107,7 +126,7 @@ export async function persistTaskOutput({ taskId, projectId, sourceUrl, env, fet
     const outputId = idFactory();
     objectKey = `outputs/${taskId}/${outputId}.mp4`;
     await env.MEDIA.put(objectKey, monitored.stream, { httpMetadata: { contentType } });
-    if (!monitored.complete() || monitored.exceeded()) throw persistenceError();
+    if (!monitored.complete() || monitored.exceeded() || monitored.bytes() === 0) throw persistenceError();
     await env.DB.prepare('INSERT OR IGNORE INTO task_outputs (id, task_id, object_key, content_type, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?)')
       .bind(outputId, taskId, objectKey, contentType, monitored.bytes(), now()).run();
     const winner = await ownedOutput(env.DB, taskId, projectId);
@@ -122,14 +141,28 @@ export async function persistTaskOutput({ taskId, projectId, sourceUrl, env, fet
   }
 }
 
-export async function readTaskOutput({ taskId, projectId, env }) {
+export async function readTaskOutput({ taskId, projectId, env, range = null }) {
   if (!validIds(taskId, projectId)) throw new OutputError('任务参数无效', 400);
   try {
     const output = await ownedOutput(env.DB, taskId, projectId);
     if (!output) return null;
-    const object = await env.MEDIA.get(output.object_key);
+    const requestedRange = range !== null;
+    if (requestedRange && (!Number.isSafeInteger(output.byte_size) || output.byte_size < 0)) throw new Error('invalid output size');
+    if (requestedRange && (typeof range !== 'string' || !validSingleRange(range, output.byte_size))) return rangeNotSatisfiable(output.byte_size);
+    const object = await env.MEDIA.get(output.object_key, requestedRange ? { range: new Headers({ range }) } : undefined);
     if (!object) return null;
-    return new Response(object.body, { headers: { 'content-type': output.content_type, 'cache-control': 'private, max-age=3600' } });
+    const size = Number.isSafeInteger(object.size) && object.size >= 0 ? object.size : output.byte_size;
+    const headers = { 'content-type': output.content_type, 'cache-control': 'private, max-age=3600', 'accept-ranges': 'bytes' };
+    if (requestedRange) {
+      const { offset, length } = object.range || {};
+      if (!Number.isSafeInteger(size) || !Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
+          offset < 0 || length <= 0 || offset + length > size) throw new Error('invalid R2 range');
+      headers['content-range'] = `bytes ${offset}-${offset + length - 1}/${size}`;
+      headers['content-length'] = String(length);
+      return new Response(object.body, { status: 206, headers });
+    }
+    if (Number.isSafeInteger(size) && size >= 0) headers['content-length'] = String(size);
+    return new Response(object.body, { headers });
   } catch {
     throw new OutputError('视频输出暂不可用', 503);
   }

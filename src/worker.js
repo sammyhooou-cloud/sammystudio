@@ -211,7 +211,7 @@ async function api(request, env) {
     const projectId = decodeProjectId(taskOutputMatch[1]);
     const taskId = decodeProjectId(taskOutputMatch[2]);
     if (!projectId?.trim() || !taskId?.trim()) return json({ error: '任务参数无效' }, 400);
-    try { return await readTaskOutput({ taskId, projectId, env }) || json({ error: '视频输出不存在' }, 404); }
+    try { return await readTaskOutput({ taskId, projectId, env, range: request.headers.get('range') }) || json({ error: '视频输出不存在' }, 404); }
     catch { return json({ error: '视频输出暂不可用' }, 503); }
   }
   const taskDetailMatch = url.pathname.match(/^\/api\/projects\/([^/]*)\/tasks\/([^/]*)$/);

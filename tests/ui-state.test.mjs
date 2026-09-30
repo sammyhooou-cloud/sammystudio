@@ -66,6 +66,47 @@ test('task provider labels use the saved task provider and default legacy rows t
   assert.equal(taskProviderLabel({}), '可灵');
 });
 
+test('new and recovered task rows retain their original project provider', () => {
+  const { submissionTaskRow } = stageHelpers;
+  const task = { id: 'new', remote_id: 'remote', status: 'queued' };
+  const row = submissionTaskRow(task, 'image', 'minimax');
+  assert.equal(row.provider, 'minimax');
+  assert.equal(taskPresenter.taskProviderLabel(row), 'MiniMax');
+  assert.equal(submissionTaskRow(task, 'text', 'kling').provider, 'kling');
+});
+
+test('reconciliation retains an existing provider and fills a missing provider from the recovered row', () => {
+  const { mergeReconciledTask } = stageHelpers;
+  const recovered = { id: 'task', status: 'queued', provider: 'minimax' };
+  assert.equal(mergeReconciledTask([{ id: 'task', status: 'submitting', provider: 'kling' }], recovered, true)[0].provider, 'kling');
+  assert.equal(mergeReconciledTask([{ id: 'task', status: 'submitting' }], recovered, true)[0].provider, 'minimax');
+});
+
+test('poll updates keep the saved provider when the status response omits it', () => {
+  const { mergePolledTaskRow } = stageHelpers;
+  const row = { id: 'task', status: 'queued', provider: 'minimax' };
+  assert.equal(mergePolledTaskRow(row, { id: 'task', status: 'generating' }).provider, 'minimax');
+  assert.equal(mergePolledTaskRow(row, { id: 'task', status: 'generating', provider: 'kling' }).provider, 'kling');
+});
+
+test('a failed output save marks only its active task with a safe retry label', () => {
+  const { markOutputPersistenceFailure, taskListItemModel, outputPersistenceRetryMessage } = stageHelpers;
+  const tasks = [{ id: 'active', status: 'generating', provider: 'minimax' }, { id: 'done', status: 'succeeded' }];
+  const marked = markOutputPersistenceFailure(tasks, 'active');
+  assert.equal(marked[0].outputPersistFailed, true);
+  assert.equal(marked[1], tasks[1]);
+  assert.equal(taskListItemModel(marked[0], 'p').label, outputPersistenceRetryMessage);
+  assert.match(outputPersistenceRetryMessage, /视频已生成.*保存到本站失败.*正在重试/);
+  assert.equal(markOutputPersistenceFailure(tasks, 'done')[1].outputPersistFailed, undefined);
+  assert.equal(stageHelpers.mergePolledTaskRow(marked[0], { id: 'active', status: 'succeeded' }).outputPersistFailed, false);
+});
+
+test('HTTP errors retain the response code for controlled poll handling', () => {
+  const error = stageHelpers.requestFailure({ status: 503 }, { error: 'internal secret', errorCode: 'output_persist_failed' });
+  assert.equal(error.code, 'output_persist_failed');
+  assert.equal(error.status, 503);
+});
+
 test('provider account view uses server balance labels and only online is green', () => {
   const { providerAccountView } = stageHelpers;
   for (const connection of ['unconfigured', 'offline', 'auth_error']) {
@@ -1028,6 +1069,41 @@ test('poller discards stale project responses and prioritizes a selected active 
   assert.deepEqual(updates, ['b']);
 });
 
+test('poller reports output save failures for the current project and keeps retrying', async () => {
+  const timers = [];
+  const errors = [];
+  let calls = 0;
+  const poller = createActiveTaskPoller({
+    load: async () => { calls += 1; if (calls === 1) throw Object.assign(new Error('private detail'), { code: 'output_persist_failed' }); return { id: 'task', status: 'succeeded' }; },
+    onUpdate: () => poller.sync('p', [{ id: 'task', status: 'succeeded' }]),
+    onError: (_error, projectId, taskId) => errors.push([projectId, taskId]),
+    schedule: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    cancel: () => {},
+  });
+  poller.sync('p', [{ id: 'task', status: 'generating' }]);
+  await timers.shift().fn();
+  assert.deepEqual(errors, [['p', 'task']]);
+  assert.equal(timers[0].ms, 6000);
+  await timers.shift().fn();
+  assert.equal(calls, 2);
+});
+
+test('poller silently backs off on ordinary network failures', async () => {
+  const timers = [];
+  const errors = [];
+  const poller = createActiveTaskPoller({
+    load: async () => { throw new Error('offline secret'); },
+    onUpdate: () => assert.fail('no update expected'),
+    onError: (error) => errors.push(error),
+    schedule: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    cancel: () => {},
+  });
+  poller.sync('p', [{ id: 'task', status: 'generating' }]);
+  await timers.shift().fn();
+  assert.deepEqual(errors, []);
+  assert.equal(timers[0].ms, 6000);
+});
+
 test('session drafts restore per-project controls including upload removal', () => {
   const drafts = createProjectDrafts();
   drafts.save('a', { prompt: 'unsubmitted', uploadId: 'asset-a' });
@@ -1067,6 +1143,14 @@ test('filters options from model capabilities', () => {
 
 test('requires a first frame in image mode', () => {
   assert.equal(validateWorkspace({ mode: 'image', model: 'turbo', uploadId: '', prompt: '' }).uploadId, '请上传首帧参考图');
+});
+
+test('MiniMax image generation requires a nonblank prompt without changing Kling image validation or payload', () => {
+  const form = { projectId: 'p', mode: 'image', model: 'MiniMax-H3', uploadId: 'image-1', prompt: '  ' };
+  assert.equal(validateWorkspace(form, 'minimax').prompt, '请输入视频提示词');
+  assert.equal(validateWorkspace(form, 'kling').prompt, undefined);
+  assert.equal(validateWorkspace({ ...form, prompt: 'moving clouds' }, 'minimax').prompt, undefined);
+  assert.equal(buildGenerationPayload({ ...form, provider: 'minimax' }).provider, undefined);
 });
 
 test('requires a selected project and includes it in the generation payload', () => {
