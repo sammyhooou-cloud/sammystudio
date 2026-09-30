@@ -40,6 +40,16 @@ export function providerAccountView(provider, status = {}) {
   };
 }
 
+export function applySubmissionProviderFailure(provider, error, apply) {
+  if (provider !== 'minimax' || error?.code !== 'insufficient_balance') return false;
+  apply({
+    connection: 'offline',
+    label: 'MiniMax 额度不足',
+    balanceLabel: '额度：不足，请前往 MiniMax 控制台查看',
+  }, provider);
+  return true;
+}
+
 export function isCurrentProviderRequest(activeProjectId, requestedProjectId, sequence, latestSequence, activeProvider, requestedProvider) {
   return Boolean(requestedProjectId) && activeProjectId === requestedProjectId && sequence === latestSequence
     && (requestedProvider === undefined || activeProvider === requestedProvider);
@@ -200,7 +210,7 @@ export function createSubmissionAttemptController(keyFactory = () => crypto.rand
   };
 }
 
-const unresolvedAttemptGuidance = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对可灵任务；不要更改设置后重复提交。';
+const unresolvedAttemptGuidance = '上次提交结果尚未确认。请保持原设置重试以复用同一请求，或先人工核对供应商任务；不要更改设置后重复提交。';
 
 export function shouldShowPendingAttemptGuidance(attempts, projectId) {
   return Boolean(projectId && !attempts.inFlight && attempts.pendingForProject(projectId));
@@ -1139,6 +1149,7 @@ function setup() {
       attempts.settle(attempt, error.task?.status === 'failed' || [400, 403, 404, 422].includes(error.status));
       if (submissionIsCurrent()) {
         submittingWithoutTask = false;
+        applySubmissionProviderFailure(submittedProvider, error, applyAccountStatus);
         document.querySelector('#form-error').textContent = error.message;
         if (error.task?.id) {
           projectTasks = prependProjectTask(currentProjectId, submittedProjectId, projectTasks, submissionTaskRow(error.task, payload.mode, submittedProvider));

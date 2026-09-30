@@ -126,6 +126,32 @@ test('provider account view uses server balance labels and only online is green'
   );
 });
 
+test('MiniMax insufficient balance submission failure immediately locks generation with safe account copy', () => {
+  const applied = [];
+  const handled = stageHelpers.applySubmissionProviderFailure(
+    'minimax',
+    { code: 'insufficient_balance', message: 'supplier-private-detail' },
+    (status, provider) => applied.push({ status, provider }),
+  );
+
+  assert.equal(handled, true);
+  assert.deepEqual(applied, [{
+    provider: 'minimax',
+    status: {
+      connection: 'offline',
+      label: 'MiniMax 额度不足',
+      balanceLabel: '额度：不足，请前往 MiniMax 控制台查看',
+    },
+  }]);
+  assert.equal(stageHelpers.providerAccountView('minimax', applied[0].status).canGenerate, false);
+  assert.doesNotMatch(JSON.stringify(applied), /supplier-private-detail/);
+
+  for (const [provider, error] of [
+    ['kling', { code: 'insufficient_balance' }],
+    ['minimax', { code: 'provider_unavailable' }],
+  ]) assert.equal(stageHelpers.applySubmissionProviderFailure(provider, error, () => assert.fail('must not change account status')), false);
+});
+
 test('new provider capabilities replace invalid values with the new model defaults', () => {
   const minimax = {
     text_to_video: { models: [{ model: 'MiniMax-H3', arguments: [
@@ -1011,6 +1037,8 @@ test('pending guidance clears only its own text after resolution', () => {
   assert.equal(typeof stageHelpers.pendingAttemptMessage, 'function');
   const warning = stageHelpers.pendingAttemptMessage('', true);
   assert.match(warning, /上次提交结果尚未确认/);
+  assert.match(warning, /人工核对供应商任务/);
+  assert.doesNotMatch(warning, /可灵/);
   assert.equal(stageHelpers.pendingAttemptMessage(warning, false), '');
   assert.equal(stageHelpers.pendingAttemptMessage('请输入视频提示词', false), '请输入视频提示词');
   assert.equal(stageHelpers.pendingAttemptMessage('请求失败', true), '请求失败');
