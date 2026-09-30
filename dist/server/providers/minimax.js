@@ -5,6 +5,7 @@ const MAX_RESPONSE_BYTES = 1024 * 1024;
 const IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const RATIOS = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'];
 const BALANCE_LABEL = '额度：控制台查看';
+const INSUFFICIENT_BALANCE_LABEL = '额度不足，请前往控制台查看';
 const FAILURE_MESSAGE = 'MiniMax 视频生成失败';
 const ERROR_MESSAGES = Object.freeze({
   provider_not_configured: '请配置 MiniMax API Key',
@@ -195,6 +196,7 @@ export function createMiniMaxProvider(env = {}, deps = {}) {
       const code = await request(`${QUERY_URL}?page_num=1&page_size=1`, { checkStatus: true });
       if (code === 200) return { connection: 'online', label: 'MiniMax 已连接', balanceLabel: BALANCE_LABEL };
       if (code === 401) return { connection: 'auth_error', label: 'MiniMax 认证失败', balanceLabel: BALANCE_LABEL };
+      if (code === 402) return { connection: 'offline', label: `MiniMax ${INSUFFICIENT_BALANCE_LABEL}`, balanceLabel: INSUFFICIENT_BALANCE_LABEL };
     } catch {}
     return { connection: 'offline', label: 'MiniMax 暂不可用', balanceLabel: BALANCE_LABEL };
   }
