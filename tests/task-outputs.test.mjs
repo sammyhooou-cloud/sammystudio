@@ -47,6 +47,7 @@ function setup(t, taskId = 'task-1', projectId = 'project-1') {
   t.after(() => db.sqlite.close());
   const puts = [];
   const gets = [];
+  const deletes = [];
   const objects = new Map();
   const media = {
     async put(key, body, options) {
@@ -61,12 +62,16 @@ function setup(t, taskId = 'task-1', projectId = 'project-1') {
       const bytes = objects.get(key);
       return bytes ? { body: new Response(bytes).body } : null;
     },
+    async delete(key) {
+      deletes.push(key);
+      objects.delete(key);
+    },
   };
-  return { db, env: { DB: db, MEDIA: media }, puts, gets, objects };
+  return { db, env: { DB: db, MEDIA: media }, puts, gets, deletes, objects };
 }
 
-function videoResponse({ type = 'video/mp4', length = '5', status = 200, finalUrl = '' } = {}) {
-  const response = new Response('video', { status, headers: { 'content-type': type, ...(length === null ? {} : { 'content-length': length }) } });
+function videoResponse({ body = 'video', type = 'video/mp4', length = '5', status = 200, finalUrl = '' } = {}) {
+  const response = new Response(body, { status, headers: { 'content-type': type, ...(length === null ? {} : { 'content-length': length }) } });
   if (finalUrl) Object.defineProperty(response, 'url', { value: finalUrl });
   response.arrayBuffer = () => assert.fail('persistence must not buffer the response');
   response.blob = () => assert.fail('persistence must not buffer the response');
@@ -130,7 +135,7 @@ test('successful video persistence streams to R2 and writes complete output meta
     return response;
   };
   assert.equal(await persist({ env, fetcher }), '/api/projects/project-1/tasks/task-1/output');
-  assert.equal(puts[0].body, stream);
+  assert.notEqual(puts[0].body, stream, 'R2 must receive a size-checked stream wrapper');
   assert.equal(puts[0].key, 'outputs/task-1.mp4');
   assert.deepEqual(puts[0].options.httpMetadata, { contentType: 'video/mp4' });
   assert.deepEqual(db.rows(), [{ id: 'output-1', task_id: 'task-1', object_key: 'outputs/task-1.mp4', content_type: 'video/mp4', byte_size: 5, created_at: 1234 }]);
@@ -172,6 +177,74 @@ test('video persistence permits missing size using the R2 size or null', async (
     await persist({ env, fetcher: async () => videoResponse({ length: null }) });
     assert.equal(db.rows()[0].byte_size, returnedSize ?? null);
   }
+});
+
+test('unknown-length video aborts its stream after actual bytes exceed the limit', async (t) => {
+  const { env, db, puts, deletes, objects } = setup(t);
+  let cancelled = 0;
+  let chunk = 0;
+  const body = new ReadableStream({
+    pull(controller) { controller.enqueue(new TextEncoder().encode(chunk++ === 0 ? '123' : '456')); },
+    cancel() { cancelled += 1; },
+  });
+  await assert.rejects(() => persist({ env, maxBytes: 5, fetcher: async () => videoResponse({ body, length: null }) }), (error) => {
+    assert.equal(error.code, 'output_persist_failed');
+    assert.equal(error.status, 503);
+    assert.doesNotMatch(error.message, /outputs\/|signed|https:/);
+    return true;
+  });
+  assert.equal(puts.length, 1); assert.equal(db.rows().length, 0);
+  assert.deepEqual(deletes, ['outputs/task-1.mp4']);
+  assert.equal(objects.has('outputs/task-1.mp4'), false);
+  assert.equal(cancelled, 1);
+});
+
+test('video rejects a lying small Content-Length using actual streamed bytes', async (t) => {
+  const { env, db, puts, deletes } = setup(t);
+  await assert.rejects(() => persist({ env, maxBytes: 5, fetcher: async () => videoResponse({ body: '123456', length: '2' }) }), { code: 'output_persist_failed', status: 503 });
+  assert.equal(puts.length, 1); assert.equal(db.rows().length, 0);
+  assert.deepEqual(deletes, ['outputs/task-1.mp4']);
+});
+
+test('actual size exactly at the stream limit succeeds with or without Content-Length', async (t) => {
+  for (const length of [null, '1']) {
+    const { env, db, puts, objects, deletes } = setup(t);
+    const response = videoResponse({ body: '12345', length });
+    const url = await persist({ env, maxBytes: 5, fetcher: async () => response });
+    assert.equal(url, '/api/projects/project-1/tasks/task-1/output');
+    assert.notEqual(puts[0].body, response.body, 'even boundary-sized videos must be streamed through the limit');
+    assert.equal(puts.length, 1); assert.equal(objects.get('outputs/task-1.mp4').byteLength, 5);
+    assert.equal(db.rows().length, 1); assert.deepEqual(deletes, []);
+  }
+});
+
+test('a swallowed R2 stream error cannot insert an oversized output and cleans the partial object', async (t) => {
+  const { env, db, objects, deletes } = setup(t);
+  env.MEDIA.put = async (key, body) => {
+    objects.set(key, new TextEncoder().encode('partial').buffer);
+    await assert.rejects(() => new Response(body).arrayBuffer());
+    return { size: 7 };
+  };
+  await assert.rejects(() => persist({ env, maxBytes: 5, fetcher: async () => videoResponse({ body: '123456', length: null }) }), { code: 'output_persist_failed' });
+  assert.equal(db.rows().length, 0);
+  assert.deepEqual(deletes, ['outputs/task-1.mp4']);
+  assert.equal(objects.has('outputs/task-1.mp4'), false);
+});
+
+test('oversize cleanup preserves a concurrent winning output row and object', async (t) => {
+  const { env, db, objects, deletes } = setup(t);
+  let streamFailed = false;
+  env.MEDIA.put = async (key, body) => {
+    db.output({ id: 'concurrent-winner' });
+    objects.set(key, new TextEncoder().encode('winner').buffer);
+    try { await new Response(body).arrayBuffer(); } catch { streamFailed = true; }
+    return { size: 6 };
+  };
+  await assert.rejects(() => persist({ env, maxBytes: 5, fetcher: async () => videoResponse({ body: '123456', length: null }) }), { code: 'output_persist_failed' });
+  assert.equal(streamFailed, true);
+  assert.equal(db.rows()[0].id, 'concurrent-winner');
+  assert.equal(objects.has('outputs/task-1.mp4'), true);
+  assert.deepEqual(deletes, []);
 });
 
 test('fetch, R2 and database failures return only safe persistence errors and remain retryable', async (t) => {
