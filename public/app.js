@@ -55,8 +55,28 @@ export function projectNavigationState(providerBusy) {
   return { disabled: Boolean(providerBusy), ariaDisabled: String(Boolean(providerBusy)) };
 }
 
-export function canChangeWorkspaceProvider({ projectId, attempts, projectSwitchBusy = false, providerSwitchBusy = false }) {
-  return Boolean(projectId) && !projectSwitchBusy && !providerSwitchBusy && !attempts.inFlight && !attempts.pendingForProject(projectId);
+export function canChangeWorkspaceProvider({ projectId, attempts, projectSwitchBusy = false, providerSwitchBusy = false, projectCreateBusy = false }) {
+  return Boolean(projectId) && !projectSwitchBusy && !providerSwitchBusy && !projectCreateBusy && !attempts.inFlight && !attempts.pendingForProject(projectId);
+}
+
+export function projectCreationState(busy) {
+  return { disabled: Boolean(busy), ariaDisabled: String(Boolean(busy)) };
+}
+
+export async function performProjectCreation({ canStart, setBusy, create, commit, select, fail = () => {} }) {
+  if (!canStart()) return false;
+  setBusy(true);
+  try {
+    const project = await create();
+    commit(project);
+    await select(project);
+    return true;
+  } catch (error) {
+    fail(error);
+    return false;
+  } finally {
+    setBusy(false);
+  }
 }
 
 export async function performProviderChange({ projectId, provider, patch, isCurrent, setBusy, commit, loadStatus, fail = () => {} }) {
@@ -531,7 +551,7 @@ function setup() {
   const duration = document.querySelector('#duration');
   const ratio = document.querySelector('#aspect-ratio');
   let mode = 'text', provider = 'kling', providerConnection = 'checking', capabilities = {}, projects = [], imageCount = 1, projectTasks = [];
-  let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, providerSwitchBusy = false, providerChangeSequence = 0, projectEpoch = 0;
+  let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, providerSwitchBusy = false, projectCreateBusy = false, providerChangeSequence = 0, projectEpoch = 0;
   const drafts = createProjectDrafts();
   const attempts = createSubmissionAttemptController(undefined, attemptStorage());
   let selectedTaskId = '', submittingWithoutTask = false, stageOverride = null;
@@ -563,9 +583,9 @@ function setup() {
   const retryWorkspace = document.querySelector('#workspace-retry');
 
   function updateSubmitDisabled() {
-    document.querySelector('#generate').disabled = projectSwitchBusy || providerSwitchBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate || (mode === 'image' && !uploadController.canSubmit);
+    document.querySelector('#generate').disabled = projectSwitchBusy || providerSwitchBusy || projectCreateBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate || (mode === 'image' && !uploadController.canSubmit);
     document.querySelectorAll('[data-provider]').forEach((button) => {
-      button.disabled = !canChangeWorkspaceProvider({ projectId: currentProjectId, attempts, projectSwitchBusy, providerSwitchBusy });
+      button.disabled = !canChangeWorkspaceProvider({ projectId: currentProjectId, attempts, projectSwitchBusy, providerSwitchBusy, projectCreateBusy });
     });
   }
 
@@ -609,15 +629,16 @@ function setup() {
   }
 
   function syncFormBusy() {
-    const busy = projectSwitchBusy || providerSwitchBusy;
+    const busy = projectSwitchBusy || providerSwitchBusy || projectCreateBusy;
     generator.setAttribute('aria-busy', String(busy));
     [...generator.elements].forEach((control) => { control.disabled = busy; });
     ratio.disabled = busy || aspectRatioControl(provider, mode).disabled;
     updateSubmitDisabled();
   }
 
-  function setProjectSwitchBusy(busy) { projectSwitchBusy = busy; syncFormBusy(); }
-  function setProviderSwitchBusy(busy) { providerSwitchBusy = busy; syncFormBusy(); syncProjectNavigationBusy(); }
+  function setProjectSwitchBusy(busy) { projectSwitchBusy = busy; syncFormBusy(); syncCreateControls(); }
+  function setProviderSwitchBusy(busy) { providerSwitchBusy = busy; syncFormBusy(); syncProjectNavigationBusy(); syncCreateControls(); }
+  function setProjectCreateBusy(busy) { projectCreateBusy = busy; syncFormBusy(); syncProjectNavigationBusy(); syncCreateControls(); }
 
   function projectStorage() {
     try { return window.localStorage; } catch { return null; }
@@ -665,7 +686,7 @@ function setup() {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'project-item';
-      const navigation = projectNavigationState(providerSwitchBusy);
+      const navigation = projectNavigationState(providerSwitchBusy || projectCreateBusy);
       button.disabled = navigation.disabled;
       button.setAttribute('aria-disabled', navigation.ariaDisabled);
       button.classList.toggle('active', project.id === currentProjectId);
@@ -684,11 +705,20 @@ function setup() {
   }
 
   function syncProjectNavigationBusy() {
-    const navigation = projectNavigationState(providerSwitchBusy);
+    const navigation = projectNavigationState(providerSwitchBusy || projectCreateBusy);
     projectList.querySelectorAll('button').forEach((button) => {
       button.disabled = navigation.disabled;
       button.setAttribute('aria-disabled', navigation.ariaDisabled);
     });
+  }
+
+  function syncCreateControls() {
+    const state = projectCreationState(providerSwitchBusy || projectSwitchBusy || projectCreateBusy);
+    for (const control of [document.querySelector('#new-project'), document.querySelector('#new-project-name'), createForm.querySelector('button[type="submit"]')]) {
+      control.disabled = state.disabled;
+      control.setAttribute('aria-disabled', state.ariaDisabled);
+    }
+    document.querySelector('#cancel-create-project').disabled = projectCreateBusy;
   }
 
   function renderProviderButtons() {
@@ -942,7 +972,7 @@ function setup() {
     catch (error) { projectError.textContent = `工作台加载失败：${error.message}`; retryWorkspace.hidden = false; throw error; }
   }
   document.querySelectorAll('[data-provider]').forEach((button) => button.onclick = async () => {
-    if (!canChangeWorkspaceProvider({ projectId: currentProjectId, attempts, projectSwitchBusy, providerSwitchBusy }) || button.dataset.provider === provider) return;
+    if (!canChangeWorkspaceProvider({ projectId: currentProjectId, attempts, projectSwitchBusy, providerSwitchBusy, projectCreateBusy }) || button.dataset.provider === provider) return;
     saveDraft();
     const projectId = currentProjectId;
     const sequence = ++providerChangeSequence;
@@ -996,14 +1026,18 @@ function setup() {
   });
   addEventListener('resize', () => { if (drawerOpen && !isMobileDrawer()) setDrawer(false); else sidebar.inert = sidebarShouldBeInert(drawerOpen, isMobileDrawer()); setSidebarCollapsed(sidebarCollapsed); });
   retryWorkspace.onclick = () => { loadWorkspace().catch(() => {}); };
-  document.querySelector('#new-project').onclick = () => { createForm.hidden = false; document.querySelector('#new-project-name').focus(); };
-  document.querySelector('#cancel-create-project').onclick = () => { createForm.hidden = true; createForm.reset(); projectError.textContent = ''; };
+  document.querySelector('#new-project').onclick = () => { if (providerSwitchBusy || projectSwitchBusy || projectCreateBusy) return; createForm.hidden = false; document.querySelector('#new-project-name').focus(); };
+  document.querySelector('#cancel-create-project').onclick = () => { if (projectCreateBusy) return; createForm.hidden = true; createForm.reset(); projectError.textContent = ''; };
   createForm.onsubmit = async (event) => {
-    event.preventDefault(); projectError.textContent = '';
-    try {
-      const project = await request('/api/projects', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: document.querySelector('#new-project-name').value }) });
-      projects = upsertProject(projects, project); createForm.hidden = true; createForm.reset(); await switchProject(project, 'selection');
-    } catch (error) { projectError.textContent = error.message; }
+    event.preventDefault();
+    await performProjectCreation({
+      canStart: () => !providerSwitchBusy && !projectSwitchBusy && !projectCreateBusy,
+      setBusy: setProjectCreateBusy,
+      create: () => { projectError.textContent = ''; return request('/api/projects', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: document.querySelector('#new-project-name').value }) }); },
+      commit: (project) => { projects = upsertProject(projects, project); createForm.hidden = true; createForm.reset(); },
+      select: (project) => switchProject(project, 'selection'),
+      fail: (error) => { projectError.textContent = error.message; },
+    });
   };
   function openRenameForm() {
     const project = projects.find(({ id }) => id === currentProjectId); if (!project) return;
@@ -1021,7 +1055,7 @@ function setup() {
   };
   generator.onsubmit = async (event) => {
     event.preventDefault();
-    if (projectSwitchBusy || providerSwitchBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate) return;
+    if (projectSwitchBusy || providerSwitchBusy || projectCreateBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate) return;
     const submittedProjectId = currentProjectId;
     const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount });
     const pending = attempts.pendingForProject(submittedProjectId);

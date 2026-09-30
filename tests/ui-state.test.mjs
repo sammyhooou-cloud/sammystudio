@@ -177,6 +177,59 @@ test('a pending ambiguous generation attempt blocks changing its project provide
   assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'a', attempts }), true);
 });
 
+test('provider PATCH busy rejects project creation before POST', async () => {
+  const events = [];
+  const created = await stageHelpers.performProjectCreation({
+    canStart: () => false,
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    create: async () => { events.push('POST'); return { id: 'new' }; },
+    commit: () => events.push('commit'),
+    select: async () => events.push('workspace'),
+  });
+  assert.equal(created, false);
+  assert.deepEqual(events, []);
+  assert.deepEqual(stageHelpers.projectCreationState(true), { disabled: true, ariaDisabled: 'true' });
+});
+
+test('project creation keeps provider switching locked until new workspace selection finishes', async () => {
+  let finishSelection;
+  const selected = new Promise((resolve) => { finishSelection = resolve; });
+  const events = [];
+  let createBusy = false;
+  const attempts = createSubmissionAttemptController(() => 'stable-key');
+  const creating = stageHelpers.performProjectCreation({
+    canStart: () => true,
+    setBusy: (busy) => { createBusy = busy; events.push(`busy:${busy}`); },
+    create: async () => { events.push('POST'); return { id: 'new' }; },
+    commit: (project) => events.push(`commit:${project.id}`),
+    select: async (project) => { events.push(`workspace:${project.id}`); await selected; },
+  });
+  await Promise.resolve();
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'old', attempts, projectCreateBusy: createBusy }), false);
+  assert.deepEqual(events, ['busy:true', 'POST', 'commit:new', 'workspace:new']);
+  finishSelection();
+  assert.equal(await creating, true);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'old', attempts, projectCreateBusy: createBusy }), true);
+  assert.deepEqual(events, ['busy:true', 'POST', 'commit:new', 'workspace:new', 'busy:false']);
+});
+
+test('failed project POST restores creation and provider controls', async () => {
+  const events = [];
+  let createBusy = false;
+  const created = await stageHelpers.performProjectCreation({
+    canStart: () => true,
+    setBusy: (busy) => { createBusy = busy; events.push(`busy:${busy}`); },
+    create: async () => { events.push('POST'); throw new Error('offline'); },
+    commit: () => events.push('commit'),
+    select: async () => events.push('workspace'),
+    fail: (error) => events.push(error.message),
+  });
+  assert.equal(created, false);
+  assert.equal(createBusy, false);
+  assert.deepEqual(events, ['busy:true', 'POST', 'offline', 'busy:false']);
+  assert.deepEqual(stageHelpers.projectCreationState(false), { disabled: false, ariaDisabled: 'false' });
+});
+
 test('status request guards project, provider, and sequence', () => {
   const { isCurrentProviderRequest } = stageHelpers;
   assert.equal(isCurrentProviderRequest('a', 'a', 2, 2, 'minimax', 'minimax'), true);
