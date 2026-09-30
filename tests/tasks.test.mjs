@@ -963,8 +963,8 @@ test('MiniMax succeeds only after output persistence and exposes the internal pl
   assert.equal(db.taskOutputs.length, 1);
   assert.equal(db.taskOutputs[0].object_key, storedKey);
   assert.equal(task.status, 'succeeded');
-  assert.deepEqual(JSON.parse(result.resultJson), { providerResult: miniMaxQueryResult.raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
-  assert.equal(task.result_json, result.resultJson);
+  assert.deepEqual(JSON.parse(result.resultJson), { videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
+  assert.deepEqual(JSON.parse(task.result_json), { providerResult: miniMaxQueryResult.raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
 });
 
 test('MiniMax output persistence failures retain polling status and a later poll retries successfully', async () => {
@@ -1012,8 +1012,8 @@ test('MiniMax completes an already persisted output even when the supplier URL i
       fetcher: () => assert.fail('existing output must not download again'),
     });
     assert.equal(result.status, 'succeeded'); assert.equal(task.status, 'succeeded');
-    assert.deepEqual(JSON.parse(result.resultJson), { providerResult: raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
-    assert.equal(task.result_json, result.resultJson); assert.equal(db.taskOutputs.length, 1);
+    assert.deepEqual(JSON.parse(result.resultJson), { videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
+    assert.deepEqual(JSON.parse(task.result_json), { providerResult: raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' }); assert.equal(db.taskOutputs.length, 1);
   }
 });
 
@@ -1021,8 +1021,33 @@ test('MiniMax non-success queries update normally without persisting an output',
   for (const status of ['failed', 'queued', 'generating']) {
     const db = new TaskDb(); const task = minimaxPollingTask(db);
     const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, { put: () => assert.fail('non-success must not persist') }), { providerFactory: () => ({ persistOutput: true, query: async () => ({ status, raw: { status } }) }), fetcher: () => assert.fail('non-success must not download') });
-    assert.equal(result.status, status); assert.deepEqual(JSON.parse(result.resultJson), { status });
+    assert.equal(result.status, status); assert.deepEqual(JSON.parse(result.resultJson), {});
+    assert.deepEqual(JSON.parse(task.result_json), { status });
   }
+});
+
+test('MiniMax status early returns filter private data and never invent progress', async () => {
+  for (const [status, remoteId] of [['submitting', null], ['queued', null], ['succeeded', 'remote'], ['failed', 'remote']]) {
+    const db = new TaskDb();
+    const id = `early-${status}`;
+    const original = JSON.stringify({ videoUrl: `/api/projects/project-1/tasks/${id}/output`, providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' } });
+    db.tasks.push({ id, provider: 'minimax', remote_id: remoteId, status, result_json: original });
+    db.projectTasks.push({ project_id: 'project-1', task_id: id });
+    const response = await getTaskStatus(id, 'project-1', taskEnv(db, new RecoveryMedia()), { providerFactory: () => assert.fail('early return must not query supplier') });
+    assert.deepEqual(JSON.parse(response.resultJson), { videoUrl: `/api/projects/project-1/tasks/${id}/output` });
+    assert.equal(db.tasks[0].result_json, original);
+    assert.doesNotMatch(JSON.stringify(response), /Bearer private|outputs\/private|supplier\.test|token=secret/);
+  }
+});
+
+test('MiniMax normal status return keeps only explicit numeric progress', async () => {
+  const db = new TaskDb();
+  const task = minimaxPollingTask(db);
+  const raw = { data: { percentage: 37.5 }, Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' };
+  const response = await getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ query: async () => ({ status: 'generating', raw }) }) });
+  assert.deepEqual(JSON.parse(response.resultJson), { progress: 37.5 });
+  assert.deepEqual(JSON.parse(task.result_json), raw);
+  assert.doesNotMatch(JSON.stringify(response), /Bearer private|outputs\/private|supplier\.test|token=secret/);
 });
 
 test('Kling external result handling is unchanged with persistence disabled', async () => {

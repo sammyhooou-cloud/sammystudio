@@ -586,6 +586,17 @@ test('task status route requires authentication and project ownership', async ()
   assert.equal(anonymous.status, 401);
 });
 
+test('task status route hides MiniMax stored supplier metadata on terminal reads', async () => {
+  const db = new TaskRouteDb();
+  const original = JSON.stringify({ videoUrl: '/api/projects/project-1/tasks/task-1/output', providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' } });
+  db.tasks.push({ id: 'task-1', provider: 'minimax', remote_id: 'remote-1', status: 'succeeded', result_json: original });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
+  const response = await worker.fetch(new Request('https://site.test/api/video/tasks/task-1?projectId=project-1', { headers: sessionHeaders }), { DB: db }, {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse((await response.json()).resultJson), { videoUrl: '/api/projects/project-1/tasks/task-1/output' });
+  assert.equal(db.tasks[0].result_json, original);
+});
+
 test('attempt lookup finds only the owned task by stable key without a paid tool call', async () => {
   const db = new TaskRouteDb();
   db.tasks.push({ id: 'task-1', idempotency_key: JSON.stringify(['project-1', 'stable-key']), remote_id: 'remote-1', status: 'queued' });

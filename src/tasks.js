@@ -1,5 +1,6 @@
 import { createVideoProvider } from './providers/index.js';
 import { persistTaskOutput } from './task-outputs.js';
+import { safeTaskResultJson } from './task-result-dto.js';
 
 export class TaskError extends Error {
   constructor(message, status, task, code) {
@@ -262,17 +263,7 @@ export async function getTaskDetail(id, projectId, env) {
     .filter((key) => request[key] !== undefined)
     .map((key) => [key, request[key]]));
   const provider = task.provider || 'kling';
-  let resultJson = task.result_json || null;
-  if (provider === 'minimax' && resultJson) {
-    let result;
-    try { result = JSON.parse(resultJson); } catch {}
-    const internalUrl = `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(id)}/output`;
-    const safeResult = {};
-    if (result?.videoUrl === internalUrl) safeResult.videoUrl = internalUrl;
-    const progress = result?.progress ?? result?.data?.progress;
-    if (typeof progress === 'number' && Number.isFinite(progress) && progress >= 0 && progress <= 100) safeResult.progress = progress;
-    resultJson = JSON.stringify(safeResult);
-  }
+  const resultJson = safeTaskResultJson({ provider, projectId, taskId: id, resultJson: task.result_json || null });
   return {
     id: task.id,
     projectId,
@@ -293,15 +284,15 @@ export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCal
   if (!task) throw new TaskError('任务不存在', 404);
   if (task.status === 'submitting' && !task.remote_id) {
     const recovered = await replayTask(task, env, projectId);
-    return { ...recovered, resultJson: task.result_json || null };
+    return { ...recovered, resultJson: safeTaskResultJson({ provider: task.provider || 'kling', projectId, taskId: id, resultJson: task.result_json || null }) };
   }
   if (!task.remote_id && ['queued', 'generating'].includes(task.status)) {
     await env.DB.prepare('UPDATE video_tasks SET status = ?, updated_at = ? WHERE id = ? AND remote_id IS NULL AND status IN (?, ?)').bind('unknown', Date.now(), id, 'queued', 'generating').run();
     const current = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.id = ? AND project_tasks.project_id = ?').bind(id, projectId).first();
     if (!current) throw new TaskError('任务不存在', 404);
-    return { ...taskDto(current), resultJson: current.result_json || null };
+    return { ...taskDto(current), resultJson: safeTaskResultJson({ provider: current.provider || 'kling', projectId, taskId: id, resultJson: current.result_json || null }) };
   }
-  if (!task.remote_id || !['queued', 'generating'].includes(task.status)) return { ...taskDto(task), resultJson: task.result_json || null };
+  if (!task.remote_id || !['queued', 'generating'].includes(task.status)) return { ...taskDto(task), resultJson: safeTaskResultJson({ provider: task.provider || 'kling', projectId, taskId: id, resultJson: task.result_json || null }) };
   const options = fetcher && typeof fetcher === 'object' ? fetcher : { fetcher, toolCaller };
   let provider, result;
   try {
@@ -319,7 +310,7 @@ export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCal
   }
   const resultJson = JSON.stringify(storedResult);
   await env.DB.prepare('UPDATE video_tasks SET status = ?, result_json = ?, updated_at = ? WHERE id = ? AND status IN (?, ?)').bind(status, resultJson, Date.now(), id, 'queued', 'generating').run();
-  return { id, remote_id: task.remote_id, status, resultJson };
+  return { id, remote_id: task.remote_id, status, resultJson: safeTaskResultJson({ provider: task.provider || 'kling', projectId, taskId: id, resultJson }) };
 }
 
 export async function getTaskByAttempt(projectId, key, env) {

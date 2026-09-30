@@ -1,3 +1,5 @@
+import { safeTaskResultJson } from './task-result-dto.js';
+
 const videoProviders = new Set(['kling', 'minimax']);
 
 export function normalizeVideoProvider(value) {
@@ -153,7 +155,7 @@ export async function readProjectWorkspace(db, id) {
       mode: task.mode,
       status: task.status,
       requestJson: task.request_json,
-      resultJson: task.result_json,
+      resultJson: safeTaskResultJson({ provider: task.provider || 'kling', projectId: id, taskId: task.id, resultJson: task.result_json }),
       createdAt: task.created_at,
       updatedAt: task.updated_at,
     })),

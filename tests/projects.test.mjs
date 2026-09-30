@@ -297,6 +297,27 @@ test('workspace exposes the project provider and each task provider', async () =
   assert.ok(db.queries.some((sql) => sql.includes('video_tasks.provider')));
 });
 
+test('workspace task results hide MiniMax supplier data and preserve Kling results', async () => {
+  const db = new FakeD1();
+  db.projects.push({ id: 'project/a', name: 'A', video_provider: 'minimax', created_at: 1, updated_at: 2 });
+  const outputUrl = '/api/projects/project%2Fa/tasks/mini%2F1/output';
+  const privateResult = JSON.stringify({ videoUrl: outputUrl, progress: 42, providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' } });
+  db.videoTasks.push(
+    { id: 'mini/1', provider: 'minimax', result_json: privateResult, created_at: 1, updated_at: 4 },
+    { id: 'mini-wrong', provider: 'minimax', result_json: JSON.stringify({ videoUrl: '/api/projects/other/tasks/mini-wrong/output', progress: '88', Authorization: 'Bearer private' }), created_at: 1, updated_at: 3 },
+    { id: 'mini-broken', provider: 'minimax', result_json: '{broken', created_at: 1, updated_at: 2 },
+    { id: 'kling', provider: 'kling', result_json: '{"url":"https://kling.test/video.mp4"}', created_at: 1, updated_at: 1 },
+  );
+  db.projectTasks.push(...db.videoTasks.map(({ id }) => ({ project_id: 'project/a', task_id: id })));
+  const workspace = await readProjectWorkspace(db, 'project/a');
+  assert.deepEqual(JSON.parse(workspace.tasks[0].resultJson), { videoUrl: outputUrl, progress: 42 });
+  assert.deepEqual(JSON.parse(workspace.tasks[1].resultJson), {});
+  assert.deepEqual(JSON.parse(workspace.tasks[2].resultJson), {});
+  assert.equal(workspace.tasks[3].resultJson, db.videoTasks[3].result_json);
+  assert.equal(db.videoTasks[0].result_json, privateResult);
+  assert.doesNotMatch(JSON.stringify(workspace), /Bearer private|outputs\/private|supplier\.test|token=secret/);
+});
+
 test('normalizes supported video providers and rejects invalid providers', () => {
   assert.equal(typeof projectsApi.normalizeVideoProvider, 'function');
   assert.equal(projectsApi.normalizeVideoProvider('  MiniMax  '), 'minimax');
