@@ -1,5 +1,5 @@
 import { createImageUploadController, openImageReplacement, renderImagePreview } from './image-preview.js';
-import { normalizeTaskStatus, parseTaskRequest, parseTaskResult, safeVideoUrl as extractVideoUrl, taskProgress as extractTaskProgress, taskDetailHref } from './task-presenter.js';
+import { normalizeTaskStatus, parseTaskRequest, parseTaskResult, safeVideoUrl as extractVideoUrl, taskProgress as extractTaskProgress, taskDetailHref, taskProviderLabel } from './task-presenter.js';
 
 export { extractVideoUrl, extractTaskProgress };
 
@@ -358,6 +358,9 @@ export function renderTaskHistory(history, tasks, projectId, selectedTaskId = ''
     status.textContent = model.label;
     const metadata = view.createElement('div');
     metadata.className = 'task-history-meta';
+    const providerLabel = view.createElement('span');
+    providerLabel.className = 'task-history-provider';
+    providerLabel.textContent = taskProviderLabel(task);
     const mode = view.createElement('span');
     mode.textContent = task?.mode === 'image' ? '图生视频' : task?.mode === 'text' ? '文生视频' : '模式待同步';
     const time = view.createElement('time');
@@ -367,7 +370,7 @@ export function renderTaskHistory(history, tasks, projectId, selectedTaskId = ''
       time.dateTime = date.toISOString();
       time.textContent = date.toLocaleString('zh-CN', { hour12: false });
     } else time.textContent = '时间待同步';
-    metadata.append(mode, time);
+    metadata.append(providerLabel, mode, time);
     const summary = view.createElement('p');
     summary.className = 'task-history-summary';
     const request = parseTaskRequest(task?.requestJson);

@@ -214,7 +214,7 @@ test('task detail returns a sanitized project-owned DTO', async () => {
   const detail = await taskApi.getTaskDetail('detail-1', 'project-1', taskEnv(db));
 
   assert.deepEqual(detail, {
-    id: 'detail-1', projectId: 'project-1', projectName: 'Project One', remoteId: 'remote-1',
+    id: 'detail-1', projectId: 'project-1', projectName: 'Project One', remoteId: 'remote-1', provider: 'kling',
     mode: 'text', status: 'succeeded',
     request: { prompt: 'ocean', model: 'kling-v1', duration: '5', resolution: '720p', aspectRatio: '16:9' },
     resultJson: '{"generationId":"remote-1"}', createdAt: 10, updatedAt: 20,

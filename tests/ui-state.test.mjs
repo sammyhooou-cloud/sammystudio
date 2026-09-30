@@ -8,6 +8,7 @@ import {
   taskProgress,
   taskDetailHref,
 } from '../public/task-presenter.js';
+import * as taskPresenter from '../public/task-presenter.js';
 import * as stageHelpers from '../public/app.js';
 import { parseResultRoute, resultViewModel, setupResultPage } from '../public/result.js';
 import {
@@ -55,6 +56,14 @@ test('workspace provider defaults to Kling and MiniMax image ratio follows its r
   assert.deepEqual(aspectRatioControl('minimax', 'image'), { disabled: true, label: '跟随参考图', value: 'adaptive' });
   assert.deepEqual(aspectRatioControl('kling', 'image'), { disabled: false, label: '画幅', value: '' });
   assert.equal(buildGenerationPayload({ projectId: 'a', provider: 'minimax' }).provider, undefined);
+});
+
+test('task provider labels use the saved task provider and default legacy rows to Kling', () => {
+  const { taskProviderLabel } = taskPresenter;
+  assert.equal(typeof taskProviderLabel, 'function');
+  assert.equal(taskProviderLabel({ provider: 'minimax' }), 'MiniMax');
+  assert.equal(taskProviderLabel({ provider: 'kling' }), '可灵');
+  assert.equal(taskProviderLabel({}), '可灵');
 });
 
 test('provider account view uses server balance labels and only online is green', () => {
@@ -309,6 +318,12 @@ test('result states distinguish playable successes from unavailable results', ()
   }
 });
 
+test('MiniMax internal output plays through the authenticated task URL', () => {
+  const videoUrl = '/api/projects/p/tasks/t/output';
+  assert.equal(safeVideoUrl({ videoUrl }), videoUrl);
+  assert.equal(resultViewModel({ provider: 'minimax', status: 'succeeded', resultJson: JSON.stringify({ videoUrl }) }).videoUrl, videoUrl);
+});
+
 test('workspace and result pages agree on JSON-encoded video URL strings', () => {
   for (const url of ['https://cdn.test/video.mp4', 'javascript:alert(1)', 'https://cdn.test/readme.txt']) {
     const detail = { id: 'task-1', status: 'succeeded', resultJson: JSON.stringify(url) };
@@ -373,7 +388,8 @@ test('result page loads the encoded API route, renders safe metadata, and clears
   assert.equal(elements['result-project'].innerHTML, undefined);
   assert.equal(elements['result-prompt'].textContent, '<script>prompt</script>');
   assert.equal(elements['back-to-workspace'].href, '/workspace?project=project%20a');
-  assert.equal(elements['result-meta'].children.length, 7);
+  assert.equal(elements['result-meta'].children.length, 8);
+  assert.deepEqual(elements['result-meta'].children[0].children.map((cell) => cell.textContent), ['生成服务', '可灵']);
   assert.equal(JSON.stringify(elements['result-meta']).includes('never-render'), false);
   assert.deepEqual(redirects, []);
   detail = { ...detail, resultJson: '{"videoUrl":"javascript:alert(1)"}' };
@@ -435,6 +451,7 @@ test('result page keeps active progress centered and shows percentages only when
   await setupResultPage({ view, pageLocation, fetcher: async () => ({ ok: true, status: 200, json: async () => ({ projectId: 'project a', status: 'generating', resultJson }) }) });
   assert.equal(elements['result-progress'].hidden, false);
   assert.equal(elements['result-percentage'].hidden, true);
+  assert.equal(elements['result-percentage'].textContent, '');
   resultJson = '{"progress":35}';
   await elements['result-retry'].onclick();
   assert.equal(elements['result-percentage'].hidden, false);
@@ -667,7 +684,7 @@ test('task history renders every task in server order with safe metadata and exp
   assert.equal(typeof stageHelpers.renderTaskHistory, 'function');
   const { history } = taskHistoryHarness();
   const tasks = [
-    { id: 'active', status: 'generating', mode: 'image', createdAt: 1750000000000, requestJson: '{"model":"<script>model</script>","resolution":"1080p","duration":5,"aspectRatio":"16:9"}' },
+    { id: 'active', provider: 'minimax', status: 'generating', mode: 'image', createdAt: 1750000000000, requestJson: '{"model":"<script>model</script>","resolution":"1080p","duration":5,"aspectRatio":"16:9"}' },
     { id: 'done', status: 'succeeded', mode: 'text', resultJson: '{"videoUrl":"https://cdn.test/clip.mp4"}' },
     { id: 'failed', status: 'failed', requestJson: '{broken' },
     { id: 'unknown', status: 'unknown', requestJson: '[]' },
@@ -675,8 +692,9 @@ test('task history renders every task in server order with safe metadata and exp
   stageHelpers.renderTaskHistory(history, tasks, 'project a');
   assert.deepEqual(history.children.map((row) => row.dataset.taskId), tasks.map(({ id }) => id));
   const [active, completed] = history.children;
-  assert.equal(active.children[0].children[1].children[0].textContent, '图生视频');
-  assert.equal(active.children[0].children[1].children[1].dateTime, '2025-06-15T15:06:40.000Z');
+  assert.equal(active.children[0].children[1].children[0].textContent, 'MiniMax');
+  assert.equal(active.children[0].children[1].children[1].textContent, '图生视频');
+  assert.equal(active.children[0].children[1].children[2].dateTime, '2025-06-15T15:06:40.000Z');
   assert.equal(active.children[0].children[2].textContent, '<script>model</script> · 1080p · 5秒 · 16:9');
   assert.equal(active.children[0].children[2].innerHTML, undefined);
   assert.equal(active.children[1].tagName, 'span');
@@ -684,6 +702,7 @@ test('task history renders every task in server order with safe metadata and exp
   assert.equal(completed.children[1].tagName, 'a');
   assert.equal(completed.children[1].href, '/projects/project%20a/results/done');
   assert.equal(completed.children[1].textContent, '查看结果');
+  assert.equal(completed.children[0].children[1].children[0].textContent, '可灵');
   assert.equal(completed.children[1].onclick, undefined);
   assert.equal(history.children[2].children[0].children[2].textContent, '参数待同步');
 });
@@ -698,7 +717,7 @@ test('task history preserves link focus across polling renders and safely clears
   stageHelpers.renderTaskHistory(history, tasks, 'project-1');
   assert.notEqual(view.activeElement, oldLink);
   assert.equal(view.activeElement, history.children[0].children[1]);
-  assert.equal(history.children[0].children[0].children[1].children[1].textContent, '时间待同步');
+  assert.equal(history.children[0].children[0].children[1].children[2].textContent, '时间待同步');
   stageHelpers.renderTaskHistory(history, [], 'project-1');
   assert.deepEqual(history.children, []);
 });

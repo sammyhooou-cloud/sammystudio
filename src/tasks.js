@@ -245,7 +245,7 @@ export function normalizeRemoteStatus(raw) {
 
 export async function getTaskDetail(id, projectId, env) {
   if (!id || !projectId) throw new TaskError('任务参数无效', 400);
-  const task = await env.DB.prepare(`SELECT video_tasks.id, video_tasks.remote_id, video_tasks.mode,
+  const task = await env.DB.prepare(`SELECT video_tasks.id, video_tasks.remote_id, video_tasks.provider, video_tasks.mode,
       video_tasks.status, video_tasks.request_json, video_tasks.result_json,
       video_tasks.created_at, video_tasks.updated_at, projects.name AS project_name
     FROM video_tasks
@@ -261,15 +261,28 @@ export async function getTaskDetail(id, projectId, env) {
   const safeRequest = Object.fromEntries(['prompt', 'model', 'duration', 'resolution', 'aspectRatio']
     .filter((key) => request[key] !== undefined)
     .map((key) => [key, request[key]]));
+  const provider = task.provider || 'kling';
+  let resultJson = task.result_json || null;
+  if (provider === 'minimax' && resultJson) {
+    let result;
+    try { result = JSON.parse(resultJson); } catch {}
+    const internalUrl = `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(id)}/output`;
+    const safeResult = {};
+    if (result?.videoUrl === internalUrl) safeResult.videoUrl = internalUrl;
+    const progress = result?.progress ?? result?.data?.progress;
+    if (typeof progress === 'number' && Number.isFinite(progress) && progress >= 0 && progress <= 100) safeResult.progress = progress;
+    resultJson = JSON.stringify(safeResult);
+  }
   return {
     id: task.id,
     projectId,
     projectName: task.project_name,
     remoteId: task.remote_id || null,
+    provider,
     mode: task.mode,
     status: task.status,
     request: safeRequest,
-    resultJson: task.result_json || null,
+    resultJson,
     createdAt: task.created_at,
     updatedAt: task.updated_at,
   };

@@ -499,8 +499,21 @@ test('task detail API decodes both IDs and returns the owned task detail', async
   db.projectTasks.push({ project_id: 'project one', task_id: 'task one' });
   const response = await projectRequest(db, '/api/projects/project%20one/tasks/task%20one');
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { id: 'task one', projectId: 'project one', projectName: '项目详情', remoteId: 'remote-1', mode: 'text', status: 'succeeded', request: { prompt: 'ocean', model: 'kling-v1', duration: 5, resolution: '720p', aspectRatio: '16:9' }, resultJson: '{"url":"https://video.test/result.mp4"}', createdAt: 1, updatedAt: 2 });
+  assert.deepEqual(await response.json(), { id: 'task one', projectId: 'project one', projectName: '项目详情', remoteId: 'remote-1', provider: 'kling', mode: 'text', status: 'succeeded', request: { prompt: 'ocean', model: 'kling-v1', duration: 5, resolution: '720p', aspectRatio: '16:9' }, resultJson: '{"url":"https://video.test/result.mp4"}', createdAt: 1, updatedAt: 2 });
   assert.equal(db.statusQueries, 0);
+});
+
+test('MiniMax task detail exposes its internal output without private supplier data', async () => {
+  const db = new TaskRouteDb();
+  db.tasks.push({ id: 'mini/1', provider: 'minimax', status: 'succeeded', mode: 'text', request_json: '{"prompt":"sky","Authorization":"Bearer private"}', result_json: JSON.stringify({ videoUrl: '/api/projects/project-1/tasks/mini%2F1/output', providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/private.mp4?token=secret' } }) });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'mini/1' });
+  const response = await projectRequest(db, '/api/projects/project-1/tasks/mini%2F1');
+  assert.equal(response.status, 200);
+  const detail = await response.json();
+  assert.equal(detail.provider, 'minimax');
+  assert.deepEqual(detail.request, { prompt: 'sky' });
+  assert.deepEqual(JSON.parse(detail.resultJson), { videoUrl: '/api/projects/project-1/tasks/mini%2F1/output' });
+  assert.doesNotMatch(JSON.stringify(detail), /Bearer private|outputs\/private|supplier\.test|token=secret/);
 });
 
 test('task detail API hides missing and cross-project tasks', async () => {
