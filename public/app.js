@@ -45,6 +45,20 @@ export function isCurrentProviderRequest(activeProjectId, requestedProjectId, se
     && (requestedProvider === undefined || activeProvider === requestedProvider);
 }
 
+export async function performProjectNavigation({ isProviderBusy, navigate }) {
+  if (isProviderBusy()) return false;
+  await navigate();
+  return true;
+}
+
+export function projectNavigationState(providerBusy) {
+  return { disabled: Boolean(providerBusy), ariaDisabled: String(Boolean(providerBusy)) };
+}
+
+export function canChangeWorkspaceProvider({ projectId, attempts, projectSwitchBusy = false, providerSwitchBusy = false }) {
+  return Boolean(projectId) && !projectSwitchBusy && !providerSwitchBusy && !attempts.inFlight && !attempts.pendingForProject(projectId);
+}
+
 export async function performProviderChange({ projectId, provider, patch, isCurrent, setBusy, commit, loadStatus, fail = () => {} }) {
   setBusy(true);
   try {
@@ -550,7 +564,9 @@ function setup() {
 
   function updateSubmitDisabled() {
     document.querySelector('#generate').disabled = projectSwitchBusy || providerSwitchBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate || (mode === 'image' && !uploadController.canSubmit);
-    document.querySelectorAll('[data-provider]').forEach((button) => { button.disabled = projectSwitchBusy || providerSwitchBusy || attempts.inFlight; });
+    document.querySelectorAll('[data-provider]').forEach((button) => {
+      button.disabled = !canChangeWorkspaceProvider({ projectId: currentProjectId, attempts, projectSwitchBusy, providerSwitchBusy });
+    });
   }
 
   function draftSnapshot() {
@@ -569,6 +585,7 @@ function setup() {
   function renderPendingAttemptState() {
     const error = document.querySelector('#form-error');
     error.textContent = pendingAttemptMessage(error.textContent, shouldShowPendingAttemptGuidance(attempts, currentProjectId));
+    updateSubmitDisabled();
   }
 
   async function reconcilePendingAttempt(projectId, sequence) {
@@ -600,7 +617,7 @@ function setup() {
   }
 
   function setProjectSwitchBusy(busy) { projectSwitchBusy = busy; syncFormBusy(); }
-  function setProviderSwitchBusy(busy) { providerSwitchBusy = busy; syncFormBusy(); }
+  function setProviderSwitchBusy(busy) { providerSwitchBusy = busy; syncFormBusy(); syncProjectNavigationBusy(); }
 
   function projectStorage() {
     try { return window.localStorage; } catch { return null; }
@@ -648,6 +665,9 @@ function setup() {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'project-item';
+      const navigation = projectNavigationState(providerSwitchBusy);
+      button.disabled = navigation.disabled;
+      button.setAttribute('aria-disabled', navigation.ariaDisabled);
       button.classList.toggle('active', project.id === currentProjectId);
       button.setAttribute('aria-current', project.id === currentProjectId ? 'page' : 'false');
       const marker = document.createElement('span'); marker.textContent = project.id === currentProjectId ? '●' : '○';
@@ -661,6 +681,14 @@ function setup() {
     document.querySelector('#mobile-project-name').textContent = current?.name || '—';
     document.querySelector('#rename-project').disabled = !current;
     document.querySelector('#rename-project-mobile').disabled = !current;
+  }
+
+  function syncProjectNavigationBusy() {
+    const navigation = projectNavigationState(providerSwitchBusy);
+    projectList.querySelectorAll('button').forEach((button) => {
+      button.disabled = navigation.disabled;
+      button.setAttribute('aria-disabled', navigation.ariaDisabled);
+    });
   }
 
   function renderProviderButtons() {
@@ -794,6 +822,10 @@ function setup() {
   }
 
   async function switchProject(project, closeReason) {
+    return performProjectNavigation({ isProviderBusy: () => providerSwitchBusy, navigate: () => switchProjectUnlocked(project, closeReason) });
+  }
+
+  async function switchProjectUnlocked(project, closeReason) {
     if (!project) return;
     const drawerWasOpen = drawerOpen;
     if (!shouldSwitchProject(currentProjectId, project)) {
@@ -910,7 +942,7 @@ function setup() {
     catch (error) { projectError.textContent = `工作台加载失败：${error.message}`; retryWorkspace.hidden = false; throw error; }
   }
   document.querySelectorAll('[data-provider]').forEach((button) => button.onclick = async () => {
-    if (!currentProjectId || projectSwitchBusy || providerSwitchBusy || attempts.inFlight || button.dataset.provider === provider) return;
+    if (!canChangeWorkspaceProvider({ projectId: currentProjectId, attempts, projectSwitchBusy, providerSwitchBusy }) || button.dataset.provider === provider) return;
     saveDraft();
     const projectId = currentProjectId;
     const sequence = ++providerChangeSequence;

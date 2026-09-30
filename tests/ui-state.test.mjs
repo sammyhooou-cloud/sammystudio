@@ -145,6 +145,38 @@ test('provider change rejects a response for another project', async () => {
   assert.deepEqual(events, ['busy:true', 'error', 'busy:false']);
 });
 
+test('project navigation waits for a provider PATCH without loading or invalidating it', async () => {
+  const events = [];
+  let providerBusy = true;
+  let providerChangeSequence = 3;
+  const navigate = async () => {
+    providerChangeSequence += 1;
+    events.push('workspace load');
+  };
+  assert.equal(await stageHelpers.performProjectNavigation({ isProviderBusy: () => providerBusy, navigate }), false);
+  assert.deepEqual(events, []);
+  assert.equal(providerChangeSequence, 3);
+  providerBusy = false;
+  assert.equal(await stageHelpers.performProjectNavigation({ isProviderBusy: () => providerBusy, navigate }), true);
+  assert.deepEqual(events, ['workspace load']);
+  assert.equal(providerChangeSequence, 4);
+});
+
+test('project navigation buttons expose disabled state while the provider PATCH is busy', () => {
+  assert.deepEqual(stageHelpers.projectNavigationState(true), { disabled: true, ariaDisabled: 'true' });
+  assert.deepEqual(stageHelpers.projectNavigationState(false), { disabled: false, ariaDisabled: 'false' });
+});
+
+test('a pending ambiguous generation attempt blocks changing its project provider', () => {
+  const attempts = createSubmissionAttemptController(() => 'stable-key');
+  const attempt = attempts.begin({ projectId: 'a', mode: 'text', model: 'm', prompt: 'clouds' });
+  attempts.settle(attempt, false);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'a', attempts }), false);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'b', attempts }), true);
+  attempts.resolve(attempt);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'a', attempts }), true);
+});
+
 test('status request guards project, provider, and sequence', () => {
   const { isCurrentProviderRequest } = stageHelpers;
   assert.equal(isCurrentProviderRequest('a', 'a', 2, 2, 'minimax', 'minimax'), true);
