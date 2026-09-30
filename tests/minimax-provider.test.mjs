@@ -137,7 +137,7 @@ test('MiniMax unconfigured status never requests the API', async () => {
   assert.deepEqual(await provider({}, {}).status(), { connection: 'unconfigured', label: 'MiniMax 未配置', balanceLabel });
 });
 
-for (const [status, connection, label, statusBalanceLabel = balanceLabel] of [[200, 'online', 'MiniMax 已连接'], [401, 'auth_error', 'MiniMax 认证失败'], [402, 'offline', 'MiniMax 额度不足，请前往控制台查看', '额度不足，请前往控制台查看'], [429, 'offline', 'MiniMax 暂不可用'], [500, 'offline', 'MiniMax 暂不可用']]) {
+for (const [status, connection, label, statusBalanceLabel = balanceLabel] of [[200, 'online', 'MiniMax 已连接'], [401, 'auth_error', 'MiniMax 认证失败'], [402, 'insufficient_balance', 'MiniMax 额度不足，请前往控制台查看', '额度不足，请前往控制台查看'], [429, 'offline', 'MiniMax 暂不可用'], [500, 'offline', 'MiniMax 暂不可用']]) {
   test(`MiniMax status maps HTTP ${status} without creating a paid task`, async () => {
     let calls = 0;
     const instance = provider({ fetcher: async (url, options) => {

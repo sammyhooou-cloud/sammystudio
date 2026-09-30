@@ -107,15 +107,17 @@ test('HTTP errors retain the response code for controlled poll handling', () => 
   assert.equal(error.status, 503);
 });
 
-test('provider account view uses server balance labels and only online is green', () => {
+test('provider account view keeps status colors honest but allows a server-validated MiniMax submit', () => {
   const { providerAccountView } = stageHelpers;
   for (const connection of ['unconfigured', 'offline', 'auth_error']) {
     const state = providerAccountView('minimax', { connection, label: 'MiniMax 不可用', balanceLabel: '额度：控制台查看' });
     assert.equal(state.online, false);
-    assert.equal(state.canGenerate, false);
+    assert.equal(state.canGenerate, true);
     assert.equal(state.balance, '额度：控制台查看');
   }
   assert.equal(providerAccountView('minimax', { connection: 'online', label: 'MiniMax 已连接', balanceLabel: '额度：控制台查看' }).canGenerate, true);
+  assert.equal(providerAccountView('minimax', { connection: 'checking' }).canGenerate, false);
+  assert.equal(providerAccountView('minimax', { connection: 'insufficient_balance' }).canGenerate, false);
   const kling = providerAccountView('kling', { connection: 'online', membership: 'Pro', credits: 25 });
   assert.equal(kling.online, true);
   assert.equal(kling.membership, 'Pro');
@@ -138,7 +140,7 @@ test('MiniMax insufficient balance submission failure immediately locks generati
   assert.deepEqual(applied, [{
     provider: 'minimax',
     status: {
-      connection: 'offline',
+      connection: 'insufficient_balance',
       label: 'MiniMax 额度不足',
       balanceLabel: '额度：不足，请前往 MiniMax 控制台查看',
     },
@@ -1179,6 +1181,12 @@ test('MiniMax image generation requires a nonblank prompt without changing Kling
   assert.equal(validateWorkspace(form, 'kling').prompt, undefined);
   assert.equal(validateWorkspace({ ...form, prompt: 'moving clouds' }, 'minimax').prompt, undefined);
   assert.equal(buildGenerationPayload({ ...form, provider: 'minimax' }).provider, undefined);
+});
+
+test('MiniMax status-probe failures can reach server validation even before models load', () => {
+  const form = { projectId: 'p', mode: 'text', model: '', uploadId: '', prompt: 'moving clouds' };
+  assert.equal(validateWorkspace(form, 'minimax').model, undefined);
+  assert.equal(validateWorkspace(form, 'kling').model, '请选择模型');
 });
 
 test('requires a selected project and includes it in the generation payload', () => {

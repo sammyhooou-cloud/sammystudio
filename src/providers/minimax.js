@@ -196,7 +196,7 @@ export function createMiniMaxProvider(env = {}, deps = {}) {
       const code = await request(`${QUERY_URL}?page_num=1&page_size=1`, { checkStatus: true });
       if (code === 200) return { connection: 'online', label: 'MiniMax 已连接', balanceLabel: BALANCE_LABEL };
       if (code === 401) return { connection: 'auth_error', label: 'MiniMax 认证失败', balanceLabel: BALANCE_LABEL };
-      if (code === 402) return { connection: 'offline', label: `MiniMax ${INSUFFICIENT_BALANCE_LABEL}`, balanceLabel: INSUFFICIENT_BALANCE_LABEL };
+      if (code === 402) return { connection: 'insufficient_balance', label: `MiniMax ${INSUFFICIENT_BALANCE_LABEL}`, balanceLabel: INSUFFICIENT_BALANCE_LABEL };
     } catch {}
     return { connection: 'offline', label: 'MiniMax 暂不可用', balanceLabel: BALANCE_LABEL };
   }

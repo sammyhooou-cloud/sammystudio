@@ -155,7 +155,7 @@ test('provider status API exposes MiniMax insufficient balance without supplier 
   const response = await providerStatusRequest({ DB: new ProviderStatusDb(), MINIMAX_API_KEY: key }, 'minimax');
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.deepEqual(body, { provider: 'minimax', connection: 'offline', label: 'MiniMax 额度不足，请前往控制台查看', balanceLabel: '额度不足，请前往控制台查看', models: minimaxCapabilities });
+  assert.deepEqual(body, { provider: 'minimax', connection: 'insufficient_balance', label: 'MiniMax 额度不足，请前往控制台查看', balanceLabel: '额度不足，请前往控制台查看', models: minimaxCapabilities });
   assert.equal(calls, 1);
   assert.equal(JSON.stringify(body).includes(key), false);
   assert.equal(JSON.stringify(body).includes('supplier-private-detail'), false);
