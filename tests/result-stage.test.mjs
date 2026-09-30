@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const html = readFileSync(new URL('../public/workspace.html', import.meta.url), 'utf8');
+const resultHtml = readFileSync(new URL('../public/result.html', import.meta.url), 'utf8');
 const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
 const css = [
   readFileSync(new URL('../public/styles.css', import.meta.url), 'utf8'),
@@ -26,6 +27,12 @@ test('result markup defines distinct layers and a task records list', () => {
   assert.match(html, /id="result-video"[^>]*controls[^>]*hidden/);
   assert.match(html, /id="task-history-wrap"[^>]*hidden/);
   assert.match(html, /<p class="eyebrow">任务记录<\/p>/);
+});
+
+test('result detail markup reserves a generated service field', () => {
+  assert.match(resultHtml, /id="result-provider"/);
+  assert.match(resultHtml, /生成服务/);
+  assert.match(rule('.task-history-provider'), /font-weight\s*:\s*600/);
 });
 
 test('result header exposes a hidden accessible return control and focuses the current task after activation', () => {

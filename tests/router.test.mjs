@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
 import { siteAssets } from '../src/site-assets.js';
+import { TaskError } from '../src/tasks.js';
+import { encryptJson } from '../src/crypto.js';
+import { minimaxCapabilities } from '../src/providers/minimax.js';
 
 function env() {
   return {
@@ -45,7 +48,8 @@ class RouteDb {
         if (sql.startsWith('UPDATE projects')) {
           const project = db.projects.find(({ id }) => id === values[2]);
           if (!project) return { success: true, meta: { changes: 0 } };
-          project.name = values[0];
+          if (sql.startsWith('UPDATE projects SET video_provider')) project.video_provider = values[0];
+          else project.name = values[0];
           project.updated_at = values[1];
           return { success: true, meta: { changes: 1 } };
         }
@@ -61,6 +65,171 @@ class RouteDb {
 }
 
 const sessionHeaders = { cookie: 'keling_session=test-token', origin: 'https://site.test', 'content-type': 'application/json' };
+
+class ProviderStatusDb extends RouteDb {
+  constructor(token = null) {
+    super();
+    this.token = token;
+    this.statusQueries = 0;
+  }
+
+  prepare(sql) {
+    if (!sql.includes('FROM oauth_tokens')) return super.prepare(sql);
+    return { first: async () => { this.statusQueries += 1; return this.token; } };
+  }
+}
+
+async function providerStatusRequest(runtime, providerId, options = {}) {
+  return worker.fetch(new Request(`https://site.test/api/video/providers/${providerId}/status`, {
+    headers: sessionHeaders, ...options,
+  }), runtime, {});
+}
+
+test('provider status API preserves Kling status and reuses its models without duplicate queries', async (t) => {
+  const secret = 'test-only-kling-token';
+  const db = new ProviderStatusDb({ encrypted_token: await encryptJson({ access_token: secret }, 'test-secret'), expires_at: Date.now() + 60_000 });
+  const models = { text_to_video: { models: [{ model: 'kling-v1' }] }, image_to_video: { models: [{ model: 'kling-v1' }] } };
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(url, 'https://klingai.com/mcp');
+    const rpc = JSON.parse(options.body);
+    assert.equal(rpc.method, 'tools/call');
+    calls.push(rpc.params.name);
+    assert.ok(['who_am_i', 'query_membership_and_credits'].includes(rpc.params.name), 'status must never create a video');
+    return Response.json({ result: { structuredContent: rpc.params.name === 'who_am_i' ? { availableModels: models } : { membershipType: 'Pro', availableRemainCredits: 25 } } });
+  });
+  const response = await providerStatusRequest({ DB: db, TOKEN_ENCRYPTION_KEY: 'test-secret' }, '%6bling');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.provider, 'kling');
+  assert.equal(body.connection, 'online');
+  assert.equal(body.membership, 'Pro');
+  assert.equal(body.credits, 25);
+  assert.deepEqual(body.models, models);
+  assert.equal(typeof body.checkedAt, 'string');
+  assert.deepEqual(calls, ['who_am_i', 'query_membership_and_credits']);
+  assert.equal(db.statusQueries, 2);
+  assert.equal(JSON.stringify(body).includes(secret), false);
+});
+
+test('provider status API keeps offline Kling models without retrying capabilities', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unconfigured Kling must not request the supplier'));
+  const db = new ProviderStatusDb();
+  const response = await providerStatusRequest({ DB: db }, 'kling');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.provider, 'kling');
+  assert.equal(body.connection, 'offline');
+  assert.equal(body.message, '请连接可灵 MCP');
+  assert.deepEqual(body.models, {});
+  assert.equal(db.statusQueries, 1);
+});
+
+test('provider status API checks MiniMax with one GET and exposes static capabilities safely', async (t) => {
+  const key = 'test-only-minimax-key';
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls += 1;
+    assert.equal(url, 'https://api.minimax.io/v2/query/video_generation?page_num=1&page_size=1');
+    assert.equal(options.method, 'GET');
+    assert.equal(options.body, undefined);
+    assert.equal(new Headers(options.headers).get('authorization'), `Bearer ${key}`);
+    return Response.json({ supplier_private_detail: key, provider: 'kling', models: { private: key } });
+  });
+  const response = await providerStatusRequest({ DB: new ProviderStatusDb(), MINIMAX_API_KEY: key }, 'minimax');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body, { provider: 'minimax', connection: 'online', label: 'MiniMax 已连接', balanceLabel: '额度：控制台查看', models: minimaxCapabilities });
+  assert.equal(calls, 1);
+  assert.equal(JSON.stringify(body).includes(key), false);
+  assert.equal(JSON.stringify(body).includes('supplier_private_detail'), false);
+});
+
+test('provider status API exposes MiniMax insufficient balance without supplier details', async (t) => {
+  const key = 'test-only-minimax-key';
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls += 1;
+    return Response.json({ error: `${key} supplier-private-detail` }, { status: 402 });
+  });
+  const response = await providerStatusRequest({ DB: new ProviderStatusDb(), MINIMAX_API_KEY: key }, 'minimax');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body, { provider: 'minimax', connection: 'offline', label: 'MiniMax 额度不足，请前往控制台查看', balanceLabel: '额度不足，请前往控制台查看', models: minimaxCapabilities });
+  assert.equal(calls, 1);
+  assert.equal(JSON.stringify(body).includes(key), false);
+  assert.equal(JSON.stringify(body).includes('supplier-private-detail'), false);
+});
+
+test('provider status API safely exposes MiniMax without a configured key', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unconfigured MiniMax must not request the supplier'));
+  for (const key of [undefined, '', '   ']) {
+    const response = await providerStatusRequest({ DB: new ProviderStatusDb(), MINIMAX_API_KEY: key }, 'minimax');
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { provider: 'minimax', connection: 'unconfigured', label: 'MiniMax 未配置', balanceLabel: '额度：控制台查看', models: minimaxCapabilities });
+  }
+});
+
+test('provider status API rejects unknown and inherited supplier IDs', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('invalid providers must not request a supplier'));
+  for (const id of ['unknown', 'toString', '__proto__', 'constructor', 'kling%2Fextra']) {
+    const response = await providerStatusRequest({ DB: new ProviderStatusDb() }, id);
+    assert.equal(response.status, 404, id);
+    assert.deepEqual(await response.json(), { error: '视频供应商无效' });
+  }
+});
+
+test('provider status API rejects malformed provider ID encoding', async () => {
+  const response = await providerStatusRequest({ DB: new ProviderStatusDb() }, '%E0%A4%A');
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: '供应商 ID 格式无效' });
+});
+
+test('provider status API authenticates before resolving or checking a supplier', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('anonymous requests must not reach a supplier'));
+  const db = new ProviderStatusDb();
+  for (const id of ['kling', 'minimax', 'unknown', '%E0%A4%A']) {
+    const response = await providerStatusRequest({ DB: db }, id, { headers: undefined });
+    assert.equal(response.status, 401, id);
+    assert.deepEqual(await response.json(), { error: '请先登录' });
+  }
+  assert.equal(db.statusQueries, 0);
+});
+
+test('provider status API sanitizes unexpected provider exceptions as 503', async (t) => {
+  const key = 'test-only-private-key';
+  const db = new ProviderStatusDb();
+  db.token = { get encrypted_token() { throw { get message() { throw new Error(`${key} raw-supplier-error`); } }; } };
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('failed status must not create a video'));
+  const response = await providerStatusRequest({ DB: db, MINIMAX_API_KEY: key }, 'kling');
+  assert.equal(response.status, 503);
+  const body = await response.json();
+  assert.deepEqual(body, { provider: 'kling', connection: 'offline', label: '供应商暂不可用', balanceLabel: '额度：暂不可用', models: {} });
+  assert.equal(JSON.stringify(body).includes(key), false);
+  assert.equal(JSON.stringify(body).includes('raw-supplier-error'), false);
+  assert.equal(db.statusQueries, 1);
+});
+
+test('provider status API only matches exact GET status paths', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unmatched status paths must not request a supplier'));
+  for (const [path, method] of [['/api/video/providers/minimax/status', 'POST'], ['/api/video/providers/minimax/status/', 'GET'], ['/api/video/providers/minimax/status/extra', 'GET']]) {
+    const response = await worker.fetch(new Request(`https://site.test${path}`, { method, headers: sessionHeaders }), { DB: new ProviderStatusDb(), MINIMAX_API_KEY: 'test-key' }, {});
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: '接口不存在' });
+  }
+});
+
+test('legacy Kling status API retains its response shape and authentication', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('unconfigured legacy status must not request the supplier'));
+  const runtime = { DB: new ProviderStatusDb() };
+  const response = await worker.fetch(new Request('https://site.test/api/kling/status', { headers: sessionHeaders }), runtime, {});
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(Object.keys(body).sort(), ['checkedAt', 'connection', 'credits', 'membership', 'message', 'models']);
+  assert.equal(body.connection, 'offline');
+  const anonymous = await worker.fetch(new Request('https://site.test/api/kling/status'), runtime, {});
+  assert.equal(anonymous.status, 401);
+});
 
 function seedDocumentAssets(t) {
   for (const page of ['login', 'workspace', 'result']) {
@@ -252,6 +421,118 @@ class TaskRouteDb extends RouteDb {
   }
 }
 
+class OutputRouteDb extends TaskRouteDb {
+  constructor() {
+    super();
+    this.outputs = [];
+    this.failOutputRead = false;
+  }
+
+  prepare(sql) {
+    if (!sql.includes('FROM task_outputs')) return super.prepare(sql);
+    const db = this;
+    return {
+      values: [],
+      bind(...values) { return { ...this, values }; },
+      async first() {
+        if (db.failOutputRead) throw new Error('database outputs/private.mp4 secret password');
+        const [taskId, projectId] = this.values;
+        if (!db.projectTasks.some(({ task_id, project_id }) => task_id === taskId && project_id === projectId)) return null;
+        return db.outputs.find(({ task_id }) => task_id === taskId) ?? null;
+      },
+    };
+  }
+}
+
+function outputRouteEnv(taskId = 'task-1', projectId = 'project-1') {
+  const db = new OutputRouteDb();
+  db.tasks.push({ id: taskId, status: 'succeeded' });
+  db.projectTasks.push({ project_id: projectId, task_id: taskId });
+  db.outputs.push({ task_id: taskId, object_key: 'outputs/private.mp4', content_type: 'video/mp4', byte_size: 11 });
+  return { DB: db, MEDIA: { get: async (key) => { assert.equal(key, 'outputs/private.mp4'); return { body: new Response('owned video').body, size: 11 }; } } };
+}
+
+async function outputRequest(runtime, pathname, headers = sessionHeaders) {
+  return worker.fetch(new Request(`https://site.test${pathname}`, { headers }), runtime, {});
+}
+
+test('task output API requires authentication before reading storage', async () => {
+  const runtime = outputRouteEnv(); runtime.MEDIA.get = () => assert.fail('anonymous request must not read storage');
+  const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output', {});
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: '请先登录' });
+});
+
+test('task output API decodes both IDs and streams an owned video with private caching', async () => {
+  const response = await outputRequest(outputRouteEnv('task /一', 'project /二'), `/api/projects/${encodeURIComponent('project /二')}/tasks/${encodeURIComponent('task /一')}/output`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'video/mp4');
+  assert.equal(response.headers.get('cache-control'), 'private, max-age=3600');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-length'), '11');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(await response.text(), 'owned video');
+});
+
+test('task output API forwards a single range to R2 and streams a 206 response', async () => {
+  const runtime = outputRouteEnv();
+  runtime.MEDIA.get = async (key, options) => {
+    assert.equal(key, 'outputs/private.mp4');
+    assert.ok(options.range instanceof Headers);
+    assert.deepEqual([...options.range.entries()], [['range', 'bytes=2-5']]);
+    return { body: new Response('ned ').body, size: 11, range: { offset: 2, length: 4 } };
+  };
+  const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output', { ...sessionHeaders, range: 'bytes=2-5' });
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-range'), 'bytes 2-5/11');
+  assert.equal(response.headers.get('content-length'), '4');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(await response.text(), 'ned ');
+});
+
+test('task output API rejects bad ranges without revealing object keys or bypassing ownership', async () => {
+  const path = '/api/projects/project-1/tasks/task-1/output';
+  const runtime = outputRouteEnv();
+  runtime.MEDIA.get = () => assert.fail('bad range must not read R2');
+  const response = await outputRequest(runtime, path, { ...sessionHeaders, range: 'bytes=11-' });
+  assert.equal(response.status, 416);
+  assert.equal(response.headers.get('content-range'), 'bytes */11');
+  assert.doesNotMatch(await response.text(), /outputs\/|private/);
+  const anonymous = await outputRequest(runtime, path, { range: 'bytes=2-5' });
+  assert.equal(anonymous.status, 401);
+  const foreign = await outputRequest(runtime, '/api/projects/other/tasks/task-1/output', { ...sessionHeaders, range: 'bytes=2-5' });
+  assert.equal(foreign.status, 404);
+});
+
+test('task output API hides missing, cross-project and missing-R2 outputs', async () => {
+  for (const pathname of ['/api/projects/other/tasks/task-1/output', '/api/projects/project-1/tasks/missing/output']) {
+    const runtime = outputRouteEnv(); runtime.MEDIA.get = () => assert.fail('missing ownership must not read storage');
+    const response = await outputRequest(runtime, pathname);
+    assert.equal(response.status, 404); assert.deepEqual(await response.json(), { error: '视频输出不存在' });
+  }
+  const runtime = outputRouteEnv(); runtime.MEDIA.get = async () => null;
+  const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output');
+  assert.equal(response.status, 404); assert.deepEqual(await response.json(), { error: '视频输出不存在' });
+});
+
+test('task output API rejects malformed and empty IDs', async () => {
+  for (const pathname of ['/api/projects/%E0%A4%A/tasks/task-1/output', '/api/projects/project-1/tasks/%E0%A4%A/output', '/api/projects//tasks/task-1/output', '/api/projects/project-1/tasks//output', '/api/projects/%20/tasks/task-1/output', '/api/projects/project-1/tasks/%20/output']) {
+    const response = await outputRequest(outputRouteEnv(), pathname);
+    assert.equal(response.status, 400, pathname); assert.deepEqual(await response.json(), { error: '任务参数无效' });
+  }
+});
+
+test('task output API sanitizes database and R2 exceptions consistently', async () => {
+  for (const failure of ['db', 'r2']) {
+    const runtime = outputRouteEnv();
+    if (failure === 'db') runtime.DB.failOutputRead = true;
+    else runtime.MEDIA.get = async () => { throw new Error('R2 outputs/private.mp4 secret credentials'); };
+    const response = await outputRequest(runtime, '/api/projects/project-1/tasks/task-1/output');
+    assert.equal(response.status, 503); assert.deepEqual(await response.json(), { error: '视频输出暂不可用' });
+  }
+});
+
 test('task detail API preserves anonymous JSON 401 responses', async () => {
   const response = await worker.fetch(new Request('https://site.test/api/projects/project-1/tasks/task-1'), { DB: new TaskRouteDb() }, {});
   assert.equal(response.status, 401);
@@ -267,8 +548,21 @@ test('task detail API decodes both IDs and returns the owned task detail', async
   db.projectTasks.push({ project_id: 'project one', task_id: 'task one' });
   const response = await projectRequest(db, '/api/projects/project%20one/tasks/task%20one');
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { id: 'task one', projectId: 'project one', projectName: '项目详情', remoteId: 'remote-1', mode: 'text', status: 'succeeded', request: { prompt: 'ocean', model: 'kling-v1', duration: 5, resolution: '720p', aspectRatio: '16:9' }, resultJson: '{"url":"https://video.test/result.mp4"}', createdAt: 1, updatedAt: 2 });
+  assert.deepEqual(await response.json(), { id: 'task one', projectId: 'project one', projectName: '项目详情', remoteId: 'remote-1', provider: 'kling', mode: 'text', status: 'succeeded', request: { prompt: 'ocean', model: 'kling-v1', duration: 5, resolution: '720p', aspectRatio: '16:9' }, resultJson: '{"url":"https://video.test/result.mp4"}', createdAt: 1, updatedAt: 2 });
   assert.equal(db.statusQueries, 0);
+});
+
+test('MiniMax task detail exposes its internal output without private supplier data', async () => {
+  const db = new TaskRouteDb();
+  db.tasks.push({ id: 'mini/1', provider: 'minimax', status: 'succeeded', mode: 'text', request_json: '{"prompt":"sky","Authorization":"Bearer private"}', result_json: JSON.stringify({ videoUrl: '/api/projects/project-1/tasks/mini%2F1/output', providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/private.mp4?token=secret' } }) });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'mini/1' });
+  const response = await projectRequest(db, '/api/projects/project-1/tasks/mini%2F1');
+  assert.equal(response.status, 200);
+  const detail = await response.json();
+  assert.equal(detail.provider, 'minimax');
+  assert.deepEqual(detail.request, { prompt: 'sky' });
+  assert.deepEqual(JSON.parse(detail.resultJson), { videoUrl: '/api/projects/project-1/tasks/mini%2F1/output' });
+  assert.doesNotMatch(JSON.stringify(detail), /Bearer private|outputs\/private|supplier\.test|token=secret/);
 });
 
 test('task detail API hides missing and cross-project tasks', async () => {
@@ -341,6 +635,17 @@ test('task status route requires authentication and project ownership', async ()
   assert.equal(anonymous.status, 401);
 });
 
+test('task status route hides MiniMax stored supplier metadata on terminal reads', async () => {
+  const db = new TaskRouteDb();
+  const original = JSON.stringify({ videoUrl: '/api/projects/project-1/tasks/task-1/output', providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' } });
+  db.tasks.push({ id: 'task-1', provider: 'minimax', remote_id: 'remote-1', status: 'succeeded', result_json: original });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'task-1' });
+  const response = await worker.fetch(new Request('https://site.test/api/video/tasks/task-1?projectId=project-1', { headers: sessionHeaders }), { DB: db }, {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse((await response.json()).resultJson), { videoUrl: '/api/projects/project-1/tasks/task-1/output' });
+  assert.equal(db.tasks[0].result_json, original);
+});
+
 test('attempt lookup finds only the owned task by stable key without a paid tool call', async () => {
   const db = new TaskRouteDb();
   db.tasks.push({ id: 'task-1', idempotency_key: JSON.stringify(['project-1', 'stable-key']), remote_id: 'remote-1', status: 'queued' });
@@ -359,11 +664,11 @@ test('attempt lookup finds only the owned task by stable key without a paid tool
   assert.equal(anonymous.status, 401);
 });
 
-function taskRequest(projectId, idempotencyKey = 'shared-key') {
+function taskRequest(projectId, idempotencyKey = 'shared-key', extra = {}) {
   return new Request('https://site.test/api/video/tasks', {
     method: 'POST',
     headers: { ...sessionHeaders, 'idempotency-key': idempotencyKey },
-    body: JSON.stringify({ projectId, mode: 'text', model: 'kling-v1', prompt: 'ocean', duration: 5, resolution: '720p', aspectRatio: '16:9' }),
+    body: JSON.stringify({ projectId, mode: 'text', model: 'kling-v1', prompt: 'ocean', duration: 5, resolution: '720p', aspectRatio: '16:9', ...extra }),
   });
 }
 
@@ -440,6 +745,61 @@ test('project routes map invalid input, missing projects, and malformed ids to J
     assert.equal(response.status, status, `${method} ${pathname}`);
     assert.equal(typeof (await response.json()).error, 'string');
   }
+});
+
+test('authenticated provider updates decode the project id and persist the provider', async () => {
+  const db = new RouteDb();
+  db.projects.push({ id: 'project one', name: '项目供应商', created_at: 1, updated_at: 2 });
+  const response = await projectRequest(db, '/api/projects/project%20one/provider', 'PATCH', JSON.stringify({ provider: ' MiniMax ' }));
+
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.deepEqual(result, { id: 'project one', videoProvider: 'minimax', updatedAt: db.projects[1].updated_at });
+  assert.equal(db.projects[1].name, '项目供应商');
+  const workspace = await projectRequest(db, '/api/projects/project%20one/workspace');
+  assert.equal((await workspace.json()).project.videoProvider, 'minimax');
+});
+
+test('provider route returns JSON errors for invalid input, malformed ids, and missing projects', async () => {
+  for (const [pathname, body, status, error] of [
+    ['/api/projects/project-1/provider', '{broken', 400, '请提供有效的 JSON'],
+    ['/api/projects/project-1/provider', JSON.stringify({ provider: 'other' }), 400, '视频供应商无效'],
+    ['/api/projects/project-1/provider', JSON.stringify({}), 400, '视频供应商无效'],
+    ['/api/projects/missing/provider', JSON.stringify({ provider: 'minimax' }), 404, '项目不存在'],
+    ['/api/projects/%E0%A4%A/provider', JSON.stringify({ provider: 'minimax' }), 400, '项目 ID 格式无效'],
+  ]) {
+    const response = await projectRequest(new RouteDb(), pathname, 'PATCH', body);
+    assert.equal(response.status, status, pathname);
+    assert.deepEqual(await response.json(), { error });
+  }
+});
+
+test('provider route requires a session and enforces mutation origin and content type', async () => {
+  for (const [headers, status, error] of [
+    [{ origin: 'https://site.test', 'content-type': 'application/json' }, 401, '请先登录'],
+    [{ ...sessionHeaders, origin: 'https://other.test' }, 403, '请求来源无效'],
+    [{ ...sessionHeaders, 'content-type': 'text/plain' }, 415, '请求内容类型无效'],
+  ]) {
+    const db = new RouteDb();
+    const response = await worker.fetch(new Request('https://site.test/api/projects/project-1/provider', {
+      method: 'PATCH', headers, body: JSON.stringify({ provider: 'minimax' }),
+    }), { DB: db }, {});
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), { error });
+    assert.equal(db.projects[0].video_provider, undefined);
+  }
+});
+
+test('provider route sanitizes unexpected database errors', async () => {
+  class FailingProviderDb extends RouteDb {
+    prepare(sql) {
+      if (!sql.startsWith('UPDATE projects SET video_provider')) return super.prepare(sql);
+      return { bind() { return { async run() { throw new Error('database password leaked'); } }; } };
+    }
+  }
+  const response = await projectRequest(new FailingProviderDb(), '/api/projects/project-1/provider', 'PATCH', JSON.stringify({ provider: 'minimax' }));
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: '项目供应商更新暂不可用' });
 });
 
 test('upload rejects a missing or invalid project before writing media', async () => {
@@ -607,6 +967,29 @@ test('fresh task still checks status and rejects an offline MCP connection', asy
   assert.equal(response.status, 409);
   assert.deepEqual(await response.json(), { error: '请先连接可灵 MCP' });
   assert.equal(db.statusQueries, 1);
+});
+
+test('fresh task resolves the project provider before checking Kling status', async () => {
+  const db = new TaskRouteDb(); db.projects[0].video_provider = 'unknown';
+  const response = await worker.fetch(taskRequest('project-1', 'unknown-provider', { provider: 'kling' }), { DB: db }, {});
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: '视频供应商无效' });
+  assert.equal(db.statusQueries, 0);
+});
+
+test('task API serializes errorCode only for coded TaskError responses', async () => {
+  class CodedTaskDb extends TaskRouteDb {
+    prepare(sql) {
+      if (!sql.startsWith('SELECT') || !sql.includes('FROM video_tasks')) return super.prepare(sql);
+      return { bind() { return { async first() { throw new TaskError('供应商暂不可用', 503, undefined, 'PROVIDER_UNAVAILABLE'); } }; } };
+    }
+  }
+  const db = new CodedTaskDb();
+  for (const request of [taskRequest('project-1'), new Request('https://site.test/api/video/tasks/task-1?projectId=project-1', { headers: sessionHeaders }), new Request('https://site.test/api/video/tasks/attempt?projectId=project-1', { headers: { ...sessionHeaders, 'idempotency-key': 'key' } }), new Request('https://site.test/api/projects/project-1/tasks/task-1', { headers: sessionHeaders })]) {
+    const response = await worker.fetch(request, { DB: db }, {});
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: '供应商暂不可用', errorCode: 'PROVIDER_UNAVAILABLE' });
+  }
 });
 
 test('unexpected database failures return a sanitized server response', async () => {

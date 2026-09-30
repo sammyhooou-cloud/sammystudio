@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   normalizeTaskStatus,
   parseTaskRequest,
@@ -7,6 +8,7 @@ import {
   taskProgress,
   taskDetailHref,
 } from '../public/task-presenter.js';
+import * as taskPresenter from '../public/task-presenter.js';
 import * as stageHelpers from '../public/app.js';
 import { parseResultRoute, resultViewModel, setupResultPage } from '../public/result.js';
 import {
@@ -47,6 +49,309 @@ import {
   sidebarShouldBeInert,
 } from '../public/app.js';
 
+test('workspace provider defaults to Kling and MiniMax image ratio follows its reference image', () => {
+  const { normalizeWorkspaceProvider, aspectRatioControl } = stageHelpers;
+  assert.equal(normalizeWorkspaceProvider('minimax'), 'minimax');
+  assert.equal(normalizeWorkspaceProvider('bad'), 'kling');
+  assert.deepEqual(aspectRatioControl('minimax', 'image'), { disabled: true, label: '跟随参考图', value: 'adaptive' });
+  assert.deepEqual(aspectRatioControl('kling', 'image'), { disabled: false, label: '画幅', value: '' });
+  assert.equal(buildGenerationPayload({ projectId: 'a', provider: 'minimax' }).provider, undefined);
+});
+
+test('task provider labels use the saved task provider and default legacy rows to Kling', () => {
+  const { taskProviderLabel } = taskPresenter;
+  assert.equal(typeof taskProviderLabel, 'function');
+  assert.equal(taskProviderLabel({ provider: 'minimax' }), 'MiniMax');
+  assert.equal(taskProviderLabel({ provider: 'kling' }), '可灵');
+  assert.equal(taskProviderLabel({}), '可灵');
+});
+
+test('new and recovered task rows retain their original project provider', () => {
+  const { submissionTaskRow } = stageHelpers;
+  const task = { id: 'new', remote_id: 'remote', status: 'queued' };
+  const row = submissionTaskRow(task, 'image', 'minimax');
+  assert.equal(row.provider, 'minimax');
+  assert.equal(taskPresenter.taskProviderLabel(row), 'MiniMax');
+  assert.equal(submissionTaskRow(task, 'text', 'kling').provider, 'kling');
+});
+
+test('reconciliation retains an existing provider and fills a missing provider from the recovered row', () => {
+  const { mergeReconciledTask } = stageHelpers;
+  const recovered = { id: 'task', status: 'queued', provider: 'minimax' };
+  assert.equal(mergeReconciledTask([{ id: 'task', status: 'submitting', provider: 'kling' }], recovered, true)[0].provider, 'kling');
+  assert.equal(mergeReconciledTask([{ id: 'task', status: 'submitting' }], recovered, true)[0].provider, 'minimax');
+});
+
+test('poll updates keep the saved provider when the status response omits it', () => {
+  const { mergePolledTaskRow } = stageHelpers;
+  const row = { id: 'task', status: 'queued', provider: 'minimax' };
+  assert.equal(mergePolledTaskRow(row, { id: 'task', status: 'generating' }).provider, 'minimax');
+  assert.equal(mergePolledTaskRow(row, { id: 'task', status: 'generating', provider: 'kling' }).provider, 'kling');
+});
+
+test('a failed output save marks only its active task with a safe retry label', () => {
+  const { markOutputPersistenceFailure, taskListItemModel, outputPersistenceRetryMessage } = stageHelpers;
+  const tasks = [{ id: 'active', status: 'generating', provider: 'minimax' }, { id: 'done', status: 'succeeded' }];
+  const marked = markOutputPersistenceFailure(tasks, 'active');
+  assert.equal(marked[0].outputPersistFailed, true);
+  assert.equal(marked[1], tasks[1]);
+  assert.equal(taskListItemModel(marked[0], 'p').label, outputPersistenceRetryMessage);
+  assert.match(outputPersistenceRetryMessage, /视频已生成.*保存到本站失败.*正在重试/);
+  assert.equal(markOutputPersistenceFailure(tasks, 'done')[1].outputPersistFailed, undefined);
+  assert.equal(stageHelpers.mergePolledTaskRow(marked[0], { id: 'active', status: 'succeeded' }).outputPersistFailed, false);
+});
+
+test('HTTP errors retain the response code for controlled poll handling', () => {
+  const error = stageHelpers.requestFailure({ status: 503 }, { error: 'internal secret', errorCode: 'output_persist_failed' });
+  assert.equal(error.code, 'output_persist_failed');
+  assert.equal(error.status, 503);
+});
+
+test('provider account view uses server balance labels and only online is green', () => {
+  const { providerAccountView } = stageHelpers;
+  for (const connection of ['unconfigured', 'offline', 'auth_error']) {
+    const state = providerAccountView('minimax', { connection, label: 'MiniMax 不可用', balanceLabel: '额度：控制台查看' });
+    assert.equal(state.online, false);
+    assert.equal(state.canGenerate, false);
+    assert.equal(state.balance, '额度：控制台查看');
+  }
+  assert.equal(providerAccountView('minimax', { connection: 'online', label: 'MiniMax 已连接', balanceLabel: '额度：控制台查看' }).canGenerate, true);
+  const kling = providerAccountView('kling', { connection: 'online', membership: 'Pro', credits: 25 });
+  assert.equal(kling.online, true);
+  assert.equal(kling.membership, 'Pro');
+  assert.equal(kling.balance, 25);
+  assert.deepEqual(
+    [providerAccountView('kling', { connection: 'checking' }).canGenerate, providerAccountView('kling', { connection: 'checking' }).label],
+    [false, '正在检测'],
+  );
+});
+
+test('MiniMax insufficient balance submission failure immediately locks generation with safe account copy', () => {
+  const applied = [];
+  const handled = stageHelpers.applySubmissionProviderFailure(
+    'minimax',
+    { code: 'insufficient_balance', message: 'supplier-private-detail' },
+    (status, provider) => applied.push({ status, provider }),
+  );
+
+  assert.equal(handled, true);
+  assert.deepEqual(applied, [{
+    provider: 'minimax',
+    status: {
+      connection: 'offline',
+      label: 'MiniMax 额度不足',
+      balanceLabel: '额度：不足，请前往 MiniMax 控制台查看',
+    },
+  }]);
+  assert.equal(stageHelpers.providerAccountView('minimax', applied[0].status).canGenerate, false);
+  assert.doesNotMatch(JSON.stringify(applied), /supplier-private-detail/);
+
+  for (const [provider, error] of [
+    ['kling', { code: 'insufficient_balance' }],
+    ['minimax', { code: 'provider_unavailable' }],
+  ]) assert.equal(stageHelpers.applySubmissionProviderFailure(provider, error, () => assert.fail('must not change account status')), false);
+});
+
+test('new provider capabilities replace invalid values with the new model defaults', () => {
+  const minimax = {
+    text_to_video: { models: [{ model: 'MiniMax-H3', arguments: [
+      { name: 'resolution', allowedValues: ['768P'] }, { name: 'duration', allowedValues: ['4'] }, { name: 'aspect_ratio', allowedValues: ['21:9'] },
+    ] }] },
+    image_to_video: { models: [{ model: 'MiniMax-H3', arguments: [
+      { name: 'resolution', allowedValues: ['768P'] }, { name: 'duration', allowedValues: ['4'] }, { name: 'aspect_ratio', allowedValues: ['adaptive'] },
+    ] }] },
+  };
+  const previous = { mode: 'image', prompt: 'clouds', model: 'image-pro', resolution: '1080p', duration: '5', aspectRatio: '1:1' };
+  assert.deepEqual(workspaceFormState(minimax, 'image', previous), {
+    mode: 'image', prompt: 'clouds', model: 'MiniMax-H3', resolution: '768P', duration: '4', aspectRatio: 'adaptive', imageCount: 1,
+  });
+});
+
+test('provider change ignores a late PATCH after project selection changes', async () => {
+  const { performProviderChange, isCurrentProviderRequest } = stageHelpers;
+  let finishPatch;
+  const pendingPatch = new Promise((resolve) => { finishPatch = resolve; });
+  const events = [];
+  let activeProjectId = 'a';
+  let latestSequence = 1;
+  const requestSequence = 1;
+  const changing = performProviderChange({
+    projectId: 'a', provider: 'minimax', sequence: requestSequence,
+    patch: () => pendingPatch,
+    isCurrent: () => isCurrentProviderRequest(activeProjectId, 'a', requestSequence, latestSequence),
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    commit: () => events.push('commit'),
+    loadStatus: () => events.push('status'),
+  });
+  activeProjectId = 'b';
+  latestSequence += 1;
+  finishPatch({ id: 'a', videoProvider: 'minimax' });
+  assert.equal(await changing, false);
+  assert.deepEqual(events, ['busy:true']);
+  assert.equal(isCurrentProviderRequest('a', 'a', 1, latestSequence), false);
+});
+
+test('provider change commits only the confirmed project value before loading its status', async () => {
+  const { performProviderChange } = stageHelpers;
+  const events = [];
+  const changed = await performProviderChange({
+    projectId: 'a', provider: 'minimax',
+    patch: async () => { events.push('patch'); return { id: 'a', videoProvider: 'minimax' }; },
+    isCurrent: () => true,
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    commit: (provider) => events.push(`commit:${provider}`),
+    loadStatus: (provider) => events.push(`status:${provider}`),
+  });
+  assert.equal(changed, true);
+  assert.deepEqual(events, ['busy:true', 'patch', 'commit:minimax', 'status:minimax', 'busy:false']);
+});
+
+test('provider change rejects a response for another project', async () => {
+  const events = [];
+  const changed = await stageHelpers.performProviderChange({
+    projectId: 'a', provider: 'minimax',
+    patch: async () => ({ id: 'b', videoProvider: 'minimax' }),
+    isCurrent: () => true,
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    commit: () => events.push('commit'),
+    loadStatus: () => events.push('status'),
+    fail: () => events.push('error'),
+  });
+  assert.equal(changed, false);
+  assert.deepEqual(events, ['busy:true', 'error', 'busy:false']);
+});
+
+test('project navigation waits for a provider PATCH without loading or invalidating it', async () => {
+  const events = [];
+  let providerBusy = true;
+  let providerChangeSequence = 3;
+  const navigate = async () => {
+    providerChangeSequence += 1;
+    events.push('workspace load');
+  };
+  assert.equal(await stageHelpers.performProjectNavigation({ isProviderBusy: () => providerBusy, navigate }), false);
+  assert.deepEqual(events, []);
+  assert.equal(providerChangeSequence, 3);
+  providerBusy = false;
+  assert.equal(await stageHelpers.performProjectNavigation({ isProviderBusy: () => providerBusy, navigate }), true);
+  assert.deepEqual(events, ['workspace load']);
+  assert.equal(providerChangeSequence, 4);
+});
+
+test('project navigation buttons expose disabled state while the provider PATCH is busy', () => {
+  assert.deepEqual(stageHelpers.projectNavigationState(true), { disabled: true, ariaDisabled: 'true' });
+  assert.deepEqual(stageHelpers.projectNavigationState(false), { disabled: false, ariaDisabled: 'false' });
+});
+
+test('a pending ambiguous generation attempt blocks changing its project provider', () => {
+  const attempts = createSubmissionAttemptController(() => 'stable-key');
+  const attempt = attempts.begin({ projectId: 'a', mode: 'text', model: 'm', prompt: 'clouds' });
+  attempts.settle(attempt, false);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'a', attempts }), false);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'b', attempts }), true);
+  attempts.resolve(attempt);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'a', attempts }), true);
+});
+
+test('provider PATCH busy rejects project creation before POST', async () => {
+  const events = [];
+  const created = await stageHelpers.performProjectCreation({
+    canStart: () => false,
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    create: async () => { events.push('POST'); return { id: 'new' }; },
+    commit: () => events.push('commit'),
+    select: async () => events.push('workspace'),
+  });
+  assert.equal(created, false);
+  assert.deepEqual(events, []);
+  assert.deepEqual(stageHelpers.projectCreationState(true), { disabled: true, ariaDisabled: 'true' });
+});
+
+test('project creation keeps provider switching locked until new workspace selection finishes', async () => {
+  let finishSelection;
+  const selected = new Promise((resolve) => { finishSelection = resolve; });
+  const events = [];
+  let createBusy = false;
+  const attempts = createSubmissionAttemptController(() => 'stable-key');
+  const creating = stageHelpers.performProjectCreation({
+    canStart: () => true,
+    setBusy: (busy) => { createBusy = busy; events.push(`busy:${busy}`); },
+    create: async () => { events.push('POST'); return { id: 'new' }; },
+    commit: (project) => events.push(`commit:${project.id}`),
+    select: async (project) => { events.push(`workspace:${project.id}`); await selected; },
+  });
+  await Promise.resolve();
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'old', attempts, projectCreateBusy: createBusy }), false);
+  assert.deepEqual(events, ['busy:true', 'POST', 'commit:new', 'workspace:new']);
+  finishSelection();
+  assert.equal(await creating, true);
+  assert.equal(stageHelpers.canChangeWorkspaceProvider({ projectId: 'old', attempts, projectCreateBusy: createBusy }), true);
+  assert.deepEqual(events, ['busy:true', 'POST', 'commit:new', 'workspace:new', 'busy:false']);
+});
+
+test('failed project POST restores creation and provider controls', async () => {
+  const events = [];
+  let createBusy = false;
+  const created = await stageHelpers.performProjectCreation({
+    canStart: () => true,
+    setBusy: (busy) => { createBusy = busy; events.push(`busy:${busy}`); },
+    create: async () => { events.push('POST'); throw new Error('offline'); },
+    commit: () => events.push('commit'),
+    select: async () => events.push('workspace'),
+    fail: (error) => events.push(error.message),
+  });
+  assert.equal(created, false);
+  assert.equal(createBusy, false);
+  assert.deepEqual(events, ['busy:true', 'POST', 'offline', 'busy:false']);
+  assert.deepEqual(stageHelpers.projectCreationState(false), { disabled: false, ariaDisabled: 'false' });
+});
+
+test('status request guards project, provider, and sequence', () => {
+  const { isCurrentProviderRequest } = stageHelpers;
+  assert.equal(isCurrentProviderRequest('a', 'a', 2, 2, 'minimax', 'minimax'), true);
+  assert.equal(isCurrentProviderRequest('b', 'a', 2, 2, 'minimax', 'minimax'), false);
+  assert.equal(isCurrentProviderRequest('a', 'a', 1, 2, 'minimax', 'minimax'), false);
+  assert.equal(isCurrentProviderRequest('a', 'a', 2, 2, 'kling', 'minimax'), false);
+});
+
+test('provider status requests use only the selected unified route', () => {
+  assert.equal(stageHelpers.providerStatusPath('minimax'), '/api/video/providers/minimax/status');
+  assert.equal(stageHelpers.providerStatusPath('kling'), '/api/video/providers/kling/status');
+});
+
+test('workspace provides an accessible project provider control above generation modes', () => {
+  const html = readFileSync(new URL('../public/workspace.html', import.meta.url), 'utf8');
+  const provider = html.indexOf('class="provider-switch"');
+  const modes = html.indexOf('class="mode-tabs"');
+  assert.ok(provider > 0 && provider < modes);
+  assert.match(html, /<fieldset class="provider-switch" aria-label="视频生成服务">/);
+  assert.match(html, /data-provider="kling"[^>]*aria-pressed="true"/);
+  assert.match(html, /data-provider="minimax"[^>]*aria-pressed="false"/);
+});
+
+test('a delayed provider status cannot overwrite a newer provider or project', async () => {
+  const { createProviderStatusLoader } = stageHelpers;
+  let finishOld;
+  const oldStatus = new Promise((resolve) => { finishOld = resolve; });
+  const events = [];
+  let activeProject = 'a';
+  let activeProvider = 'kling';
+  const loader = createProviderStatusLoader({
+    load: (provider) => provider === 'kling' ? oldStatus : Promise.resolve({ connection: 'online', label: 'MiniMax 已连接' }),
+    isCurrent: (projectId, provider) => activeProject === projectId && activeProvider === provider,
+    apply: (status, provider) => events.push(`${provider}:${status.label}`),
+  });
+  const stale = loader.refresh('a', 'kling');
+  activeProvider = 'minimax';
+  assert.equal(await loader.refresh('a', 'minimax'), true);
+  finishOld({ connection: 'online', label: 'MCP 在线' });
+  assert.equal(await stale, false);
+  assert.deepEqual(events, ['minimax:MiniMax 已连接']);
+  activeProject = 'b';
+  loader.invalidate();
+  assert.deepEqual(events, ['minimax:MiniMax 已连接']);
+});
+
 test('result routes decode exact project and task segments', () => {
   assert.deepEqual(parseResultRoute('/projects/project%20a/results/task%2F1'), { projectId: 'project a', taskId: 'task/1' });
   for (const path of ['', '/', '/projects//results/task', '/projects/p/results/', '/projects/p/results/t/', '/projects/p/results/t/extra', '/projects/%ZZ/results/t', '/projects/p/results/%E0%A4%A', '/projects/p/tasks/t', '/projects/p/results/t?x=1', '/projects/p/results/t#x']) {
@@ -78,6 +383,12 @@ test('result states distinguish playable successes from unavailable results', ()
     assert.equal(state.kind, 'unavailable');
     assert.equal(state.videoUrl, '');
   }
+});
+
+test('MiniMax internal output plays through the authenticated task URL', () => {
+  const videoUrl = '/api/projects/p/tasks/t/output';
+  assert.equal(safeVideoUrl({ videoUrl }), videoUrl);
+  assert.equal(resultViewModel({ provider: 'minimax', status: 'succeeded', resultJson: JSON.stringify({ videoUrl }) }).videoUrl, videoUrl);
 });
 
 test('workspace and result pages agree on JSON-encoded video URL strings', () => {
@@ -144,7 +455,8 @@ test('result page loads the encoded API route, renders safe metadata, and clears
   assert.equal(elements['result-project'].innerHTML, undefined);
   assert.equal(elements['result-prompt'].textContent, '<script>prompt</script>');
   assert.equal(elements['back-to-workspace'].href, '/workspace?project=project%20a');
-  assert.equal(elements['result-meta'].children.length, 7);
+  assert.equal(elements['result-meta'].children.length, 8);
+  assert.deepEqual(elements['result-meta'].children[0].children.map((cell) => cell.textContent), ['生成服务', '可灵']);
   assert.equal(JSON.stringify(elements['result-meta']).includes('never-render'), false);
   assert.deepEqual(redirects, []);
   detail = { ...detail, resultJson: '{"videoUrl":"javascript:alert(1)"}' };
@@ -206,6 +518,7 @@ test('result page keeps active progress centered and shows percentages only when
   await setupResultPage({ view, pageLocation, fetcher: async () => ({ ok: true, status: 200, json: async () => ({ projectId: 'project a', status: 'generating', resultJson }) }) });
   assert.equal(elements['result-progress'].hidden, false);
   assert.equal(elements['result-percentage'].hidden, true);
+  assert.equal(elements['result-percentage'].textContent, '');
   resultJson = '{"progress":35}';
   await elements['result-retry'].onclick();
   assert.equal(elements['result-percentage'].hidden, false);
@@ -438,7 +751,7 @@ test('task history renders every task in server order with safe metadata and exp
   assert.equal(typeof stageHelpers.renderTaskHistory, 'function');
   const { history } = taskHistoryHarness();
   const tasks = [
-    { id: 'active', status: 'generating', mode: 'image', createdAt: 1750000000000, requestJson: '{"model":"<script>model</script>","resolution":"1080p","duration":5,"aspectRatio":"16:9"}' },
+    { id: 'active', provider: 'minimax', status: 'generating', mode: 'image', createdAt: 1750000000000, requestJson: '{"model":"<script>model</script>","resolution":"1080p","duration":5,"aspectRatio":"16:9"}' },
     { id: 'done', status: 'succeeded', mode: 'text', resultJson: '{"videoUrl":"https://cdn.test/clip.mp4"}' },
     { id: 'failed', status: 'failed', requestJson: '{broken' },
     { id: 'unknown', status: 'unknown', requestJson: '[]' },
@@ -446,8 +759,9 @@ test('task history renders every task in server order with safe metadata and exp
   stageHelpers.renderTaskHistory(history, tasks, 'project a');
   assert.deepEqual(history.children.map((row) => row.dataset.taskId), tasks.map(({ id }) => id));
   const [active, completed] = history.children;
-  assert.equal(active.children[0].children[1].children[0].textContent, '图生视频');
-  assert.equal(active.children[0].children[1].children[1].dateTime, '2025-06-15T15:06:40.000Z');
+  assert.equal(active.children[0].children[1].children[0].textContent, 'MiniMax');
+  assert.equal(active.children[0].children[1].children[1].textContent, '图生视频');
+  assert.equal(active.children[0].children[1].children[2].dateTime, '2025-06-15T15:06:40.000Z');
   assert.equal(active.children[0].children[2].textContent, '<script>model</script> · 1080p · 5秒 · 16:9');
   assert.equal(active.children[0].children[2].innerHTML, undefined);
   assert.equal(active.children[1].tagName, 'span');
@@ -455,6 +769,7 @@ test('task history renders every task in server order with safe metadata and exp
   assert.equal(completed.children[1].tagName, 'a');
   assert.equal(completed.children[1].href, '/projects/project%20a/results/done');
   assert.equal(completed.children[1].textContent, '查看结果');
+  assert.equal(completed.children[0].children[1].children[0].textContent, '可灵');
   assert.equal(completed.children[1].onclick, undefined);
   assert.equal(history.children[2].children[0].children[2].textContent, '参数待同步');
 });
@@ -469,7 +784,7 @@ test('task history preserves link focus across polling renders and safely clears
   stageHelpers.renderTaskHistory(history, tasks, 'project-1');
   assert.notEqual(view.activeElement, oldLink);
   assert.equal(view.activeElement, history.children[0].children[1]);
-  assert.equal(history.children[0].children[0].children[1].children[1].textContent, '时间待同步');
+  assert.equal(history.children[0].children[0].children[1].children[2].textContent, '时间待同步');
   stageHelpers.renderTaskHistory(history, [], 'project-1');
   assert.deepEqual(history.children, []);
 });
@@ -722,6 +1037,8 @@ test('pending guidance clears only its own text after resolution', () => {
   assert.equal(typeof stageHelpers.pendingAttemptMessage, 'function');
   const warning = stageHelpers.pendingAttemptMessage('', true);
   assert.match(warning, /上次提交结果尚未确认/);
+  assert.match(warning, /人工核对供应商任务/);
+  assert.doesNotMatch(warning, /可灵/);
   assert.equal(stageHelpers.pendingAttemptMessage(warning, false), '');
   assert.equal(stageHelpers.pendingAttemptMessage('请输入视频提示词', false), '请输入视频提示词');
   assert.equal(stageHelpers.pendingAttemptMessage('请求失败', true), '请求失败');
@@ -780,6 +1097,41 @@ test('poller discards stale project responses and prioritizes a selected active 
   assert.deepEqual(updates, ['b']);
 });
 
+test('poller reports output save failures for the current project and keeps retrying', async () => {
+  const timers = [];
+  const errors = [];
+  let calls = 0;
+  const poller = createActiveTaskPoller({
+    load: async () => { calls += 1; if (calls === 1) throw Object.assign(new Error('private detail'), { code: 'output_persist_failed' }); return { id: 'task', status: 'succeeded' }; },
+    onUpdate: () => poller.sync('p', [{ id: 'task', status: 'succeeded' }]),
+    onError: (_error, projectId, taskId) => errors.push([projectId, taskId]),
+    schedule: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    cancel: () => {},
+  });
+  poller.sync('p', [{ id: 'task', status: 'generating' }]);
+  await timers.shift().fn();
+  assert.deepEqual(errors, [['p', 'task']]);
+  assert.equal(timers[0].ms, 6000);
+  await timers.shift().fn();
+  assert.equal(calls, 2);
+});
+
+test('poller silently backs off on ordinary network failures', async () => {
+  const timers = [];
+  const errors = [];
+  const poller = createActiveTaskPoller({
+    load: async () => { throw new Error('offline secret'); },
+    onUpdate: () => assert.fail('no update expected'),
+    onError: (error) => errors.push(error),
+    schedule: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    cancel: () => {},
+  });
+  poller.sync('p', [{ id: 'task', status: 'generating' }]);
+  await timers.shift().fn();
+  assert.deepEqual(errors, []);
+  assert.equal(timers[0].ms, 6000);
+});
+
 test('session drafts restore per-project controls including upload removal', () => {
   const drafts = createProjectDrafts();
   drafts.save('a', { prompt: 'unsubmitted', uploadId: 'asset-a' });
@@ -819,6 +1171,14 @@ test('filters options from model capabilities', () => {
 
 test('requires a first frame in image mode', () => {
   assert.equal(validateWorkspace({ mode: 'image', model: 'turbo', uploadId: '', prompt: '' }).uploadId, '请上传首帧参考图');
+});
+
+test('MiniMax image generation requires a nonblank prompt without changing Kling image validation or payload', () => {
+  const form = { projectId: 'p', mode: 'image', model: 'MiniMax-H3', uploadId: 'image-1', prompt: '  ' };
+  assert.equal(validateWorkspace(form, 'minimax').prompt, '请输入视频提示词');
+  assert.equal(validateWorkspace(form, 'kling').prompt, undefined);
+  assert.equal(validateWorkspace({ ...form, prompt: 'moving clouds' }, 'minimax').prompt, undefined);
+  assert.equal(buildGenerationPayload({ ...form, provider: 'minimax' }).provider, undefined);
 });
 
 test('requires a selected project and includes it in the generation payload', () => {

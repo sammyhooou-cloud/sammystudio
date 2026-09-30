@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as projectsApi from '../src/projects.js';
 import {
   createProject,
   backfillLegacyRows,
@@ -93,7 +94,8 @@ class FakeD1 {
         if (sql.startsWith('UPDATE projects')) {
           const project = db.projects.find(({ id }) => id === values[2]);
           if (!project) return { success: true, meta: { changes: 0 } };
-          project.name = values[0];
+          if (sql.startsWith('UPDATE projects SET video_provider')) project.video_provider = values[0];
+          else project.name = values[0];
           project.updated_at = values[1];
           return { success: true, meta: { changes: 1 } };
         }
@@ -235,8 +237,8 @@ test('lists projects most recently updated after ensuring the default project', 
   );
 
   assert.deepEqual(await listProjects(db), [
-    { id: 'newer', name: '较新', createdAt: 30, updatedAt: 40 },
-    { id: 'older', name: '较早', createdAt: 10, updatedAt: 20 },
+    { id: 'newer', name: '较新', videoProvider: 'kling', createdAt: 30, updatedAt: 40 },
+    { id: 'older', name: '较早', videoProvider: 'kling', createdAt: 10, updatedAt: 20 },
   ]);
 });
 
@@ -245,8 +247,8 @@ test('creates and renames a normalized project', async () => {
   const created = await createProject(db, { name: '  新项目  ' }, () => 'project-1', 100);
   const renamed = await renameProject(db, 'project-1', { name: '  更名后  ' }, 200);
 
-  assert.deepEqual(created, { id: 'project-1', name: '新项目', createdAt: 100, updatedAt: 100 });
-  assert.deepEqual(renamed, { id: 'project-1', name: '更名后', createdAt: 100, updatedAt: 200 });
+  assert.deepEqual(created, { id: 'project-1', name: '新项目', videoProvider: 'kling', createdAt: 100, updatedAt: 100 });
+  assert.deepEqual(renamed, { id: 'project-1', name: '更名后', videoProvider: 'kling', createdAt: 100, updatedAt: 200 });
   await assert.rejects(() => renameProject(db, 'missing', { name: '不存在' }, 300), { message: '项目不存在' });
 });
 
@@ -268,13 +270,82 @@ test('reads only assets and tasks linked to one project and parses settings', as
   const workspace = await readProjectWorkspace(db, 'project-a');
 
   assert.equal(workspace.project.id, 'project-a');
+  assert.equal(workspace.project.videoProvider, 'kling');
   assert.deepEqual(workspace.assets.map(({ id }) => id), ['asset-a']);
   assert.equal(workspace.assets[0].name, 'first-frame.png');
   assert.deepEqual(workspace.tasks.map(({ id }) => id), ['task-a']);
+  assert.equal(workspace.tasks[0].provider, 'kling');
   assert.deepEqual(workspace.settings, { duration: 5 });
   assert.equal('objectKey' in workspace.assets[0], false);
   assert.equal('idempotencyKey' in workspace.tasks[0], false);
   assert.equal(db.queries.filter((sql) => sql.includes('LIMIT 100')).length, 2);
+});
+
+test('workspace exposes the project provider and each task provider', async () => {
+  const db = new FakeD1();
+  db.projects.push({ id: 'project-a', name: 'A', video_provider: 'minimax', created_at: 1, updated_at: 2 });
+  db.videoTasks.push(
+    { id: 'task-a', provider: 'minimax', created_at: 1, updated_at: 4 },
+    { id: 'task-b', provider: 'kling', created_at: 1, updated_at: 3 },
+  );
+  db.projectTasks.push({ project_id: 'project-a', task_id: 'task-a' }, { project_id: 'project-a', task_id: 'task-b' });
+
+  const workspace = await readProjectWorkspace(db, 'project-a');
+
+  assert.equal(workspace.project.videoProvider, 'minimax');
+  assert.deepEqual(workspace.tasks.map(({ provider }) => provider), ['minimax', 'kling']);
+  assert.ok(db.queries.some((sql) => sql.includes('video_tasks.provider')));
+});
+
+test('workspace task results hide MiniMax supplier data and preserve Kling results', async () => {
+  const db = new FakeD1();
+  db.projects.push({ id: 'project/a', name: 'A', video_provider: 'minimax', created_at: 1, updated_at: 2 });
+  const outputUrl = '/api/projects/project%2Fa/tasks/mini%2F1/output';
+  const privateResult = JSON.stringify({ videoUrl: outputUrl, progress: 42, providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' } });
+  db.videoTasks.push(
+    { id: 'mini/1', provider: 'minimax', result_json: privateResult, created_at: 1, updated_at: 4 },
+    { id: 'mini-wrong', provider: 'minimax', result_json: JSON.stringify({ videoUrl: '/api/projects/other/tasks/mini-wrong/output', progress: '88', Authorization: 'Bearer private' }), created_at: 1, updated_at: 3 },
+    { id: 'mini-broken', provider: 'minimax', result_json: '{broken', created_at: 1, updated_at: 2 },
+    { id: 'kling', provider: 'kling', result_json: '{"url":"https://kling.test/video.mp4"}', created_at: 1, updated_at: 1 },
+  );
+  db.projectTasks.push(...db.videoTasks.map(({ id }) => ({ project_id: 'project/a', task_id: id })));
+  const workspace = await readProjectWorkspace(db, 'project/a');
+  assert.deepEqual(JSON.parse(workspace.tasks[0].resultJson), { videoUrl: outputUrl, progress: 42 });
+  assert.deepEqual(JSON.parse(workspace.tasks[1].resultJson), {});
+  assert.deepEqual(JSON.parse(workspace.tasks[2].resultJson), {});
+  assert.equal(workspace.tasks[3].resultJson, db.videoTasks[3].result_json);
+  assert.equal(db.videoTasks[0].result_json, privateResult);
+  assert.doesNotMatch(JSON.stringify(workspace), /Bearer private|outputs\/private|supplier\.test|token=secret/);
+});
+
+test('normalizes supported video providers and rejects invalid providers', () => {
+  assert.equal(typeof projectsApi.normalizeVideoProvider, 'function');
+  assert.equal(projectsApi.normalizeVideoProvider('  MiniMax  '), 'minimax');
+  assert.equal(projectsApi.normalizeVideoProvider(' KLING '), 'kling');
+  for (const provider of [undefined, null, '', 'other', {}, ['minimax']]) {
+    assert.throws(() => projectsApi.normalizeVideoProvider(provider), { message: '视频供应商无效' });
+  }
+});
+
+test('updates the project video provider and its update time', async () => {
+  assert.equal(typeof projectsApi.updateProjectProvider, 'function');
+  const db = new FakeD1();
+  db.projects.push({ id: 'project-1', name: '项目一', created_at: 1, updated_at: 2 });
+
+  const result = await projectsApi.updateProjectProvider(db, 'project-1', { provider: 'minimax' }, 100);
+
+  assert.deepEqual(result, { id: 'project-1', videoProvider: 'minimax', updatedAt: 100 });
+  assert.equal((await readProjectWorkspace(db, 'project-1')).project.videoProvider, 'minimax');
+  assert.equal((await listProjects(db)).find(({ id }) => id === 'project-1').videoProvider, 'minimax');
+  assert.equal((await renameProject(db, 'project-1', { name: '更名' }, 200)).videoProvider, 'minimax');
+});
+
+test('provider updates reject invalid providers before writing and reject missing projects', async () => {
+  assert.equal(typeof projectsApi.updateProjectProvider, 'function');
+  const db = new FakeD1();
+  await assert.rejects(() => projectsApi.updateProjectProvider(db, 'missing', { provider: 'other' }, 100), { message: '视频供应商无效' });
+  assert.equal(db.runs.length, 0);
+  await assert.rejects(() => projectsApi.updateProjectProvider(db, 'missing', { provider: 'minimax' }, 100), { message: '项目不存在' });
 });
 
 test('falls back to empty settings and rejects missing projects', async () => {

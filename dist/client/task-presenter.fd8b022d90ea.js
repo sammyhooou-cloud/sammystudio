@@ -2,6 +2,10 @@ export function normalizeTaskStatus(status) {
   return typeof status === 'string' ? status.toLowerCase() : '';
 }
 
+export function taskProviderLabel(task) {
+  return task?.provider === 'minimax' ? 'MiniMax' : '可灵';
+}
+
 export function parseTaskRequest(value) {
   if (typeof value === 'string') {
     try { value = JSON.parse(value); } catch { return {}; }

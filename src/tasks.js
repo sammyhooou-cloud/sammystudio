@@ -1,10 +1,14 @@
-import { callTool, toolData } from './kling-mcp.js';
+import { createVideoProvider } from './providers/index.js';
+import { persistTaskOutput } from './task-outputs.js';
+import { safeTaskResultJson } from './task-result-dto.js';
 
 export class TaskError extends Error {
-  constructor(message, status, task) {
+  constructor(message, status, task, code) {
+    if (message && typeof message === 'object') ({ message, status, task, code } = message);
     super(message);
     this.status = status;
     if (task) this.task = task;
+    if (code) this.code = code;
   }
 }
 
@@ -36,19 +40,41 @@ function settingsSnapshot(valid) {
   };
 }
 
-function generationArguments(model, valid) {
-  const values = { prompt: valid.prompt || '', duration: valid.duration, resolution: valid.resolution, aspect_ratio: valid.aspectRatio, imageCount: valid.imageCount };
-  return (model?.arguments || []).filter(({ name }) => Object.hasOwn(values, name) && values[name] != null)
-    .map(({ name }) => ({ name, value: String(values[name]) }));
+function submissionOptions(source, fetcher, toolCaller) {
+  if (source && typeof source === 'object' && ['providerFactory', 'capabilitiesSource', 'fetcher', 'toolCaller'].some((key) => Object.hasOwn(source, key))) return source;
+  return { capabilitiesSource: source, fetcher, toolCaller };
 }
 
-async function loadCapabilities(source) {
-  if (typeof source !== 'function') return source;
-  const status = await source();
-  if (status.connection !== 'online') {
-    throw new TaskError('请先连接可灵 MCP', 409);
+function taskProvider(id, env, options) {
+  try { return (options.providerFactory || createVideoProvider)(id, env, options); }
+  catch (error) {
+    if (error instanceof TaskError) throw error;
+    if (error.message === '视频供应商无效') throw new TaskError('视频供应商无效', 400);
+    throw new TaskError('视频供应商暂不可用', 503, undefined, safeErrorCode(error));
   }
-  return status.models;
+}
+
+const providerErrorMessages = Object.freeze({
+  provider_not_configured: '请配置 MiniMax API Key',
+  provider_auth_failed: 'MiniMax 认证失败，请检查服务端配置',
+  insufficient_balance: 'MiniMax 额度不足，请前往控制台查看',
+  invalid_parameters: 'MiniMax 生成参数或参考图无效',
+  provider_unavailable: 'MiniMax 暂不可用，请稍后重试',
+  invalid_response: 'MiniMax 返回结果未确认，请勿重新创建任务',
+});
+
+function safeErrorCode(error) {
+  if (error instanceof TaskError) return error.code;
+  return Object.hasOwn(providerErrorMessages, error?.code) ? error.code : undefined;
+}
+
+async function loadCapabilities(provider) {
+  try { return await provider.capabilities(); }
+  catch (error) {
+    if (error instanceof TaskError) throw error;
+    if (provider.id === 'kling' && error.status === 409) throw new TaskError('请先连接可灵 MCP', 409);
+    throw new TaskError('视频供应商暂不可用', 503, undefined, safeErrorCode(error));
+  }
 }
 
 function taskDto(task) {
@@ -115,7 +141,7 @@ async function replayTask(task, env, projectId) {
   if (!object) return stale();
   let record;
   try { record = JSON.parse(await object.text()); } catch { throw new TaskError('任务恢复记录无效', 500); }
-  if (record.id !== task.id || record.projectId !== projectId || !record.settings || !Number.isFinite(record.settingsVersion)) throw new TaskError('任务恢复记录无效', 500);
+  if (record.id !== task.id || record.projectId !== projectId || (record.provider || 'kling') !== (task.provider || 'kling') || !record.settings || !Number.isFinite(record.settingsVersion)) throw new TaskError('任务恢复记录无效', 500);
   let replayed = task;
   if (task.status === 'submitting' && !task.remote_id && record.remoteId) {
     await finalizeTask(env.DB, task.id, record.remoteId, record.result);
@@ -131,10 +157,10 @@ async function replayTask(task, env, projectId) {
   return taskDto(replayed);
 }
 
-export async function submitTask(input, env, idempotencyKey, capabilitiesSource, fetcher = fetch, toolCaller = callTool) {
+export async function submitTask(input, env, idempotencyKey, capabilitiesSource, fetcher = fetch, toolCaller) {
   const projectId = String(input?.projectId || '').trim();
   if (!projectId) throw new TaskError('请选择项目', 400);
-  const project = await env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(projectId).first();
+  const project = await env.DB.prepare('SELECT id, video_provider FROM projects WHERE id = ?').bind(projectId).first();
   if (!project) throw new TaskError('请选有效项目', 400);
   const internalKey = JSON.stringify([projectId, idempotencyKey]);
   const existing = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(internalKey, projectId).first();
@@ -142,7 +168,10 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   const legacy = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.idempotency_key = ? AND project_tasks.project_id = ?').bind(idempotencyKey, projectId).first();
   if (legacy) return replayTask(legacy, env, projectId);
   if (typeof env.DB.batch !== 'function') throw new TaskError('任务保存失败', 500);
-  const capabilities = await loadCapabilities(capabilitiesSource);
+  const options = submissionOptions(capabilitiesSource, fetcher, toolCaller);
+  const providerId = project.video_provider || 'kling';
+  const provider = taskProvider(providerId, env, options);
+  const capabilities = await loadCapabilities(provider);
   let valid;
   try { valid = validateTask(input, capabilities); }
   catch (error) { throw new TaskError(error.message, 400); }
@@ -157,7 +186,7 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   const id = crypto.randomUUID();
   const createdAt = Date.now();
   const reservation = [
-    env.DB.prepare('INSERT INTO video_tasks (id, idempotency_key, remote_id, mode, status, request_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(id, internalKey, null, valid.mode, 'submitting', JSON.stringify({ ...valid, settingsVersion }), createdAt, createdAt),
+    env.DB.prepare('INSERT INTO video_tasks (id, idempotency_key, remote_id, mode, status, request_json, created_at, updated_at, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(id, internalKey, null, valid.mode, 'submitting', JSON.stringify({ ...valid, settingsVersion }), createdAt, createdAt, providerId),
     env.DB.prepare('INSERT INTO project_tasks (project_id, task_id, created_at) VALUES (?, ?, ?)').bind(projectId, id, createdAt),
   ];
   try {
@@ -167,7 +196,6 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
     if (reserved) return taskDto(reserved);
     throw new TaskError('任务保存失败', 500);
   }
-  let result;
   let imageFile, imageUpload;
   if (valid.mode === 'image') {
     imageUpload = await env.DB.prepare('SELECT stored_objects.object_key, stored_objects.mime_type, stored_objects.size, stored_objects.filename FROM stored_objects JOIN project_assets ON project_assets.object_id = stored_objects.id WHERE stored_objects.id = ? AND project_assets.project_id = ?').bind(valid.uploadId, projectId).first();
@@ -177,49 +205,32 @@ export async function submitTask(input, env, idempotencyKey, capabilitiesSource,
   }
   const traceId = id.replace(/-/g, '');
   const settings = settingsSnapshot(valid);
-  const recovery = { id, projectId, idempotencyKey, traceId, request: settings, settings, settingsVersion, remoteId: null, phase: 'intent' };
+  const recovery = { id, projectId, provider: providerId, idempotencyKey, traceId, request: settings, settings, settingsVersion, remoteId: null, phase: 'intent' };
   try { await writeRecovery(env.MEDIA, recovery); }
   catch (error) { await markFailed(env.DB, id); throw new TaskError(error.message, error.status, { id, remote_id: null, status: 'failed' }); }
-  let paidStarted = false;
-  const modelSpec = (valid.mode === 'text' ? capabilities.text_to_video : capabilities.image_to_video).models.find((model) => model.model === valid.model);
+  let created;
   try {
-    if (valid.mode === 'text') {
-      paidStarted = true;
-      result = toolData(await toolCaller(env, 'text_to_video', { model: valid.model, taskTraceId: traceId, arguments: generationArguments(modelSpec, valid) }, fetcher));
-    } else {
-      const filename = imageUpload.filename || 'reference-image';
-      const uploaded = toolData(await toolCaller(env, 'file_upload', { filename, contentType: imageUpload.mime_type, size: imageUpload.size, taskTraceId: traceId }, fetcher));
-      let imageUrl = uploaded.url;
-      if (!imageUrl) {
-        if (!uploaded.ticket || !/^https:\/\//.test(uploaded.uploadUrl || '')) throw new Error('upload_ticket_invalid');
-        const form = new FormData();
-        form.append('ticket', uploaded.ticket);
-        form.append('file', new Blob([await imageFile.arrayBuffer()], { type: imageUpload.mime_type || 'image/png' }), filename);
-        const response = await fetcher(uploaded.uploadUrl, { method: 'POST', body: form });
-        if (!response.ok) throw new Error('upload_failed');
-        const body = await response.json();
-        imageUrl = body.url || body.data?.url;
-      }
-      if (!/^https:\/\//.test(imageUrl || '')) throw new Error('upload_url_invalid');
-      const imageInputs = modelSpec.inputs || [];
-      const inputName = imageInputs.find((item) => item.required)?.name || imageInputs[0]?.name || 'input';
-      paidStarted = true;
-      result = toolData(await toolCaller(env, 'image_to_video', { model: valid.model, taskTraceId: traceId, arguments: generationArguments(modelSpec, valid), inputs: [{ name: inputName, inputType: 'URL', url: imageUrl }] }, fetcher));
-    }
+    created = await provider.create({ input: valid, reference: imageUpload ? { ...imageUpload, object: imageFile } : undefined, traceId });
   } catch (error) {
-    if (paidStarted) await markUnknown(env.DB, id);
-    else await markFailed(env.DB, id);
-    if (!paidStarted) throw new TaskError('参考图上传失败', 502, { id, remote_id: null, status: 'failed' });
-    throw new TaskError('提交结果未确认，请勿重新创建任务；请联系管理员核对可灵记录', 502, { id, remote_id: null, status: 'unknown' });
+    if (error?.submissionState === 'failed') {
+      await markFailed(env.DB, id);
+      const code = safeErrorCode(error);
+      const message = providerId === 'minimax' ? providerErrorMessages[code] || 'MiniMax 提交失败，请稍后重试' : '参考图上传失败';
+      throw new TaskError(message, 502, { id, remote_id: null, status: 'failed' }, code);
+    }
+    await markUnknown(env.DB, id);
+    const message = providerId === 'kling' ? '提交结果未确认，请勿重新创建任务；请联系管理员核对可灵记录' : '提交结果未确认，请勿重新创建任务；请联系管理员核对供应商记录';
+    throw new TaskError(message, 502, { id, remote_id: null, status: 'unknown' }, safeErrorCode(error));
   }
-  const remoteId = result?.generationId || result?.taskId || result?.task_id || result?.id || null;
+  const remoteId = created?.remoteId || null;
   if (!remoteId) {
     await markUnknown(env.DB, id);
-    throw new TaskError('提交结果未确认，请勿重新创建任务；请联系管理员核对可灵记录', 502, { id, remote_id: null, status: 'unknown' });
+    const message = providerId === 'kling' ? '提交结果未确认，请勿重新创建任务；请联系管理员核对可灵记录' : '提交结果未确认，请勿重新创建任务；请联系管理员核对供应商记录';
+    throw new TaskError(message, 502, { id, remote_id: null, status: 'unknown' });
   }
   try { await writeRecovery(env.MEDIA, { ...recovery, remoteId, phase: 'accepted', result: { generationId: remoteId } }); }
   catch { /* The remote identifier remains available for direct DB finalization. */ }
-  await finalizeTask(env.DB, id, remoteId, result);
+  await finalizeTask(env.DB, id, remoteId, created.raw);
   await saveSettings(env.DB, projectId, settings, settingsVersion);
   await deleteRecovery(env.MEDIA, id);
   return taskDto({ id, remote_id: remoteId, status: 'queued' });
@@ -235,7 +246,7 @@ export function normalizeRemoteStatus(raw) {
 
 export async function getTaskDetail(id, projectId, env) {
   if (!id || !projectId) throw new TaskError('任务参数无效', 400);
-  const task = await env.DB.prepare(`SELECT video_tasks.id, video_tasks.remote_id, video_tasks.mode,
+  const task = await env.DB.prepare(`SELECT video_tasks.id, video_tasks.remote_id, video_tasks.provider, video_tasks.mode,
       video_tasks.status, video_tasks.request_json, video_tasks.result_json,
       video_tasks.created_at, video_tasks.updated_at, projects.name AS project_name
     FROM video_tasks
@@ -251,42 +262,55 @@ export async function getTaskDetail(id, projectId, env) {
   const safeRequest = Object.fromEntries(['prompt', 'model', 'duration', 'resolution', 'aspectRatio']
     .filter((key) => request[key] !== undefined)
     .map((key) => [key, request[key]]));
+  const provider = task.provider || 'kling';
+  const resultJson = safeTaskResultJson({ provider, projectId, taskId: id, resultJson: task.result_json || null });
   return {
     id: task.id,
     projectId,
     projectName: task.project_name,
     remoteId: task.remote_id || null,
+    provider,
     mode: task.mode,
     status: task.status,
     request: safeRequest,
-    resultJson: task.result_json || null,
+    resultJson,
     createdAt: task.created_at,
     updatedAt: task.updated_at,
   };
 }
 
-export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCaller = callTool) {
+export async function getTaskStatus(id, projectId, env, fetcher = fetch, toolCaller) {
   const task = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.id = ? AND project_tasks.project_id = ?').bind(id, projectId).first();
   if (!task) throw new TaskError('任务不存在', 404);
   if (task.status === 'submitting' && !task.remote_id) {
     const recovered = await replayTask(task, env, projectId);
-    return { ...recovered, resultJson: task.result_json || null };
+    return { ...recovered, resultJson: safeTaskResultJson({ provider: task.provider || 'kling', projectId, taskId: id, resultJson: task.result_json || null }) };
   }
   if (!task.remote_id && ['queued', 'generating'].includes(task.status)) {
     await env.DB.prepare('UPDATE video_tasks SET status = ?, updated_at = ? WHERE id = ? AND remote_id IS NULL AND status IN (?, ?)').bind('unknown', Date.now(), id, 'queued', 'generating').run();
     const current = await env.DB.prepare('SELECT video_tasks.* FROM video_tasks JOIN project_tasks ON project_tasks.task_id = video_tasks.id WHERE video_tasks.id = ? AND project_tasks.project_id = ?').bind(id, projectId).first();
     if (!current) throw new TaskError('任务不存在', 404);
-    return { ...taskDto(current), resultJson: current.result_json || null };
+    return { ...taskDto(current), resultJson: safeTaskResultJson({ provider: current.provider || 'kling', projectId, taskId: id, resultJson: current.result_json || null }) };
   }
-  if (!task.remote_id || !['queued', 'generating'].includes(task.status)) return { ...taskDto(task), resultJson: task.result_json || null };
-  let result;
-  try { result = toolData(await toolCaller(env, 'query_tasks', { generationId: task.remote_id }, fetcher)); }
-  catch { throw new TaskError('任务状态暂不可用', 503); }
-  if (!result || result.isError || (result.generationId && result.generationId !== task.remote_id)) throw new TaskError('任务状态暂不可用', 503);
-  const status = normalizeRemoteStatus(result.status);
-  const resultJson = JSON.stringify(result);
+  if (!task.remote_id || !['queued', 'generating'].includes(task.status)) return { ...taskDto(task), resultJson: safeTaskResultJson({ provider: task.provider || 'kling', projectId, taskId: id, resultJson: task.result_json || null }) };
+  const options = fetcher && typeof fetcher === 'object' ? fetcher : { fetcher, toolCaller };
+  let provider, result;
+  try {
+    provider = taskProvider(task.provider || 'kling', env, options);
+    result = await provider.query(task.remote_id);
+  } catch (error) { throw new TaskError('任务状态暂不可用', 503, undefined, safeErrorCode(error)); }
+  const status = result.status;
+  let storedResult = result.raw;
+  if (provider.persistOutput && status === 'succeeded') {
+    let videoUrl;
+    try {
+      videoUrl = await persistTaskOutput({ taskId: id, projectId, sourceUrl: result.outputUrl, env, fetcher: options.fetcher || fetch });
+    } catch { throw new TaskError('视频输出保存暂不可用，请稍后重试', 503, undefined, 'output_persist_failed'); }
+    storedResult = { providerResult: result.raw, videoUrl };
+  }
+  const resultJson = JSON.stringify(storedResult);
   await env.DB.prepare('UPDATE video_tasks SET status = ?, result_json = ?, updated_at = ? WHERE id = ? AND status IN (?, ?)').bind(status, resultJson, Date.now(), id, 'queued', 'generating').run();
-  return { id, remote_id: task.remote_id, status, resultJson };
+  return { id, remote_id: task.remote_id, status, resultJson: safeTaskResultJson({ provider: task.provider || 'kling', projectId, taskId: id, resultJson }) };
 }
 
 export async function getTaskByAttempt(projectId, key, env) {

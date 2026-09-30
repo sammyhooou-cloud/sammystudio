@@ -11,6 +11,19 @@ const execFileAsync = promisify(execFile);
 const projectRoot = new URL('..', import.meta.url);
 const fingerprint = (value) => createHash('sha256').update(value).digest('hex').slice(0, 12);
 
+test('CI workflow runs the required checks without deployment credentials or deployment steps', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /pull_request:/);
+  assert.match(workflow, /push:\s*\n\s*branches:\s*\n\s*-\s*main\b/);
+  assert.match(workflow, /permissions:\s*\n\s*contents:\s*read\b/);
+  assert.match(workflow, /node-version:\s*['"]?22['"]?/);
+  assert.match(workflow, /npm test\b/);
+  assert.match(workflow, /npm run build\b/);
+  assert.match(workflow, /git diff --exit-code -- dist\b/);
+  assert.match(workflow, /git diff --check\b/);
+  assert.doesNotMatch(workflow, /wrangler\s+deploy|MINIMAX_API_KEY|KLING(?:_API_KEY)?/i);
+});
+
 test('production build packages independent pages and their complete fingerprinted module graph', async () => {
   await execFileAsync(process.execPath, ['scripts/build.mjs'], { cwd: projectRoot });
   const modules = new Map();

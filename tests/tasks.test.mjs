@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { submitTask, getTaskStatus } from '../src/tasks.js';
 import * as taskApi from '../src/tasks.js';
+import { ProviderError } from '../src/providers/minimax.js';
 
 const capabilities = {
   text_to_video: {
@@ -70,6 +71,7 @@ class TaskDb {
     this.projects = [{ id: 'project-1', name: 'Project One' }, { id: 'project-2', name: 'Project Two' }];
     this.tasks = [];
     this.projectTasks = [];
+    this.taskOutputs = [];
     this.settings = [];
     this.settingsVersions = new Map();
     this.batchCount = 0;
@@ -82,6 +84,7 @@ class TaskDb {
     this.afterSettingsRead = null;
     this.upload = null;
     this.beforeOrphanUpdate = null;
+    this.failOutputInsert = false;
   }
 
   prepare(sql) {
@@ -92,6 +95,11 @@ class TaskDb {
       bind(...values) { return { ...statement, values }; },
       async first() {
         db.queries.push({ sql, values: this.values });
+        if (sql.includes('FROM task_outputs')) {
+          const [taskId, projectId] = this.values;
+          if (!db.projectTasks.some(({ task_id, project_id }) => task_id === taskId && project_id === projectId)) return null;
+          return db.taskOutputs.find(({ task_id }) => task_id === taskId) ?? null;
+        }
         if (sql.startsWith('INSERT INTO project_settings_versions')) {
           const projectId = this.values[0];
           const version = (db.settingsVersions.get(projectId) || 0) + 1;
@@ -131,9 +139,13 @@ class TaskDb {
       },
       async run() {
         const values = this.values;
-        if (sql.startsWith('INSERT INTO video_tasks')) {
+        if (sql.startsWith('INSERT OR IGNORE INTO task_outputs')) {
+          if (db.failOutputInsert) throw new Error('database outputs/minimax-poll.mp4 private insert failure');
+          if (!db.taskOutputs.some(({ task_id }) => task_id === values[1])) db.taskOutputs.push({ id: values[0], task_id: values[1], object_key: values[2], content_type: values[3], byte_size: values[4], created_at: values[5] });
+        }
+        else if (sql.startsWith('INSERT INTO video_tasks')) {
           if (db.tasks.some(({ idempotency_key }) => idempotency_key === values[1])) throw new Error('UNIQUE constraint failed: video_tasks.idempotency_key');
-          db.tasks.push({ id: values[0], idempotency_key: values[1], remote_id: values[2], mode: values[3], status: values[4], request_json: values[5] });
+          db.tasks.push({ id: values[0], idempotency_key: values[1], remote_id: values[2], mode: values[3], status: values[4], request_json: values[5], ...(sql.includes('provider') ? { provider: values[8] } : {}) });
         }
         else if (sql.startsWith('UPDATE video_tasks SET remote_id')) {
           db.finalizationAttempts += 1;
@@ -202,7 +214,7 @@ test('task detail returns a sanitized project-owned DTO', async () => {
   const detail = await taskApi.getTaskDetail('detail-1', 'project-1', taskEnv(db));
 
   assert.deepEqual(detail, {
-    id: 'detail-1', projectId: 'project-1', projectName: 'Project One', remoteId: 'remote-1',
+    id: 'detail-1', projectId: 'project-1', projectName: 'Project One', remoteId: 'remote-1', provider: 'kling',
     mode: 'text', status: 'succeeded',
     request: { prompt: 'ocean', model: 'kling-v1', duration: '5', resolution: '720p', aspectRatio: '16:9' },
     resultJson: '{"generationId":"remote-1"}', createdAt: 10, updatedAt: 20,
@@ -676,7 +688,8 @@ test('recovery record is minimal and excludes extra secrets or raw input data', 
   await assert.rejects(() => submitTask({ ...input, apiToken: 'secret-token', rawFile: [1, 2, 3] }, taskEnv(db, media), 'safe-recovery', capabilities, fetch, async () => ({ taskId: 'remote-safe', access_token: 'provider-secret' })));
   const record = JSON.parse([...media.objects.values()][0]);
 
-  assert.deepEqual(Object.keys(record).sort(), ['id', 'idempotencyKey', 'phase', 'projectId', 'remoteId', 'request', 'result', 'settings', 'settingsVersion', 'traceId']);
+  assert.deepEqual(Object.keys(record).sort(), ['id', 'idempotencyKey', 'phase', 'projectId', 'provider', 'remoteId', 'request', 'result', 'settings', 'settingsVersion', 'traceId']);
+  assert.equal(record.provider, 'kling');
   assert.equal(typeof record.settingsVersion, 'number');
   assert.equal(record.remoteId, 'remote-safe');
   assert.deepEqual(record.result, { generationId: 'remote-safe' });
@@ -808,4 +821,297 @@ test('task links the generated task and saves a serializable settings snapshot',
   });
   assert.equal(db.batchCount, 1);
   assert.doesNotThrow(() => JSON.stringify(JSON.parse(db.settings[0].settings_json)));
+});
+
+test('fresh task injects a provider factory and snapshots the project provider', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia();
+  db.projects[0].video_provider = 'custom';
+  let created = 0; let intent;
+  const providerFactory = (id, env) => {
+    assert.equal(id, 'custom'); assert.equal(env.DB, db);
+    return { id, persistOutput: false, capabilities: async () => capabilities, create: async ({ input: valid, reference, traceId }) => {
+      created += 1; assert.equal(valid.duration, '5'); assert.equal(reference, undefined);
+      intent = JSON.parse(media.objects.get(`task-recovery/${db.tasks[0].id}.json`));
+      assert.equal(intent.traceId, traceId);
+      return { remoteId: 'custom-remote', status: 'queued', raw: { privateProviderResult: true } };
+    } };
+  };
+  const result = await submitTask(input, taskEnv(db, media), 'factory', { providerFactory });
+  assert.equal(created, 1); assert.equal(result.remote_id, 'custom-remote');
+  assert.equal(db.tasks[0].provider, 'custom'); assert.equal(intent.provider, 'custom');
+  assert.match(db.queries.find(({ sql }) => sql.includes('FROM projects')).sql, /SELECT id, video_provider/);
+});
+
+test('legacy project provider defaults to Kling for fresh tasks', async () => {
+  const db = new TaskDb();
+  await submitTask(input, taskEnv(db), 'legacy-provider', { providerFactory: (id) => {
+    assert.equal(id, 'kling');
+    return { id, capabilities: async () => capabilities, create: async () => ({ remoteId: 'legacy-remote', status: 'queued', raw: {} }) };
+  } });
+  assert.equal(db.tasks[0].provider, 'kling');
+});
+
+test('replay with an existing remote ID never instantiates or creates the current project provider', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'stored', provider: 'kling', idempotency_key: '["project-1","stored-key"]', remote_id: 'paid-remote', status: 'submitting' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'stored' });
+  const replay = await submitTask(input, taskEnv(db), 'stored-key', { providerFactory: () => { assert.fail('replay must not create a provider'); } });
+  assert.equal(replay.remote_id, 'paid-remote');
+  assert.equal(db.tasks.length, 1);
+});
+
+test('polling uses the saved task provider after the project switches providers', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'poll-provider', provider: 'custom', remote_id: 'paid-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'poll-provider' });
+  const result = await getTaskStatus('poll-provider', 'project-1', taskEnv(db), { providerFactory: (id) => {
+    assert.equal(id, 'custom');
+    return { id, create: async () => { assert.fail('polling must never create'); }, query: async (remoteId) => {
+      assert.equal(remoteId, 'paid-remote'); return { status: 'succeeded', raw: { url: 'https://cdn.test/custom.mp4' }, outputUrl: 'https://cdn.test/custom.mp4' };
+    } };
+  } });
+  assert.equal(result.status, 'succeeded');
+  assert.equal(JSON.parse(result.resultJson).url, 'https://cdn.test/custom.mp4');
+});
+
+test('polling legacy tasks defaults to Kling independently of the project provider', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'legacy-poll', remote_id: 'legacy-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'legacy-poll' });
+  await getTaskStatus('legacy-poll', 'project-1', taskEnv(db), { providerFactory: (id) => {
+    assert.equal(id, 'kling'); return { query: async () => ({ status: 'generating', raw: { status: 'RUNNING' } }) };
+  } });
+  assert.equal(db.tasks[0].status, 'generating');
+});
+
+test('accepted recovery follows the stored provider even when the project changes', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia(); db.projects[0].video_provider = 'different';
+  db.tasks.push({ id: 'recover-provider', provider: 'custom', idempotency_key: '["project-1","recover-provider"]', remote_id: null, status: 'submitting' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'recover-provider' });
+  media.objects.set('task-recovery/recover-provider.json', JSON.stringify({ id: 'recover-provider', projectId: 'project-1', provider: 'custom', settings: {}, settingsVersion: 1, remoteId: 'known-paid', result: { generationId: 'known-paid' } }));
+  const replay = await submitTask(input, taskEnv(db, media), 'recover-provider', { providerFactory: () => { assert.fail('accepted replay must not create'); } });
+  assert.equal(replay.remote_id, 'known-paid'); assert.equal(db.tasks[0].provider, 'custom');
+});
+
+test('recovery provider mismatch is rejected before attaching a remote ID', async () => {
+  const db = new TaskDb(); const media = new RecoveryMedia();
+  db.tasks.push({ id: 'mismatch-provider', provider: 'custom', idempotency_key: '["project-1","mismatch-provider"]', remote_id: null, status: 'submitting' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'mismatch-provider' });
+  media.objects.set('task-recovery/mismatch-provider.json', JSON.stringify({ id: 'mismatch-provider', projectId: 'project-1', provider: 'kling', settings: {}, settingsVersion: 1, remoteId: 'wrong-provider-remote', result: {} }));
+  await assert.rejects(() => submitTask(input, taskEnv(db, media), 'mismatch-provider', { providerFactory: () => { assert.fail('replay must not create'); } }), { message: '任务恢复记录无效' });
+  assert.equal(db.tasks[0].remote_id, null);
+});
+
+test('injected provider ambiguous error remains unknown and replay makes no second paid call', async () => {
+  const db = new TaskDb(); const env = taskEnv(db); let creates = 0;
+  const options = { providerFactory: () => ({ id: 'kling', capabilities: async () => capabilities, create: async () => { creates += 1; throw new Error('raw secret provider failure'); } }) };
+  await assert.rejects(() => submitTask(input, env, 'injected-unknown', options), (error) => error.task?.status === 'unknown' && !error.message.includes('secret'));
+  const replay = await submitTask(input, env, 'injected-unknown', options);
+  assert.equal(replay.status, 'unknown'); assert.equal(creates, 1);
+});
+
+test('injected provider without a remote ID remains unknown', async () => {
+  const db = new TaskDb();
+  await assert.rejects(() => submitTask(input, taskEnv(db), 'injected-empty', { providerFactory: () => ({ id: 'kling', capabilities: async () => capabilities, create: async () => ({ status: 'queued', raw: {} }) }) }), (error) => error.task?.status === 'unknown');
+});
+
+test('non-Error provider rejection still marks a paid submission unknown', async () => {
+  for (const reason of [null, undefined, 'raw secret rejection']) {
+    const db = new TaskDb();
+    await assert.rejects(() => submitTask(input, taskEnv(db), 'untyped-rejection', { providerFactory: () => ({ id: 'kling', capabilities: async () => capabilities, create: async () => { throw reason; } }) }), (error) => error.task?.status === 'unknown' && !error.message.includes('secret'));
+    assert.equal(db.tasks[0].status, 'unknown');
+  }
+});
+
+test('TaskError supports coded positional and options forms without changing legacy calls', () => {
+  const task = { id: 'task-1', status: 'failed' };
+  const legacy = new taskApi.TaskError('旧错误', 400, task);
+  assert.equal(legacy.status, 400); assert.deepEqual(legacy.task, task); assert.equal(legacy.code, undefined);
+  const coded = new taskApi.TaskError('明确错误', 409, task, 'PROVIDER_UNAVAILABLE');
+  assert.equal(coded.code, 'PROVIDER_UNAVAILABLE');
+  const options = new taskApi.TaskError({ message: '明确错误', status: 409, code: 'PROVIDER_UNAVAILABLE', task });
+  assert.equal(options.message, '明确错误'); assert.equal(options.status, 409);
+  assert.equal(options.code, 'PROVIDER_UNAVAILABLE'); assert.deepEqual(options.task, task);
+});
+
+function minimaxPollingTask(db, status = 'queued') {
+  db.tasks.push({ id: 'minimax-poll', provider: 'minimax', remote_id: 'minimax-remote', status, result_json: '{"task_id":"minimax-remote"}' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'minimax-poll' });
+  return db.tasks[0];
+}
+
+const miniMaxQueryResult = { status: 'succeeded', raw: { id: 'minimax-remote', status: 'succeeded', content: { url: 'https://cdn.test/minimax.mp4' } }, outputUrl: 'https://cdn.test/minimax.mp4' };
+
+test('MiniMax succeeds only after output persistence and exposes the internal playback URL', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db); const media = new RecoveryMedia();
+  let factories = 0; let downloads = 0; let storedKey;
+  media.put = async (key, body, options) => {
+    assert.equal(task.status, 'queued', 'success must wait for R2');
+    assert.equal(db.taskOutputs.length, 0);
+    assert.match(key, /^outputs\/minimax-poll\/[0-9a-f-]{36}\.mp4$/);
+    storedKey = key;
+    assert.ok(body instanceof ReadableStream);
+    assert.equal(options.httpMetadata.contentType, 'video/mp4');
+    return { size: (await new Response(body).arrayBuffer()).byteLength };
+  };
+  const options = {
+    providerFactory: (id) => { factories += 1; assert.equal(id, 'minimax'); return { id, persistOutput: true, query: async () => miniMaxQueryResult }; },
+    fetcher: async (url) => { downloads += 1; assert.equal(task.status, 'queued'); assert.equal(url, miniMaxQueryResult.outputUrl); return new Response('video', { headers: { 'content-type': 'video/mp4', 'content-length': '5' } }); },
+  };
+  const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), options);
+  assert.equal(factories, 1); assert.equal(downloads, 1);
+  assert.equal(db.taskOutputs.length, 1);
+  assert.equal(db.taskOutputs[0].object_key, storedKey);
+  assert.equal(task.status, 'succeeded');
+  assert.deepEqual(JSON.parse(result.resultJson), { videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
+  assert.deepEqual(JSON.parse(task.result_json), { providerResult: miniMaxQueryResult.raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
+});
+
+test('MiniMax output persistence failures retain polling status and a later poll retries successfully', async () => {
+  for (const status of ['queued', 'generating']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db, status); const oldResult = task.result_json;
+    let fail = true; let downloads = 0;
+    const media = { put: async (_key, body) => { if (fail) throw new Error('outputs/minimax-poll.mp4 provider private storage error'); return { size: (await new Response(body).arrayBuffer()).byteLength }; } };
+    const options = { providerFactory: () => ({ persistOutput: true, query: async () => miniMaxQueryResult }), fetcher: async () => { downloads += 1; return new Response('video', { headers: { 'content-type': 'video/mp4' } }); } };
+    await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db, media), options), (error) => {
+      assert.ok(error instanceof taskApi.TaskError); assert.equal(error.status, 503); assert.equal(error.code, 'output_persist_failed');
+      assert.doesNotMatch(error.message, /outputs\/|https:|private/);
+      return true;
+    });
+    assert.equal(task.status, status); assert.equal(task.result_json, oldResult); assert.equal(db.taskOutputs.length, 0);
+    fail = false;
+    const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), options);
+    assert.equal(result.status, 'succeeded'); assert.equal(downloads, 2); assert.equal(db.taskOutputs.length, 1);
+  }
+});
+
+test('MiniMax success without an output URL stays retryable and never marks success', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db, 'generating');
+  await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ persistOutput: true, query: async () => ({ ...miniMaxQueryResult, outputUrl: null }) }), fetcher: () => assert.fail('missing URL must not download') }), { status: 503, code: 'output_persist_failed' });
+  assert.equal(task.status, 'generating'); assert.equal(db.taskOutputs.length, 0);
+});
+
+test('MiniMax status retry reuses an already persisted output without downloading again', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db);
+  db.taskOutputs.push({ id: 'existing', task_id: task.id, object_key: 'outputs/minimax-poll.mp4', content_type: 'video/mp4' });
+  const media = { put: () => assert.fail('existing output must not be written again') };
+  const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), { providerFactory: () => ({ persistOutput: true, query: async () => miniMaxQueryResult }), fetcher: () => assert.fail('existing output must not be downloaded again') });
+  assert.equal(result.status, 'succeeded');
+  assert.equal(JSON.parse(result.resultJson).videoUrl, '/api/projects/project-1/tasks/minimax-poll/output');
+  assert.equal(db.taskOutputs.length, 1);
+});
+
+test('MiniMax completes an already persisted output even when the supplier URL is unavailable', async () => {
+  for (const outputUrl of [null, undefined, '', 'invalid-url', 'http://expired.test/clip.mp4']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db, 'generating');
+    db.taskOutputs.push({ id: 'existing', task_id: task.id, object_key: 'outputs/minimax-poll.mp4', content_type: 'video/mp4' });
+    const raw = { id: 'minimax-remote', status: 'succeeded' };
+    const media = { put: () => assert.fail('existing output must not write R2'), get: () => assert.fail('existing output must not read R2') };
+    const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), {
+      providerFactory: () => ({ persistOutput: true, query: async () => ({ status: 'succeeded', raw, outputUrl }) }),
+      fetcher: () => assert.fail('existing output must not download again'),
+    });
+    assert.equal(result.status, 'succeeded'); assert.equal(task.status, 'succeeded');
+    assert.deepEqual(JSON.parse(result.resultJson), { videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
+    assert.deepEqual(JSON.parse(task.result_json), { providerResult: raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' }); assert.equal(db.taskOutputs.length, 1);
+  }
+});
+
+test('MiniMax non-success queries update normally without persisting an output', async () => {
+  for (const status of ['failed', 'queued', 'generating']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db);
+    const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, { put: () => assert.fail('non-success must not persist') }), { providerFactory: () => ({ persistOutput: true, query: async () => ({ status, raw: { status } }) }), fetcher: () => assert.fail('non-success must not download') });
+    assert.equal(result.status, status); assert.deepEqual(JSON.parse(result.resultJson), {});
+    assert.deepEqual(JSON.parse(task.result_json), { status });
+  }
+});
+
+test('MiniMax status early returns filter private data and never invent progress', async () => {
+  for (const [status, remoteId] of [['submitting', null], ['queued', null], ['succeeded', 'remote'], ['failed', 'remote']]) {
+    const db = new TaskDb();
+    const id = `early-${status}`;
+    const original = JSON.stringify({ videoUrl: `/api/projects/project-1/tasks/${id}/output`, providerResult: { Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' } });
+    db.tasks.push({ id, provider: 'minimax', remote_id: remoteId, status, result_json: original });
+    db.projectTasks.push({ project_id: 'project-1', task_id: id });
+    const response = await getTaskStatus(id, 'project-1', taskEnv(db, new RecoveryMedia()), { providerFactory: () => assert.fail('early return must not query supplier') });
+    assert.deepEqual(JSON.parse(response.resultJson), { videoUrl: `/api/projects/project-1/tasks/${id}/output` });
+    assert.equal(db.tasks[0].result_json, original);
+    assert.doesNotMatch(JSON.stringify(response), /Bearer private|outputs\/private|supplier\.test|token=secret/);
+  }
+});
+
+test('MiniMax normal status return keeps only explicit numeric progress', async () => {
+  const db = new TaskDb();
+  const task = minimaxPollingTask(db);
+  const raw = { data: { percentage: 37.5 }, Authorization: 'Bearer private', object_key: 'outputs/private.mp4', url: 'https://supplier.test/video?token=secret' };
+  const response = await getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ query: async () => ({ status: 'generating', raw }) }) });
+  assert.deepEqual(JSON.parse(response.resultJson), { progress: 37.5 });
+  assert.deepEqual(JSON.parse(task.result_json), raw);
+  assert.doesNotMatch(JSON.stringify(response), /Bearer private|outputs\/private|supplier\.test|token=secret/);
+});
+
+test('Kling external result handling is unchanged with persistence disabled', async () => {
+  const db = new TaskDb(); db.tasks.push({ id: 'kling-poll', provider: 'kling', remote_id: 'kling-remote', status: 'queued' });
+  db.projectTasks.push({ project_id: 'project-1', task_id: 'kling-poll' });
+  const raw = { works: [{ contentType: 'video', url: 'https://kling.test/clip.mp4' }] };
+  const result = await getTaskStatus('kling-poll', 'project-1', taskEnv(db, { put: () => assert.fail('Kling must not persist output') }), { providerFactory: () => ({ persistOutput: false, query: async () => ({ status: 'succeeded', raw, outputUrl: raw.works[0].url }) }), fetcher: () => assert.fail('Kling must not download output') });
+  assert.deepEqual(JSON.parse(result.resultJson), raw); assert.equal(result.status, 'succeeded'); assert.equal(db.taskOutputs.length, 0);
+});
+
+test('polling preserves safe ProviderError codes without exposing supplier error text', async () => {
+  for (const code of ['provider_auth_failed', 'provider_not_configured', 'provider_unavailable', 'invalid_response']) {
+    const db = new TaskDb(); const task = minimaxPollingTask(db);
+    await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ query: async () => { const error = new ProviderError(code); error.message = 'raw supplier secret'; throw error; } }) }), (error) => {
+      assert.equal(error.code, code); assert.ok(error instanceof taskApi.TaskError); assert.equal(error.status, 503); assert.equal(error.message, '任务状态暂不可用'); return true;
+    });
+    assert.equal(task.status, 'queued');
+  }
+});
+
+test('definitive MiniMax create errors fail the task with useful safe Chinese messages and codes', async () => {
+  const cases = {
+    provider_not_configured: '请配置 MiniMax API Key',
+    provider_auth_failed: 'MiniMax 认证失败，请检查服务端配置',
+    insufficient_balance: 'MiniMax 额度不足，请前往控制台查看',
+    invalid_parameters: 'MiniMax 生成参数或参考图无效',
+    provider_unavailable: 'MiniMax 暂不可用，请稍后重试',
+  };
+  for (const [code, message] of Object.entries(cases)) {
+    const db = new TaskDb(); db.projects[0].video_provider = 'minimax';
+    await assert.rejects(() => submitTask(input, taskEnv(db), `minimax-create-${code}`, { providerFactory: () => ({ id: 'minimax', capabilities: async () => capabilities, create: async () => { const error = new ProviderError(code, { definitive: true, submissionState: 'failed' }); error.message = 'raw supplier secret'; throw error; } }) }), (error) => {
+      assert.ok(error instanceof taskApi.TaskError); assert.equal(error.message, message); assert.equal(error.code, code); assert.equal(error.task.status, 'failed'); return true;
+    });
+    assert.equal(db.tasks[0].status, 'failed');
+  }
+});
+
+test('ambiguous MiniMax submission preserves the safe error code and remains unknown', async () => {
+  const db = new TaskDb(); db.projects[0].video_provider = 'minimax';
+  await assert.rejects(() => submitTask(input, taskEnv(db), 'minimax-create-unknown', { providerFactory: () => ({ id: 'minimax', capabilities: async () => capabilities, create: async () => { throw new ProviderError('provider_unavailable', { submissionState: 'unknown' }); } }) }), (error) => error.code === 'provider_unavailable' && error.task.status === 'unknown');
+});
+
+test('provider construction and capability errors preserve safe codes through TaskError', async () => {
+  for (const phase of ['factory', 'capabilities']) {
+    const db = new TaskDb(); db.projects[0].video_provider = 'minimax';
+    const fail = () => { throw new ProviderError('provider_not_configured'); };
+    const options = { providerFactory: phase === 'factory' ? fail : () => ({ id: 'minimax', capabilities: fail }) };
+    await assert.rejects(() => submitTask(input, taskEnv(db), `configuration-${phase}`, options), (error) => error instanceof taskApi.TaskError && error.code === 'provider_not_configured' && error.status === 503);
+    assert.equal(db.tasks.length, 0);
+  }
+});
+
+test('polling drops unrecognized supplier codes instead of exposing raw supplier text', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db);
+  await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db), { providerFactory: () => ({ query: async () => { const error = new Error('secret supplier message'); error.code = 'https://supplier.test/private?secret=token'; throw error; } }) }), (error) => error.code === undefined && error.message === '任务状态暂不可用');
+});
+
+test('MiniMax output database insertion failure never reports success and can retry', async () => {
+  const db = new TaskDb(); const task = minimaxPollingTask(db, 'generating'); db.failOutputInsert = true;
+  const media = { put: async (_key, body) => ({ size: (await new Response(body).arrayBuffer()).byteLength }) };
+  const options = { providerFactory: () => ({ persistOutput: true, query: async () => miniMaxQueryResult }), fetcher: async () => new Response('video', { headers: { 'content-type': 'video/mp4' } }) };
+  await assert.rejects(() => getTaskStatus(task.id, 'project-1', taskEnv(db, media), options), { status: 503, code: 'output_persist_failed' });
+  assert.equal(task.status, 'generating'); assert.equal(db.taskOutputs.length, 0);
+  db.failOutputInsert = false;
+  const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), options);
+  assert.equal(result.status, 'succeeded'); assert.equal(db.taskOutputs.length, 1);
 });

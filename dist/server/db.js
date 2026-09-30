@@ -7,6 +7,7 @@ const statements = [
   'CREATE TABLE IF NOT EXISTS oauth_tokens (encrypted_token TEXT NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS video_tasks (id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE NOT NULL, remote_id TEXT, mode TEXT NOT NULL, status TEXT NOT NULL, request_json TEXT NOT NULL, result_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)',
   'CREATE INDEX IF NOT EXISTS idx_video_tasks_remote ON video_tasks(remote_id)',
+  'CREATE TABLE IF NOT EXISTS task_outputs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, object_key TEXT NOT NULL UNIQUE, content_type TEXT NOT NULL, byte_size INTEGER, created_at INTEGER NOT NULL, FOREIGN KEY (task_id) REFERENCES video_tasks(id) ON DELETE CASCADE)',
   'CREATE TABLE IF NOT EXISTS stored_objects (id TEXT PRIMARY KEY, object_key TEXT UNIQUE NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS project_assets (project_id TEXT NOT NULL, object_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, PRIMARY KEY (project_id, object_id))',
@@ -20,11 +21,17 @@ const statements = [
 
 let initialized = false;
 
+async function addColumn(db, sql) {
+  try { await db.prepare(sql).run(); }
+  catch (error) { if (!/duplicate column name/i.test(String(error?.message))) throw error; }
+}
+
 export async function ensureSchema(db) {
   if (initialized) return;
   if (typeof db.batch === 'function') await db.batch(statements.map((sql) => db.prepare(sql)));
   else for (const sql of statements) await db.prepare(sql).run();
-  try { await db.prepare('ALTER TABLE stored_objects ADD COLUMN filename TEXT').run(); }
-  catch (error) { if (!/duplicate column name/i.test(String(error?.message))) throw error; }
+  await addColumn(db, 'ALTER TABLE stored_objects ADD COLUMN filename TEXT');
+  await addColumn(db, "ALTER TABLE projects ADD COLUMN video_provider TEXT NOT NULL DEFAULT 'kling'");
+  await addColumn(db, "ALTER TABLE video_tasks ADD COLUMN provider TEXT NOT NULL DEFAULT 'kling'");
   initialized = true;
 }
