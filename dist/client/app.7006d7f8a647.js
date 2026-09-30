@@ -31,7 +31,7 @@ export function aspectRatioControl(provider, mode) {
 export function providerAccountView(provider, status = {}) {
   const online = status.connection === 'online';
   if (provider === 'minimax') return {
-    online, canGenerate: online, label: status.label || (online ? 'MiniMax 已连接' : 'MiniMax 暂不可用'),
+    online, canGenerate: !['checking', 'insufficient_balance'].includes(status.connection), label: status.label || (online ? 'MiniMax 已连接' : 'MiniMax 暂不可用'),
     membership: '', balance: status.balanceLabel ?? '额度：暂不可用',
   };
   return {
@@ -43,7 +43,7 @@ export function providerAccountView(provider, status = {}) {
 export function applySubmissionProviderFailure(provider, error, apply) {
   if (provider !== 'minimax' || error?.code !== 'insufficient_balance') return false;
   apply({
-    connection: 'offline',
+    connection: 'insufficient_balance',
     label: 'MiniMax 额度不足',
     balanceLabel: '额度：不足，请前往 MiniMax 控制台查看',
   }, provider);
@@ -557,7 +557,7 @@ export function optionsForModel(capabilities, mode, modelId) {
 export function validateWorkspace(value, provider = 'kling') {
   const errors = {};
   if (!value.projectId) errors.projectId = '请先选择项目';
-  if (!value.model) errors.model = '请选择模型';
+  if (!value.model && provider !== 'minimax') errors.model = '请选择模型';
   if ((value.mode === 'text' || (value.mode === 'image' && provider === 'minimax')) && !value.prompt?.trim()) errors.prompt = '请输入视频提示词';
   if (value.mode === 'image' && !value.uploadId) errors.uploadId = '请上传首帧参考图';
   return errors;
