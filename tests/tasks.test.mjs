@@ -944,11 +944,12 @@ const miniMaxQueryResult = { status: 'succeeded', raw: { id: 'minimax-remote', s
 
 test('MiniMax succeeds only after output persistence and exposes the internal playback URL', async () => {
   const db = new TaskDb(); const task = minimaxPollingTask(db); const media = new RecoveryMedia();
-  let factories = 0; let downloads = 0;
+  let factories = 0; let downloads = 0; let storedKey;
   media.put = async (key, body, options) => {
     assert.equal(task.status, 'queued', 'success must wait for R2');
     assert.equal(db.taskOutputs.length, 0);
-    assert.equal(key, 'outputs/minimax-poll.mp4');
+    assert.match(key, /^outputs\/minimax-poll\/[0-9a-f-]{36}\.mp4$/);
+    storedKey = key;
     assert.ok(body instanceof ReadableStream);
     assert.equal(options.httpMetadata.contentType, 'video/mp4');
     return { size: (await new Response(body).arrayBuffer()).byteLength };
@@ -960,6 +961,7 @@ test('MiniMax succeeds only after output persistence and exposes the internal pl
   const result = await getTaskStatus(task.id, 'project-1', taskEnv(db, media), options);
   assert.equal(factories, 1); assert.equal(downloads, 1);
   assert.equal(db.taskOutputs.length, 1);
+  assert.equal(db.taskOutputs[0].object_key, storedKey);
   assert.equal(task.status, 'succeeded');
   assert.deepEqual(JSON.parse(result.resultJson), { providerResult: miniMaxQueryResult.raw, videoUrl: '/api/projects/project-1/tasks/minimax-poll/output' });
   assert.equal(task.result_json, result.resultJson);

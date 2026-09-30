@@ -73,7 +73,7 @@ function limitedVideoBody(body, maxBytes) {
     },
     cancel(reason) { return reader.cancel(reason); },
   }, { highWaterMark: 0 });
-  return { stream, complete: () => completed, exceeded: () => exceeded, cancel: () => reader.cancel().catch(() => {}) };
+  return { stream, complete: () => completed, exceeded: () => exceeded, bytes: () => size, cancel: () => reader.cancel().catch(() => {}) };
 }
 
 async function ownedOutput(db, taskId, projectId) {
@@ -84,8 +84,9 @@ async function ownedOutput(db, taskId, projectId) {
 
 async function cleanupIncompleteOutput(env, taskId, projectId, objectKey) {
   try {
-    if (!await ownedOutput(env.DB, taskId, projectId)) await env.MEDIA.delete(objectKey);
-  } catch { /* Preserve a concurrent winner when ownership cannot be checked. */ }
+    const winner = await ownedOutput(env.DB, taskId, projectId);
+    if (winner?.object_key !== objectKey) await env.MEDIA.delete(objectKey);
+  } catch { /* Preserve a winning object when ownership cannot be checked. */ }
 }
 
 export async function persistTaskOutput({ taskId, projectId, sourceUrl, env, fetcher = fetch, now = Date.now, idFactory = () => crypto.randomUUID(), maxBytes = MAX_VIDEO_BYTES }) {
@@ -101,16 +102,17 @@ export async function persistTaskOutput({ taskId, projectId, sourceUrl, env, fet
     if (typeof sourceUrl !== 'string' || !httpsUrl(sourceUrl)) throw new OutputError('任务输出参数无效', 400);
 
     const response = await fetcher(sourceUrl, { redirect: 'follow' });
-    const { contentType, byteSize } = videoMetadata(response, httpsUrl(sourceUrl), sizeLimit);
+    const { contentType } = videoMetadata(response, httpsUrl(sourceUrl), sizeLimit);
     monitored = limitedVideoBody(response.body, sizeLimit);
-    objectKey = `outputs/${taskId}.mp4`;
-    const stored = await env.MEDIA.put(objectKey, monitored.stream, { httpMetadata: { contentType } });
-    if (!monitored.complete() || monitored.exceeded() || (Number.isSafeInteger(stored?.size) && stored.size > sizeLimit)) throw persistenceError();
-    const storedSize = Number.isSafeInteger(stored?.size) && stored.size >= 0 && stored.size <= MAX_VIDEO_BYTES ? stored.size : null;
+    const outputId = idFactory();
+    objectKey = `outputs/${taskId}/${outputId}.mp4`;
+    await env.MEDIA.put(objectKey, monitored.stream, { httpMetadata: { contentType } });
+    if (!monitored.complete() || monitored.exceeded()) throw persistenceError();
     await env.DB.prepare('INSERT OR IGNORE INTO task_outputs (id, task_id, object_key, content_type, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .bind(idFactory(), taskId, objectKey, contentType, byteSize ?? storedSize, now()).run();
-    // A concurrent poll may have inserted first. Keep that winning row and object.
-    if (!await ownedOutput(env.DB, taskId, projectId)) throw persistenceError();
+      .bind(outputId, taskId, objectKey, contentType, monitored.bytes(), now()).run();
+    const winner = await ownedOutput(env.DB, taskId, projectId);
+    if (!winner) throw persistenceError();
+    if (winner.object_key !== objectKey) await env.MEDIA.delete(objectKey);
     return outputUrl(projectId, taskId);
   } catch (error) {
     if (monitored) await monitored.cancel();
