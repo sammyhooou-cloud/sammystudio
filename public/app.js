@@ -14,6 +14,75 @@ export function selectCurrentProject(projects, savedId) {
   return projects.find(({ id }) => id === savedId) || projects[0] || null;
 }
 
+export function normalizeWorkspaceProvider(value) {
+  return value === 'minimax' ? 'minimax' : 'kling';
+}
+
+export function providerStatusPath(provider) {
+  return `/api/video/providers/${normalizeWorkspaceProvider(provider)}/status`;
+}
+
+export function aspectRatioControl(provider, mode) {
+  return provider === 'minimax' && mode === 'image'
+    ? { disabled: true, label: '跟随参考图', value: 'adaptive' }
+    : { disabled: false, label: '画幅', value: '' };
+}
+
+export function providerAccountView(provider, status = {}) {
+  const online = status.connection === 'online';
+  if (provider === 'minimax') return {
+    online, canGenerate: online, label: status.label || (online ? 'MiniMax 已连接' : 'MiniMax 暂不可用'),
+    membership: '', balance: status.balanceLabel ?? '额度：暂不可用',
+  };
+  return {
+    online, canGenerate: status.connection !== 'checking', label: status.connection === 'checking' ? '正在检测' : online ? 'MCP 在线' : 'MCP 未连接',
+    membership: status.membership ?? '—', balance: status.credits ?? '暂不可用',
+  };
+}
+
+export function isCurrentProviderRequest(activeProjectId, requestedProjectId, sequence, latestSequence, activeProvider, requestedProvider) {
+  return Boolean(requestedProjectId) && activeProjectId === requestedProjectId && sequence === latestSequence
+    && (requestedProvider === undefined || activeProvider === requestedProvider);
+}
+
+export async function performProviderChange({ projectId, provider, patch, isCurrent, setBusy, commit, loadStatus, fail = () => {} }) {
+  setBusy(true);
+  try {
+    const result = await patch();
+    if (!isCurrent()) return false;
+    if (result?.id !== projectId || result?.videoProvider !== provider) throw new Error('供应商切换响应无效');
+    commit(provider);
+    loadStatus(provider);
+    return true;
+  } catch (error) {
+    if (isCurrent()) fail(error);
+    return false;
+  } finally {
+    if (isCurrent()) setBusy(false);
+  }
+}
+
+export function createProviderStatusLoader({ load, isCurrent, apply, setChecking = () => {}, fail = () => {} }) {
+  let sequence = 0;
+  return {
+    invalidate() { sequence += 1; },
+    async refresh(projectId, provider) {
+      const requestSequence = ++sequence;
+      setChecking(provider);
+      const current = () => requestSequence === sequence && isCurrent(projectId, provider);
+      try {
+        const status = await load(provider);
+        if (!current()) return false;
+        apply(status, provider);
+        return true;
+      } catch (error) {
+        if (current()) fail(error, provider);
+        return false;
+      }
+    },
+  };
+}
+
 export function selectInitialProject(projects, savedId, search = '') {
   const requestedId = new URLSearchParams(search).get('project');
   return selectCurrentProject(projects, projects.some(({ id }) => id === requestedId) ? requestedId : savedId);
@@ -447,8 +516,8 @@ function setup() {
   const resolution = document.querySelector('#resolution');
   const duration = document.querySelector('#duration');
   const ratio = document.querySelector('#aspect-ratio');
-  let mode = 'text', capabilities = {}, projects = [], imageCount = 1, projectTasks = [];
-  let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, projectEpoch = 0;
+  let mode = 'text', provider = 'kling', providerConnection = 'checking', capabilities = {}, projects = [], imageCount = 1, projectTasks = [];
+  let drawerOpen = false, workspaceLoadSequence = 0, generationSequence = 0, projectSwitchBusy = false, providerSwitchBusy = false, providerChangeSequence = 0, projectEpoch = 0;
   const drafts = createProjectDrafts();
   const attempts = createSubmissionAttemptController(undefined, attemptStorage());
   let selectedTaskId = '', submittingWithoutTask = false, stageOverride = null;
@@ -480,7 +549,8 @@ function setup() {
   const retryWorkspace = document.querySelector('#workspace-retry');
 
   function updateSubmitDisabled() {
-    document.querySelector('#generate').disabled = projectSwitchBusy || attempts.inFlight || (mode === 'image' && !uploadController.canSubmit);
+    document.querySelector('#generate').disabled = projectSwitchBusy || providerSwitchBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate || (mode === 'image' && !uploadController.canSubmit);
+    document.querySelectorAll('[data-provider]').forEach((button) => { button.disabled = projectSwitchBusy || providerSwitchBusy || attempts.inFlight; });
   }
 
   function draftSnapshot() {
@@ -521,12 +591,16 @@ function setup() {
     } catch { /* Absence or temporary lookup failure keeps the stable key for explicit retry. */ }
   }
 
-  function setProjectSwitchBusy(busy) {
-    projectSwitchBusy = busy;
+  function syncFormBusy() {
+    const busy = projectSwitchBusy || providerSwitchBusy;
     generator.setAttribute('aria-busy', String(busy));
     [...generator.elements].forEach((control) => { control.disabled = busy; });
+    ratio.disabled = busy || aspectRatioControl(provider, mode).disabled;
     updateSubmitDisabled();
   }
+
+  function setProjectSwitchBusy(busy) { projectSwitchBusy = busy; syncFormBusy(); }
+  function setProviderSwitchBusy(busy) { providerSwitchBusy = busy; syncFormBusy(); }
 
   function projectStorage() {
     try { return window.localStorage; } catch { return null; }
@@ -589,9 +663,15 @@ function setup() {
     document.querySelector('#rename-project-mobile').disabled = !current;
   }
 
-  function applyWorkspace(workspaceState) {
-    const pendingSettings = pendingWorkspaceSettings(attempts, currentProjectId, workspaceState?.assets, capabilities);
-    const settings = pendingSettings || drafts.load(currentProjectId, workspaceState?.settings || {});
+  function renderProviderButtons() {
+    document.querySelectorAll('[data-provider]').forEach((button) => {
+      const active = button.dataset.provider === provider;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  }
+
+  function renderFormSettings(settings) {
     const state = workspaceFormState(capabilities, mode, settings);
     mode = state.mode;
     document.querySelectorAll('[data-mode]').forEach((button) => {
@@ -608,15 +688,30 @@ function setup() {
     duration.value = state.duration;
     ratio.value = state.aspectRatio;
     imageCount = state.imageCount;
+    updateAspectRatioControl();
+    updateSubmitDisabled();
+  }
+
+  function applyWorkspace(workspaceState) {
+    provider = normalizeWorkspaceProvider(workspaceState?.project?.videoProvider);
+    providerConnection = 'checking';
+    statusLoader.invalidate();
+    capabilities = {};
+    renderProviderButtons();
+    const pending = attempts.pendingForProject(currentProjectId);
+    const settings = pending?.payload || drafts.load(currentProjectId, workspaceState?.settings || {});
+    drafts.save(currentProjectId, settings);
+    renderFormSettings(settings);
     const restoredImage = workspaceImageState(currentProjectId, settings, workspaceState?.assets);
     if (restoredImage && mode === 'image') uploadController.restore(restoredImage.asset, restoredImage.url);
-    else clearImage();
+    else { imageInput.value = ''; uploadController.remove(); }
     projectTasks = Array.isArray(workspaceState?.tasks) ? workspaceState.tasks : [];
     selectedTaskId = '';
     submittingWithoutTask = false;
     stageOverride = null;
     renderTasks();
     renderPendingAttemptState();
+    void refreshStatus();
   }
 
   function renderTasks() {
@@ -712,6 +807,8 @@ function setup() {
       });
       return;
     }
+    providerChangeSequence += 1;
+    setProviderSwitchBusy(false);
     const sequence = ++workspaceLoadSequence;
     saveDraft();
     projectError.textContent = '正在加载项目…';
@@ -764,31 +861,47 @@ function setup() {
     } else projectError.textContent = '暂无可用项目';
   }
 
-  const fill = (select, values) => { select.innerHTML = values.map((value) => `<option value="${value}">${value}${select === duration ? ' 秒' : ''}</option>`).join(''); };
-  function updateOptions() { const values = optionsForModel(capabilities, mode, modelSelect.value); fill(resolution, values.resolutions); fill(duration, values.durations); fill(ratio, values.aspectRatios); }
+  const fill = (select, values) => { select.innerHTML = values.map((value) => `<option value="${value}">${value === 'adaptive' ? '跟随参考图' : `${value}${select === duration ? ' 秒' : ''}`}</option>`).join(''); };
+  function updateAspectRatioControl() {
+    const control = aspectRatioControl(provider, mode);
+    document.querySelector('#aspect-ratio-label').textContent = control.label;
+    ratio.disabled = projectSwitchBusy || providerSwitchBusy || control.disabled;
+    if (control.disabled) ratio.value = control.value;
+  }
+  function updateOptions() { const values = optionsForModel(capabilities, mode, modelSelect.value); fill(resolution, values.resolutions); fill(duration, values.durations); fill(ratio, values.aspectRatios); updateAspectRatioControl(); }
   function fillModels() { const group = mode === 'text' ? capabilities.text_to_video : capabilities.image_to_video; modelSelect.innerHTML = (group?.models || []).map((item) => `<option value="${item.model}">${item.alias?.split(',')[0] || item.model}</option>`).join(''); updateOptions(); }
 
-  async function refreshStatus() {
-    statusText.textContent = '正在检测';
-    const priorSettings = draftSnapshot();
-    const status = await request('/api/kling/status'); capabilities = status.models || {};
-    const online = status.connection === 'online'; statusLight.classList.toggle('online', online); statusText.textContent = online ? 'MCP 在线' : 'MCP 未连接';
-    document.querySelector('#membership').textContent = status.membership ?? '—'; document.querySelector('#credits').textContent = status.credits ?? '暂不可用'; document.querySelector('#last-check').textContent = `最后检查 ${new Date(status.checkedAt).toLocaleTimeString()}`;
-    fillModels();
-    const restored = workspaceFormState(capabilities, mode, priorSettings);
-    modelSelect.value = restored.model; updateOptions();
-    resolution.value = restored.resolution; duration.value = restored.duration; ratio.value = restored.aspectRatio;
-    if (!online) statusText.parentElement.onclick = () => { location.href = '/api/kling/oauth/start'; };
+  function applyAccountStatus(status, selectedProvider) {
+    const view = providerAccountView(selectedProvider, status);
+    providerConnection = status.connection;
+    statusLight.classList.toggle('online', view.online);
+    statusText.textContent = view.label;
+    document.querySelector('#membership-field').hidden = selectedProvider === 'minimax';
+    document.querySelector('#balance-title').textContent = selectedProvider === 'minimax' ? '额度' : '点数余额';
+    document.querySelector('#membership').textContent = view.membership;
+    document.querySelector('#credits').textContent = view.balance;
+    document.querySelector('#last-check').textContent = status.checkedAt ? `最后检查 ${new Date(status.checkedAt).toLocaleTimeString()}` : '状态由当前生成服务提供';
+    statusText.parentElement.onclick = selectedProvider === 'kling' && !view.online ? () => { location.href = '/api/kling/oauth/start'; } : null;
+    updateSubmitDisabled();
   }
-  function applyAccountStatus(status) {
-    const online = status.connection === 'online';
-    statusLight.classList.toggle('online', online); statusText.textContent = online ? 'MCP 在线' : 'MCP 未连接';
-    document.querySelector('#membership').textContent = status.membership ?? '—';
-    document.querySelector('#credits').textContent = status.credits ?? '暂不可用';
-    document.querySelector('#last-check').textContent = `最后检查 ${new Date(status.checkedAt).toLocaleTimeString()}`;
+  const statusLoader = createProviderStatusLoader({
+    load: (selectedProvider) => request(providerStatusPath(selectedProvider)),
+    isCurrent: (projectId, selectedProvider) => currentProjectId === projectId && provider === selectedProvider,
+    setChecking: (selectedProvider) => applyAccountStatus({ connection: 'checking', label: '正在检测' }, selectedProvider),
+    apply: (status, selectedProvider) => {
+      capabilities = status.models || {};
+      applyAccountStatus(status, selectedProvider);
+      const settings = pendingWorkspaceSettings(attempts, currentProjectId, [], capabilities) || drafts.load(currentProjectId, draftSnapshot());
+      renderFormSettings(settings);
+      saveDraft();
+    },
+    fail: (_error, selectedProvider) => applyAccountStatus({ connection: 'offline', label: selectedProvider === 'minimax' ? 'MiniMax 暂不可用' : 'MCP 未连接' }, selectedProvider),
+  });
+  function refreshStatus() {
+    if (!currentProjectId) return Promise.resolve(false);
+    return statusLoader.refresh(currentProjectId, provider);
   }
   const loadWorkspaceEntry = createRetryableLoader(async () => {
-    await refreshStatus();
     await loadProjects();
   });
   async function loadWorkspace() {
@@ -796,7 +909,30 @@ function setup() {
     try { await loadWorkspaceEntry(); }
     catch (error) { projectError.textContent = `工作台加载失败：${error.message}`; retryWorkspace.hidden = false; throw error; }
   }
-  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); document.querySelector('#upload-field').hidden = mode !== 'image'; updateSubmitDisabled(); fillModels(); saveDraft(); });
+  document.querySelectorAll('[data-provider]').forEach((button) => button.onclick = async () => {
+    if (!currentProjectId || projectSwitchBusy || providerSwitchBusy || attempts.inFlight || button.dataset.provider === provider) return;
+    saveDraft();
+    const projectId = currentProjectId;
+    const sequence = ++providerChangeSequence;
+    const requestedProvider = button.dataset.provider;
+    await performProviderChange({
+      projectId, provider: requestedProvider, sequence,
+      patch: () => request(`/api/projects/${encodeURIComponent(projectId)}/provider`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: requestedProvider }) }),
+      isCurrent: () => isCurrentProviderRequest(currentProjectId, projectId, sequence, providerChangeSequence),
+      setBusy: setProviderSwitchBusy,
+      commit: (confirmedProvider) => {
+        provider = confirmedProvider;
+        providerConnection = 'checking';
+        capabilities = {};
+        projects = projects.map((item) => item.id === projectId ? { ...item, videoProvider: confirmedProvider } : item);
+        renderProviderButtons();
+        statusLoader.invalidate();
+      },
+      loadStatus: () => { void refreshStatus(); },
+      fail: (error) => { document.querySelector('#form-error').textContent = error.message; },
+    });
+  });
+  document.querySelectorAll('[data-mode]').forEach((button) => button.onclick = () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); document.querySelector('#upload-field').hidden = mode !== 'image'; fillModels(); updateSubmitDisabled(); saveDraft(); });
   modelSelect.onchange = () => { updateOptions(); saveDraft(); };
   generator.addEventListener('input', saveDraft);
   generator.addEventListener('change', saveDraft);
@@ -853,7 +989,7 @@ function setup() {
   };
   generator.onsubmit = async (event) => {
     event.preventDefault();
-    if (projectSwitchBusy || attempts.inFlight) return;
+    if (projectSwitchBusy || providerSwitchBusy || attempts.inFlight || !providerAccountView(provider, { connection: providerConnection }).canGenerate) return;
     const submittedProjectId = currentProjectId;
     const payload = buildGenerationPayload({ projectId: submittedProjectId, mode, uploadId: uploadController.uploadId, model: modelSelect.value, prompt: document.querySelector('#prompt').value, resolution: resolution.value, duration: duration.value, aspectRatio: ratio.value, imageCount });
     const pending = attempts.pendingForProject(submittedProjectId);
@@ -884,7 +1020,7 @@ function setup() {
         stageOverride = null;
         renderTasks();
         renderPendingAttemptState();
-        void refreshAccountSnapshot({ load: () => request('/api/kling/status'), isCurrent: submissionIsCurrent, apply: applyAccountStatus }).catch(() => {});
+        if (submissionIsCurrent()) void refreshStatus();
       }
     } catch (error) {
       attempts.settle(attempt, error.task?.status === 'failed' || [400, 403, 404, 422].includes(error.status));

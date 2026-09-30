@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   normalizeTaskStatus,
   parseTaskRequest,
@@ -46,6 +47,149 @@ import {
   shouldSaveStaleUpload,
   sidebarShouldBeInert,
 } from '../public/app.js';
+
+test('workspace provider defaults to Kling and MiniMax image ratio follows its reference image', () => {
+  const { normalizeWorkspaceProvider, aspectRatioControl } = stageHelpers;
+  assert.equal(normalizeWorkspaceProvider('minimax'), 'minimax');
+  assert.equal(normalizeWorkspaceProvider('bad'), 'kling');
+  assert.deepEqual(aspectRatioControl('minimax', 'image'), { disabled: true, label: '跟随参考图', value: 'adaptive' });
+  assert.deepEqual(aspectRatioControl('kling', 'image'), { disabled: false, label: '画幅', value: '' });
+  assert.equal(buildGenerationPayload({ projectId: 'a', provider: 'minimax' }).provider, undefined);
+});
+
+test('provider account view uses server balance labels and only online is green', () => {
+  const { providerAccountView } = stageHelpers;
+  for (const connection of ['unconfigured', 'offline', 'auth_error']) {
+    const state = providerAccountView('minimax', { connection, label: 'MiniMax 不可用', balanceLabel: '额度：控制台查看' });
+    assert.equal(state.online, false);
+    assert.equal(state.canGenerate, false);
+    assert.equal(state.balance, '额度：控制台查看');
+  }
+  assert.equal(providerAccountView('minimax', { connection: 'online', label: 'MiniMax 已连接', balanceLabel: '额度：控制台查看' }).canGenerate, true);
+  const kling = providerAccountView('kling', { connection: 'online', membership: 'Pro', credits: 25 });
+  assert.equal(kling.online, true);
+  assert.equal(kling.membership, 'Pro');
+  assert.equal(kling.balance, 25);
+  assert.deepEqual(
+    [providerAccountView('kling', { connection: 'checking' }).canGenerate, providerAccountView('kling', { connection: 'checking' }).label],
+    [false, '正在检测'],
+  );
+});
+
+test('new provider capabilities replace invalid values with the new model defaults', () => {
+  const minimax = {
+    text_to_video: { models: [{ model: 'MiniMax-H3', arguments: [
+      { name: 'resolution', allowedValues: ['768P'] }, { name: 'duration', allowedValues: ['4'] }, { name: 'aspect_ratio', allowedValues: ['21:9'] },
+    ] }] },
+    image_to_video: { models: [{ model: 'MiniMax-H3', arguments: [
+      { name: 'resolution', allowedValues: ['768P'] }, { name: 'duration', allowedValues: ['4'] }, { name: 'aspect_ratio', allowedValues: ['adaptive'] },
+    ] }] },
+  };
+  const previous = { mode: 'image', prompt: 'clouds', model: 'image-pro', resolution: '1080p', duration: '5', aspectRatio: '1:1' };
+  assert.deepEqual(workspaceFormState(minimax, 'image', previous), {
+    mode: 'image', prompt: 'clouds', model: 'MiniMax-H3', resolution: '768P', duration: '4', aspectRatio: 'adaptive', imageCount: 1,
+  });
+});
+
+test('provider change ignores a late PATCH after project selection changes', async () => {
+  const { performProviderChange, isCurrentProviderRequest } = stageHelpers;
+  let finishPatch;
+  const pendingPatch = new Promise((resolve) => { finishPatch = resolve; });
+  const events = [];
+  let activeProjectId = 'a';
+  let latestSequence = 1;
+  const requestSequence = 1;
+  const changing = performProviderChange({
+    projectId: 'a', provider: 'minimax', sequence: requestSequence,
+    patch: () => pendingPatch,
+    isCurrent: () => isCurrentProviderRequest(activeProjectId, 'a', requestSequence, latestSequence),
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    commit: () => events.push('commit'),
+    loadStatus: () => events.push('status'),
+  });
+  activeProjectId = 'b';
+  latestSequence += 1;
+  finishPatch({ id: 'a', videoProvider: 'minimax' });
+  assert.equal(await changing, false);
+  assert.deepEqual(events, ['busy:true']);
+  assert.equal(isCurrentProviderRequest('a', 'a', 1, latestSequence), false);
+});
+
+test('provider change commits only the confirmed project value before loading its status', async () => {
+  const { performProviderChange } = stageHelpers;
+  const events = [];
+  const changed = await performProviderChange({
+    projectId: 'a', provider: 'minimax',
+    patch: async () => { events.push('patch'); return { id: 'a', videoProvider: 'minimax' }; },
+    isCurrent: () => true,
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    commit: (provider) => events.push(`commit:${provider}`),
+    loadStatus: (provider) => events.push(`status:${provider}`),
+  });
+  assert.equal(changed, true);
+  assert.deepEqual(events, ['busy:true', 'patch', 'commit:minimax', 'status:minimax', 'busy:false']);
+});
+
+test('provider change rejects a response for another project', async () => {
+  const events = [];
+  const changed = await stageHelpers.performProviderChange({
+    projectId: 'a', provider: 'minimax',
+    patch: async () => ({ id: 'b', videoProvider: 'minimax' }),
+    isCurrent: () => true,
+    setBusy: (busy) => events.push(`busy:${busy}`),
+    commit: () => events.push('commit'),
+    loadStatus: () => events.push('status'),
+    fail: () => events.push('error'),
+  });
+  assert.equal(changed, false);
+  assert.deepEqual(events, ['busy:true', 'error', 'busy:false']);
+});
+
+test('status request guards project, provider, and sequence', () => {
+  const { isCurrentProviderRequest } = stageHelpers;
+  assert.equal(isCurrentProviderRequest('a', 'a', 2, 2, 'minimax', 'minimax'), true);
+  assert.equal(isCurrentProviderRequest('b', 'a', 2, 2, 'minimax', 'minimax'), false);
+  assert.equal(isCurrentProviderRequest('a', 'a', 1, 2, 'minimax', 'minimax'), false);
+  assert.equal(isCurrentProviderRequest('a', 'a', 2, 2, 'kling', 'minimax'), false);
+});
+
+test('provider status requests use only the selected unified route', () => {
+  assert.equal(stageHelpers.providerStatusPath('minimax'), '/api/video/providers/minimax/status');
+  assert.equal(stageHelpers.providerStatusPath('kling'), '/api/video/providers/kling/status');
+});
+
+test('workspace provides an accessible project provider control above generation modes', () => {
+  const html = readFileSync(new URL('../public/workspace.html', import.meta.url), 'utf8');
+  const provider = html.indexOf('class="provider-switch"');
+  const modes = html.indexOf('class="mode-tabs"');
+  assert.ok(provider > 0 && provider < modes);
+  assert.match(html, /<fieldset class="provider-switch" aria-label="视频生成服务">/);
+  assert.match(html, /data-provider="kling"[^>]*aria-pressed="true"/);
+  assert.match(html, /data-provider="minimax"[^>]*aria-pressed="false"/);
+});
+
+test('a delayed provider status cannot overwrite a newer provider or project', async () => {
+  const { createProviderStatusLoader } = stageHelpers;
+  let finishOld;
+  const oldStatus = new Promise((resolve) => { finishOld = resolve; });
+  const events = [];
+  let activeProject = 'a';
+  let activeProvider = 'kling';
+  const loader = createProviderStatusLoader({
+    load: (provider) => provider === 'kling' ? oldStatus : Promise.resolve({ connection: 'online', label: 'MiniMax 已连接' }),
+    isCurrent: (projectId, provider) => activeProject === projectId && activeProvider === provider,
+    apply: (status, provider) => events.push(`${provider}:${status.label}`),
+  });
+  const stale = loader.refresh('a', 'kling');
+  activeProvider = 'minimax';
+  assert.equal(await loader.refresh('a', 'minimax'), true);
+  finishOld({ connection: 'online', label: 'MCP 在线' });
+  assert.equal(await stale, false);
+  assert.deepEqual(events, ['minimax:MiniMax 已连接']);
+  activeProject = 'b';
+  loader.invalidate();
+  assert.deepEqual(events, ['minimax:MiniMax 已连接']);
+});
 
 test('result routes decode exact project and task segments', () => {
   assert.deepEqual(parseResultRoute('/projects/project%20a/results/task%2F1'), { projectId: 'project a', taskId: 'task/1' });

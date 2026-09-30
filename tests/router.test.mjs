@@ -591,11 +591,11 @@ test('attempt lookup finds only the owned task by stable key without a paid tool
   assert.equal(anonymous.status, 401);
 });
 
-function taskRequest(projectId, idempotencyKey = 'shared-key') {
+function taskRequest(projectId, idempotencyKey = 'shared-key', extra = {}) {
   return new Request('https://site.test/api/video/tasks', {
     method: 'POST',
     headers: { ...sessionHeaders, 'idempotency-key': idempotencyKey },
-    body: JSON.stringify({ projectId, mode: 'text', model: 'kling-v1', prompt: 'ocean', duration: 5, resolution: '720p', aspectRatio: '16:9' }),
+    body: JSON.stringify({ projectId, mode: 'text', model: 'kling-v1', prompt: 'ocean', duration: 5, resolution: '720p', aspectRatio: '16:9', ...extra }),
   });
 }
 
@@ -898,7 +898,7 @@ test('fresh task still checks status and rejects an offline MCP connection', asy
 
 test('fresh task resolves the project provider before checking Kling status', async () => {
   const db = new TaskRouteDb(); db.projects[0].video_provider = 'unknown';
-  const response = await worker.fetch(taskRequest('project-1', 'unknown-provider'), { DB: db }, {});
+  const response = await worker.fetch(taskRequest('project-1', 'unknown-provider', { provider: 'kling' }), { DB: db }, {});
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: '视频供应商无效' });
   assert.equal(db.statusQueries, 0);
