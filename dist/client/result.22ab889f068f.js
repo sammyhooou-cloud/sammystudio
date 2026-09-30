@@ -1,4 +1,4 @@
-import { normalizeTaskStatus, parseTaskRequest, parseTaskResult, safeVideoUrl, taskProgress } from './task-presenter.d0a03b080cd6.js';
+import { normalizeTaskStatus, parseTaskRequest, parseTaskResult, safeVideoUrl, taskProgress, taskProviderLabel } from './task-presenter.fd8b022d90ea.js';
 
 export function parseResultRoute(pathname) {
   if (typeof pathname !== 'string') return null;
@@ -101,7 +101,7 @@ export async function setupResultPage({ view = document, pageLocation = location
     const mode = detail?.mode === 'image' ? '图生视频' : detail?.mode === 'text' ? '文生视频' : '—';
     const duration = scalarText(request.duration);
     const fields = [
-      ['生成模式', mode], ['模型', scalarText(request.model)], ['分辨率', scalarText(request.resolution)],
+      ['生成服务', taskProviderLabel(detail)], ['生成模式', mode], ['模型', scalarText(request.model)], ['分辨率', scalarText(request.resolution)],
       ['视频时长', duration === '—' ? duration : `${duration}秒`], ['画幅', scalarText(request.aspectRatio)],
       ['创建时间', dateText(detail?.createdAt)], ['更新时间', dateText(detail?.updatedAt)],
     ];
@@ -109,6 +109,7 @@ export async function setupResultPage({ view = document, pageLocation = location
     metadata.replaceChildren();
     for (const [label, value] of fields) {
       const row = view.createElement('div');
+      if (label === '生成服务') row.id = 'result-provider';
       const term = view.createElement('dt'); term.textContent = label;
       const definition = view.createElement('dd'); definition.textContent = value;
       row.append(term, definition);

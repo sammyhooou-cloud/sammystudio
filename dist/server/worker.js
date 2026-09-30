@@ -1,10 +1,12 @@
 import { createSession, deleteSession, requireSession, unauthorized } from './auth.js';
 import { beginAuthorization, finishAuthorization } from './kling-oauth.js';
 import { getKlingStatus } from './kling-mcp.js';
+import { createVideoProvider } from './providers/index.js';
 import { submitTask, getTaskStatus, getTaskByAttempt, getTaskDetail, TaskError } from './tasks.js';
+import { readTaskOutput } from './task-outputs.js';
 import { siteAssets } from './site-assets.js';
 import { ensureSchema } from './db.js';
-import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject } from './projects.js';
+import { backfillLegacyRows, createProject, listProjects, readProjectWorkspace, renameProject, updateProjectProvider } from './projects.js';
 
 const securityHeaders = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'permissions-policy': 'camera=(), microphone=(), geolocation=()', 'content-security-policy': "default-src 'self'; img-src 'self' blob: data:; media-src 'self' https:; style-src 'self'; script-src 'self'; connect-src 'self' https://klingai.com" };
 
@@ -15,6 +17,7 @@ function withSecurity(response) {
 }
 
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8' } });
+const taskErrorBody = (error) => ({ error: error.message, ...(error.code ? { errorCode: error.code } : {}), ...(error.task ? { task: error.task } : {}) });
 
 function projectInputError(error) {
   return error instanceof SyntaxError || ['项目名称不能为空', '项目名称不能超过60个字符'].includes(error?.message);
@@ -143,6 +146,18 @@ async function api(request, env) {
       throw error;
     }
   }
+  const providerMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/provider$/);
+  if (providerMatch && request.method === 'PATCH') {
+    const projectId = decodeProjectId(providerMatch[1]);
+    if (projectId === null) return json({ error: '项目 ID 格式无效' }, 400);
+    try { return json(await updateProjectProvider(env.DB, projectId, await request.json())); }
+    catch (error) {
+      if (error instanceof SyntaxError) return json({ error: '请提供有效的 JSON' }, 400);
+      if (error?.message === '视频供应商无效') return json({ error: error.message }, 400);
+      if (error?.message === '项目不存在') return json({ error: error.message }, 404);
+      return json({ error: '项目供应商更新暂不可用' }, 503);
+    }
+  }
   const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
   if (projectMatch && request.method === 'PATCH') {
     const projectId = decodeProjectId(projectMatch[1]);
@@ -154,6 +169,21 @@ async function api(request, env) {
       throw error;
     }
   }
+  const providerStatusMatch = url.pathname.match(/^\/api\/video\/providers\/([^/]+)\/status$/);
+  if (providerStatusMatch && request.method === 'GET') {
+    const providerId = decodeProjectId(providerStatusMatch[1]);
+    if (providerId === null) return json({ error: '供应商 ID 格式无效' }, 400);
+    let provider;
+    try { provider = createVideoProvider(providerId, env); }
+    catch { return json({ error: '视频供应商无效' }, 404); }
+    try {
+      const status = await provider.status();
+      const models = Object.hasOwn(status, 'models') ? status.models : await provider.capabilities();
+      return json({ ...status, provider: provider.id, models });
+    } catch {
+      return json({ provider: providerId, connection: 'offline', label: '供应商暂不可用', balanceLabel: '额度：暂不可用', models: {} }, 503);
+    }
+  }
   if (url.pathname === '/api/kling/status' && request.method === 'GET') return json(await getKlingStatus(env));
   if (url.pathname === '/api/kling/oauth/start' && request.method === 'GET') return Response.redirect((await beginAuthorization(request, env)).url.toString(), 302);
   if (url.pathname === '/api/kling/oauth/callback' && request.method === 'GET') { try { await finishAuthorization(request, env); return Response.redirect(`${url.origin}/workspace?authorized=1`, 302); } catch (error) { return Response.redirect(`${url.origin}/workspace?oauth_error=1`, 302); } }
@@ -163,18 +193,26 @@ async function api(request, env) {
     try { input = await request.json(); }
     catch { return json({ error: '请提供有效的 JSON' }, 400); }
     try {
-      return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID(), () => getKlingStatus(env)));
+      return json(await submitTask(input, env, request.headers.get('idempotency-key') || crypto.randomUUID()));
     } catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message, ...(error.task ? { task: error.task } : {}) }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务处理失败' }, 500);
     }
   }
   if (url.pathname === '/api/video/tasks/attempt' && request.method === 'GET') {
     try { return json(await getTaskByAttempt(url.searchParams.get('projectId'), request.headers.get('idempotency-key'), env)); }
     catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务状态暂不可用' }, 503);
     }
+  }
+  const taskOutputMatch = url.pathname.match(/^\/api\/projects\/([^/]*)\/tasks\/([^/]*)\/output$/);
+  if (taskOutputMatch && request.method === 'GET') {
+    const projectId = decodeProjectId(taskOutputMatch[1]);
+    const taskId = decodeProjectId(taskOutputMatch[2]);
+    if (!projectId?.trim() || !taskId?.trim()) return json({ error: '任务参数无效' }, 400);
+    try { return await readTaskOutput({ taskId, projectId, env }) || json({ error: '视频输出不存在' }, 404); }
+    catch { return json({ error: '视频输出暂不可用' }, 503); }
   }
   const taskDetailMatch = url.pathname.match(/^\/api\/projects\/([^/]*)\/tasks\/([^/]*)$/);
   if (taskDetailMatch && request.method === 'GET') {
@@ -183,7 +221,7 @@ async function api(request, env) {
     if (!projectId || !taskId) return json({ error: '任务参数无效' }, 400);
     try { return json(await getTaskDetail(taskId, projectId, env)); }
     catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务详情暂不可用' }, 503);
     }
   }
@@ -194,7 +232,7 @@ async function api(request, env) {
     if (!id || !projectId) return json({ error: '任务参数无效' }, 400);
     try { return json(await getTaskStatus(id, projectId, env)); }
     catch (error) {
-      if (error instanceof TaskError) return json({ error: error.message }, error.status);
+      if (error instanceof TaskError) return json(taskErrorBody(error), error.status);
       return json({ error: '任务状态暂不可用' }, 503);
     }
   }
